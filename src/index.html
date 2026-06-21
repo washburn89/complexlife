@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Particle Life Simulator</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body { background: #111; font-family: Arial, sans-serif; overflow: hidden; }
+
+        canvas {
+            position: fixed; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            display: block; background: #000;
+        }
+
+        /* ── Side panel ─────────────────────────────────────────────────────── */
+        #ui {
+            position: fixed; top: 0; left: 0;
+            width: 340px; height: 100vh;
+            background: rgba(10,10,14,0.96);
+            color: #ddd; display: flex; flex-direction: column;
+            font-size: 12px; z-index: 200;
+            border-right: 1px solid #333;
+        }
+
+        #ui-header { padding: 10px 14px 8px; border-bottom: 1px solid #333; flex-shrink: 0; }
+        #ui-header h3 { font-size: 13px; color: #0af; margin-bottom: 6px; }
+        #stats-bar {
+            color: #0f0; font-family: monospace; font-size: 11px;
+            display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+        }
+        #stats-bar .ap-label {
+            display: flex; align-items: center; gap: 3px;
+            color: #666; font-size: 10px; cursor: pointer;
+        }
+        #stats-bar .ap-label:hover { color: #aaa; }
+        #fps-warn { color: #f84; font-size: 10px; display: none; }
+
+        /* ── Controls ────────────────────────────────────────────────────────── */
+        #ui-controls {
+            padding: 10px 14px; border-bottom: 1px solid #333;
+            flex-shrink: 0; display: flex; flex-direction: column; gap: 8px;
+        }
+        .ctrl-row { display: flex; align-items: center; gap: 8px; }
+        .ctrl-row label { width: 52px; font-size: 11px; color: #aaa; flex-shrink: 0; }
+        .ctrl-row input[type="number"] {
+            flex: 1; padding: 3px 6px; background: #1e1e24; color: #ddd;
+            border: 1px solid #444; border-radius: 3px; font-size: 11px;
+        }
+        .ctrl-row input[type="range"] { flex: 1; accent-color: #0af; }
+        .ctrl-row .val { font-size: 10px; color: #0af; width: 32px; text-align: right; }
+        .btn-row { display: flex; gap: 6px; }
+
+        button {
+            flex: 1; padding: 5px 8px; background: #1a2a3a; color: #0af;
+            border: 1px solid #0af; border-radius: 3px; font-size: 11px;
+            cursor: pointer; transition: background 0.15s;
+        }
+        button:hover { background: #0af; color: #000; }
+        button.active { background: #0af; color: #000; }
+
+        /* ── Tabs ────────────────────────────────────────────────────────────── */
+        #tab-bar { display: flex; border-bottom: 1px solid #333; flex-shrink: 0; }
+        .tab-btn {
+            flex: 1; padding: 7px 2px; background: transparent; color: #888;
+            border: none; border-bottom: 2px solid transparent; border-radius: 0;
+            font-size: 10px; cursor: pointer; transition: color 0.15s, border-color 0.15s;
+        }
+        .tab-btn:hover { color: #ccc; background: transparent; }
+        .tab-btn.active { color: #0af; border-bottom-color: #0af; background: transparent; }
+
+        #tab-content { flex: 1; overflow-y: auto; overflow-x: auto; padding: 10px; }
+        .tab-pane { display: none; }
+        .tab-pane.active { display: block; }
+
+        /* ── Matrix table ────────────────────────────────────────────────────── */
+        .matrix-wrap { overflow-x: auto; }
+        .matrix-label { font-size: 10px; color: #666; margin-bottom: 6px; }
+        table.matrix { border-collapse: collapse; font-size: 9px; }
+        table.matrix th {
+            padding: 2px 3px; text-align: center; font-weight: normal;
+            color: #aaa; white-space: nowrap;
+        }
+        table.matrix th.row-header { text-align: right; padding-right: 5px; }
+        .type-pip {
+            display: inline-block; width: 7px; height: 7px;
+            border-radius: 50%; margin-right: 2px; vertical-align: middle;
+        }
+        table.matrix td.mcell {
+            width: 28px; height: 22px; text-align: center; vertical-align: middle;
+            cursor: pointer; border: 1px solid #0001; font-size: 8px;
+            color: rgba(255,255,255,0.85); user-select: none; transition: filter 0.1s;
+        }
+        table.matrix td.mcell:hover { filter: brightness(1.5); border-color: #fff4; }
+
+        /* ── Force cell editor popup ─────────────────────────────────────────── */
+        #cell-editor {
+            position: fixed; background: #1a1a22; border: 1px solid #0af;
+            border-radius: 5px; padding: 8px 10px; z-index: 500;
+            display: none; flex-direction: column; gap: 6px;
+            min-width: 160px; box-shadow: 0 4px 16px #0009;
+        }
+        #cell-editor.visible { display: flex; }
+        #cell-editor-title { font-size: 10px; color: #0af; }
+        #cell-editor-row { display: flex; align-items: center; gap: 8px; }
+        #cell-slider { flex: 1; accent-color: #0af; }
+        #cell-value-display {
+            font-size: 11px; color: #fff; width: 38px; text-align: right; font-family: monospace;
+        }
+
+        /* ── Transform mode tab ─────────────────────────────────────────────── */
+        .mode-toggle-row {
+            display: flex; gap: 6px; margin-bottom: 10px;
+        }
+        .mode-btn {
+            flex: 1; padding: 6px 4px; font-size: 11px;
+        }
+        .mode-btn.selected { background: #0af; color: #000; border-color: #0af; }
+
+        #transform-panel { display: none; }
+        #transform-panel.visible { display: block; }
+
+        .tr-hint {
+            font-size: 10px; color: #555; margin-bottom: 8px; line-height: 1.4;
+        }
+
+        table.matrix td.tcell {
+            width: 28px; height: 22px; text-align: center; vertical-align: middle;
+            cursor: pointer; border: 1px solid #0001; font-size: 7.5px; font-weight: bold;
+            user-select: none; transition: filter 0.1s; letter-spacing: -0.5px;
+            line-height: 1.1;
+        }
+        table.matrix td.tcell:hover { filter: brightness(1.5); border-color: #fff4; }
+
+        /* ── Transform rule popup ────────────────────────────────────────────── */
+        #transform-editor {
+            position: fixed; background: #14141e; border: 1px solid #0af;
+            border-radius: 6px; padding: 10px 12px; z-index: 500;
+            display: none; flex-direction: column; gap: 8px;
+            min-width: 220px; box-shadow: 0 4px 20px #000c;
+        }
+        #transform-editor.visible { display: flex; }
+
+        #te-title { font-size: 10px; color: #0af; margin-bottom: 2px; }
+
+        .te-rule {
+            background: #1e1e28; border-radius: 4px; padding: 7px 8px;
+            display: flex; flex-direction: column; gap: 5px;
+        }
+        .te-rule-header {
+            display: flex; align-items: center; gap: 6px; font-size: 10px; color: #ccc;
+        }
+        .te-rule-header input[type="checkbox"] { accent-color: #0af; width: 13px; height: 13px; }
+        .te-rule-header label { cursor: pointer; }
+        .te-threshold-row {
+            display: flex; align-items: center; gap: 6px; font-size: 10px; color: #888;
+            padding-left: 18px;
+        }
+        .te-threshold-row input[type="number"] {
+            width: 60px; padding: 2px 5px; background: #0e0e18; color: #ddd;
+            border: 1px solid #444; border-radius: 3px; font-size: 10px;
+        }
+        .te-target-row {
+            display: flex; align-items: center; gap: 5px; padding-left: 18px; flex-wrap: wrap;
+        }
+        .te-target-row span { font-size: 10px; color: #888; flex-shrink: 0; }
+        .type-dot-btn {
+            width: 16px; height: 16px; border-radius: 50%; border: 2px solid transparent;
+            cursor: pointer; flex-shrink: 0; transition: border-color 0.1s;
+        }
+        .type-dot-btn.selected { border-color: #fff; }
+        .type-dot-btn:hover { border-color: #aaa; }
+
+        /* ── Settings tab ────────────────────────────────────────────────────── */
+        .settings-section { margin-bottom: 14px; }
+        .settings-section h4 {
+            font-size: 11px; color: #0af; margin-bottom: 8px;
+            border-bottom: 1px solid #333; padding-bottom: 4px;
+        }
+        .settings-row {
+            display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 11px;
+        }
+        .settings-row label { color: #aaa; width: 80px; flex-shrink: 0; }
+        .settings-row input[type="number"] {
+            width: 70px; padding: 3px 5px; background: #1e1e24; color: #ddd;
+            border: 1px solid #444; border-radius: 3px; font-size: 11px;
+        }
+        .settings-row input[type="range"] { flex: 1; accent-color: #0af; }
+        .settings-row input[type="color"] {
+            width: 46px; height: 26px; border: 1px solid #444; border-radius: 3px;
+            background: none; cursor: pointer; padding: 1px;
+        }
+        .settings-row .sep { color: #555; }
+        .settings-row .val { font-size: 10px; color: #0af; width: 32px; text-align: right; }
+
+        .edge-toggle-row { display: flex; gap: 6px; }
+        .edge-btn { flex: 1; padding: 5px 4px; font-size: 11px; }
+        .edge-btn.selected { background: #0af; color: #000; border-color: #0af; }
+
+        .hint { font-size: 10px; color: #555; margin-top: 6px; line-height: 1.4; }
+
+        /* ── Pole panel ──────────────────────────────────────────────────────── */
+        .pole-row { display: flex; align-items: center; gap: 5px; margin-bottom: 5px; flex-wrap: wrap; }
+        .pole-count-btns { display: flex; gap: 2px; }
+        .pole-count-btn {
+            padding: 2px 4px; font-size: 10px; min-width: 18px; flex: none;
+            background: #1a2030; color: #aaa; border-color: #444;
+        }
+        .pole-count-btn.selected { background: #0af; color: #000; border-color: #0af; }
+        .pole-signs { display: flex; gap: 2px; }
+        .pole-sign-btn {
+            width: 18px; height: 18px; border-radius: 3px; font-size: 11px;
+            padding: 0; flex: none; font-weight: bold; line-height: 1;
+            background: #1a1a24;
+        }
+        .pole-sign-pos { color: #0f8; border-color: #0f8; }
+        .pole-sign-neg { color: #f55; border-color: #f55; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <div id="ui-header">
+            <h3>Particle Life</h3>
+            <div id="stats-bar">
+                <span>FPS: <span id="fps">0</span></span>
+                <label class="ap-label" title="Auto-pause when FPS drops below 5">
+                    <input type="checkbox" id="autoPauseChk" checked> AP
+                </label>
+                <span id="fps-warn">⚠ low FPS</span>
+                <span>N: <span id="particleCountDisplay">0</span></span>
+                <span>Z: <span id="zoomDisplay">1.00×</span></span>
+                <span>T: <span id="time">0.0s</span></span>
+            </div>
+        </div>
+
+        <div id="ui-controls">
+            <div class="ctrl-row">
+                <label>Count</label>
+                <input type="number" id="particleCount" min="100" max="30000" value="3000" step="500">
+            </div>
+            <div class="ctrl-row">
+                <label>Types</label>
+                <input type="number" id="typeCount" min="1" max="20" value="10" step="1">
+            </div>
+            <div class="ctrl-row">
+                <label>Speed</label>
+                <input type="range" id="speed" min="0.1" max="5" value="1" step="0.1">
+                <span class="val" id="speedValue">1.0×</span>
+            </div>
+            <div class="btn-row">
+                <button id="resetBtn">Reset</button>
+                <button id="randomizeBtn">Randomize</button>
+                <button id="pauseBtn">Pause</button>
+            </div>
+        </div>
+
+        <div id="tab-bar">
+            <button class="tab-btn active" data-tab="strength">Strength</button>
+            <button class="tab-btn"        data-tab="radius">Radius</button>
+            <button class="tab-btn"        data-tab="mode">Mode</button>
+            <button class="tab-btn"        data-tab="settings">Settings</button>
+        </div>
+
+        <div id="tab-content">
+            <!-- Strength matrix -->
+            <div id="pane-strength" class="tab-pane active">
+                <p class="matrix-label">Row = from · Col = to · Click cell to edit</p>
+                <div class="matrix-wrap"><table class="matrix" id="strength-table"></table></div>
+            </div>
+
+            <!-- Radius matrix -->
+            <div id="pane-radius" class="tab-pane">
+                <p class="matrix-label">Interaction radius per type pair (world units)</p>
+                <div class="matrix-wrap"><table class="matrix" id="radius-table"></table></div>
+            </div>
+
+            <!-- Mode tab -->
+            <div id="pane-mode" class="tab-pane">
+                <div class="mode-toggle-row">
+                    <button class="mode-btn selected" id="mode0-btn">0 · Classic</button>
+                    <button class="mode-btn"          id="mode1-btn">1 · Transform</button>
+                </div>
+
+                <div id="transform-panel">
+                    <p class="tr-hint">
+                        Each tick a particle accumulates force from each trigger type. If it exceeds the
+                        threshold the particle probabilistically transforms — the further past the threshold,
+                        the higher the chance (up to 50%/tick at 3× threshold). First match wins.
+                    </p>
+                    <div class="btn-row" style="margin-bottom:8px;">
+                        <button id="randomizeTransformBtn">Randomize Rules</button>
+                    </div>
+                    <p class="matrix-label">Row = source type · Col = trigger type</p>
+                    <div class="matrix-wrap"><table class="matrix" id="transform-table"></table></div>
+
+                    <div id="pole-panel" style="margin-top:14px;">
+                        <p class="matrix-label">Polar field per type</p>
+                        <div id="pole-list"></div>
+                        <div class="btn-row" style="margin-top:6px;">
+                            <button id="randomizePolesBtn">Randomize Poles</button>
+                        </div>
+                        <p class="tr-hint" style="margin-top:6px;">
+                            M = monopole (uniform). 2 = dipole (front+/back−, velocity-aligned).
+                            3–6 = N lobes evenly spaced; click ± to flip each lobe's polarity.
+                            Positive lobes amplify the base force, negative lobes reverse it.
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings tab -->
+            <div id="pane-settings" class="tab-pane">
+                <div class="settings-section">
+                    <h4>Simulation Area</h4>
+                    <div class="settings-row">
+                        <label>World size</label>
+                        <input type="number" id="worldW" min="200" max="4000" step="100" value="1600">
+                        <span class="sep">×</span>
+                        <input type="number" id="worldH" min="200" max="4000" step="100" value="900">
+                    </div>
+                    <div class="settings-row">
+                        <label></label>
+                        <button id="applyWorldSize" style="flex:none;padding:4px 12px;">Apply &amp; Reset</button>
+                    </div>
+                    <p class="hint">Resize the browser window freely — the sim area is letterboxed.
+                    Double-click canvas to reset view. Scroll to zoom, middle-drag to pan.</p>
+                </div>
+
+                <div class="settings-section">
+                    <h4>Edge Behavior</h4>
+                    <div class="edge-toggle-row">
+                        <button class="edge-btn selected" id="edgeLoopBtn">Loop</button>
+                        <button class="edge-btn"          id="edgeOpenBtn">Open</button>
+                    </div>
+                    <p class="hint">
+                        <strong style="color:#888">Loop</strong> — edges wrap toroidally.<br>
+                        <strong style="color:#888">Open</strong> — particles spawn in the configured area
+                        but the physics world is 5× larger with solid walls.
+                    </p>
+                </div>
+
+                <div class="settings-section">
+                    <h4>Visual</h4>
+                    <div class="settings-row">
+                        <label>Background</label>
+                        <input type="color" id="bgColorPicker" value="#0d0d14">
+                    </div>
+                    <div class="settings-row">
+                        <label>Saturation</label>
+                        <input type="range" id="satSlider" min="0" max="2" step="0.05" value="1">
+                        <span class="val" id="satValue">1.0</span>
+                    </div>
+                    <div class="settings-row">
+                        <label>Particle Glow</label>
+                        <input type="range" id="glowSlider" min="0" max="1" step="0.05" value="0.6">
+                        <span class="val" id="glowValue">0.6</span>
+                    </div>
+                    <p class="hint" style="margin-top:4px">
+                        Glow 0 = hard solid circles. Glow 1 = wide soft orbs that bloom where they overlap.
+                    </p>
+                </div>
+
+                <div class="settings-section">
+                    <h4>Config</h4>
+                    <div class="btn-row">
+                        <button id="exportBtn">Export JSON</button>
+                        <button id="importBtn">Import JSON</button>
+                    </div>
+                    <input type="file" id="importFile" accept=".json" style="display:none">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Force cell editor (strength / radius) -->
+    <div id="cell-editor">
+        <div id="cell-editor-title"></div>
+        <div id="cell-editor-row">
+            <input type="range" id="cell-slider">
+            <span id="cell-value-display"></span>
+        </div>
+    </div>
+
+    <!-- Transform rule editor -->
+    <div id="transform-editor">
+        <div id="te-title"></div>
+
+        <div class="te-rule" id="te-upper">
+            <div class="te-rule-header">
+                <input type="checkbox" id="te-upper-enabled">
+                <label for="te-upper-enabled">↑ force from trigger &gt;</label>
+            </div>
+            <div class="te-threshold-row">
+                threshold: <input type="number" id="te-upper-threshold" step="0.05" value="0.5">
+            </div>
+            <div class="te-target-row">
+                <span>→ becomes:</span>
+                <div id="te-upper-picker"></div>
+            </div>
+        </div>
+
+        <div class="te-rule" id="te-lower">
+            <div class="te-rule-header">
+                <input type="checkbox" id="te-lower-enabled">
+                <label for="te-lower-enabled">↓ force from trigger &lt;</label>
+            </div>
+            <div class="te-threshold-row">
+                threshold: <input type="number" id="te-lower-threshold" step="0.05" value="-0.5">
+            </div>
+            <div class="te-target-row">
+                <span>→ becomes:</span>
+                <div id="te-lower-picker"></div>
+            </div>
+        </div>
+    </div>
+
+    <canvas id="sim-canvas" oncontextmenu="return false" onmousedown="if(event.button===1)event.preventDefault()"></canvas>
+</body>
+</html>
