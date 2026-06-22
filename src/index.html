@@ -104,9 +104,11 @@
         }
         #cell-editor.visible { display: flex; }
         #cell-editor-title { font-size: 10px; color: #0af; }
-        #cell-editor-row { display: flex; align-items: center; gap: 8px; }
-        #cell-slider { flex: 1; accent-color: #0af; }
-        #cell-value-display {
+        #cell-editor-row, #cell-editor-row2 { display: flex; align-items: center; gap: 8px; }
+        #cell-slider, #cell-slider2 { flex: 1; accent-color: #0af; }
+        #cell-editor-row2 { display: none; }
+        #cell-editor-label2 { font-size: 9px; color: #888; width: 24px; flex-shrink: 0; }
+        #cell-value-display, #cell-value-display2 {
             font-size: 11px; color: #fff; width: 38px; text-align: right; font-family: monospace;
         }
 
@@ -238,7 +240,7 @@
         <div id="ui-controls">
             <div class="ctrl-row">
                 <label>Count</label>
-                <input type="number" id="particleCount" min="100" max="30000" value="3000" step="500">
+                <input type="number" id="particleCount" min="1000" max="300000" value="20000" step="1000">
             </div>
             <div class="ctrl-row">
                 <label>Types</label>
@@ -251,7 +253,6 @@
             </div>
             <div class="btn-row">
                 <button id="resetBtn">Reset</button>
-                <button id="randomizeBtn">Randomize</button>
                 <button id="pauseBtn">Pause</button>
             </div>
         </div>
@@ -266,14 +267,26 @@
         <div id="tab-content">
             <!-- Strength matrix -->
             <div id="pane-strength" class="tab-pane active">
+                <div class="btn-row" style="margin-bottom:6px">
+                    <button id="randomizeStrengthBtn">Randomize</button>
+                </div>
                 <p class="matrix-label">Row = from · Col = to · Click cell to edit</p>
                 <div class="matrix-wrap"><table class="matrix" id="strength-table"></table></div>
             </div>
 
             <!-- Radius matrix -->
             <div id="pane-radius" class="tab-pane">
-                <p class="matrix-label">Interaction radius per type pair (world units)</p>
+                <p class="matrix-label">Max interaction radius per type pair (world units)</p>
+                <div class="btn-row" style="margin-bottom:6px">
+                    <button id="randomizeMaxRadiusBtn">Randomize Max</button>
+                </div>
                 <div class="matrix-wrap"><table class="matrix" id="radius-table"></table></div>
+                <p class="matrix-label" style="margin-top:10px">Min radius — inner dead zone (no interaction below this distance)</p>
+                <div class="btn-row" style="margin-bottom:6px">
+                    <button id="randomizeMinRadiusBtn">Randomize Min</button>
+                    <button id="zeroMinRadiusBtn">All Zero</button>
+                </div>
+                <div class="matrix-wrap"><table class="matrix" id="min-radius-table"></table></div>
             </div>
 
             <!-- Mode tab -->
@@ -316,16 +329,15 @@
                     <h4>Simulation Area</h4>
                     <div class="settings-row">
                         <label>World size</label>
-                        <input type="number" id="worldW" min="200" max="4000" step="100" value="1600">
+                        <input type="number" id="worldW" min="200" max="20000" step="100" value="4800">
                         <span class="sep">×</span>
-                        <input type="number" id="worldH" min="200" max="4000" step="100" value="900">
+                        <input type="number" id="worldH" min="200" max="20000" step="100" value="2700">
                     </div>
                     <div class="settings-row">
                         <label></label>
                         <button id="applyWorldSize" style="flex:none;padding:4px 12px;">Apply &amp; Reset</button>
                     </div>
-                    <p class="hint">Resize the browser window freely — the sim area is letterboxed.
-                    Double-click canvas to reset view. Scroll to zoom, middle-drag to pan.</p>
+                    <p class="hint">World size sets the physics space; rendering resolution stays fixed at the canvas pixel size. Large worlds require zooming in to see particles. Scroll to zoom, middle-drag to pan, double-click to reset view.</p>
                 </div>
 
                 <div class="settings-section">
@@ -344,6 +356,20 @@
                 <div class="settings-section">
                     <h4>Visual</h4>
                     <div class="settings-row">
+                        <label>Blend</label>
+                        <div class="edge-toggle-row" style="flex:1">
+                            <button class="edge-btn" id="blendStandardBtn">Standard</button>
+                            <button class="edge-btn selected" id="blendAdditiveBtn">Additive</button>
+                        </div>
+                    </div>
+                    <div class="settings-row">
+                        <label>Shapes</label>
+                        <div class="edge-toggle-row" style="flex:1">
+                            <button class="edge-btn" id="shapeCircleBtn">Circles</button>
+                            <button class="edge-btn selected" id="shapePolyBtn">Shapes</button>
+                        </div>
+                    </div>
+                    <div class="settings-row">
                         <label>Background</label>
                         <input type="color" id="bgColorPicker" value="#0d0d14">
                     </div>
@@ -354,11 +380,22 @@
                     </div>
                     <div class="settings-row">
                         <label>Particle Glow</label>
-                        <input type="range" id="glowSlider" min="0" max="1" step="0.05" value="0.6">
-                        <span class="val" id="glowValue">0.6</span>
+                        <input type="range" id="glowSlider" min="0" max="1" step="0.05" value="0">
+                        <span class="val" id="glowValue">0.00</span>
+                    </div>
+                    <div class="settings-row">
+                        <label>Opacity</label>
+                        <input type="range" id="alphaSlider" min="0" max="1" step="0.05" value="1">
+                        <span class="val" id="alphaValue">1.00</span>
+                    </div>
+                    <div class="settings-row">
+                        <label>Add. Strength</label>
+                        <input type="range" id="addStrSlider" min="0" max="1" step="0.05" value="0.7">
+                        <span class="val" id="addStrValue">0.70</span>
                     </div>
                     <p class="hint" style="margin-top:4px">
-                        Glow 0 = hard solid circles. Glow 1 = wide soft orbs that bloom where they overlap.
+                        Glow 0 = hard solid circles. Glow 1 = wide soft orbs that bloom where they overlap.<br>
+                        Add. Strength scales per-particle light in additive mode — lower = less bloom.
                     </p>
                 </div>
 
@@ -380,6 +417,11 @@
         <div id="cell-editor-row">
             <input type="range" id="cell-slider">
             <span id="cell-value-display"></span>
+        </div>
+        <div id="cell-editor-row2">
+            <span id="cell-editor-label2">min</span>
+            <input type="range" id="cell-slider2">
+            <span id="cell-value-display2"></span>
         </div>
     </div>
 

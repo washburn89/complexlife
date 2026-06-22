@@ -19,6 +19,11 @@ function radiusToColor(v: number): string {
     return `rgb(8,${Math.round(8 + t * 72)},${Math.round(40 + t * 210)})`;
 }
 
+function minRadiusToColor(v: number): string {
+    const t = Math.max(0, Math.min(1, v / 200));
+    return `rgb(${Math.round(30 + t * 160)},${Math.round(16 + t * 56)},8)`;
+}
+
 function transformCellHTML(rule: TransformRule): { bg: string; html: string } {
     const u = rule.upperEnabled;
     const l = rule.lowerEnabled;
@@ -136,10 +141,6 @@ class ParticleLifeApp {
 
         // Buttons
         document.getElementById('resetBtn')!.addEventListener('click', () => this.sim?.reset());
-        document.getElementById('randomizeBtn')!.addEventListener('click', () => {
-            this.sim?.randomizeForces();
-            this.refreshForceMatrices();
-        });
         document.getElementById('pauseBtn')!.addEventListener('click', () => {
             if (!this.sim) return;
             this.sim.togglePause();
@@ -154,6 +155,24 @@ class ParticleLifeApp {
         document.getElementById('mode0-btn')!.addEventListener('click', () => this.setSimMode(0));
         document.getElementById('mode1-btn')!.addEventListener('click', () => this.setSimMode(1));
 
+        // Per-matrix randomize buttons
+        document.getElementById('randomizeStrengthBtn')!.addEventListener('click', () => {
+            this.sim?.randomizeStrengths();
+            this.refreshForceMatrices();
+        });
+        document.getElementById('randomizeMaxRadiusBtn')!.addEventListener('click', () => {
+            this.sim?.randomizeMaxRadii();
+            this.refreshForceMatrices();
+        });
+        document.getElementById('randomizeMinRadiusBtn')!.addEventListener('click', () => {
+            this.sim?.randomizeMinRadii();
+            this.refreshForceMatrices();
+        });
+        document.getElementById('zeroMinRadiusBtn')!.addEventListener('click', () => {
+            this.sim?.zeroMinRadii();
+            this.refreshForceMatrices();
+        });
+
         // Randomize transform rules
         document.getElementById('randomizeTransformBtn')!.addEventListener('click', () => {
             this.sim?.randomizeTransformRules();
@@ -166,11 +185,10 @@ class ParticleLifeApp {
             this.buildPolePanel();
         });
 
-        // World size
+        // World size (physics space only — canvas pixel resolution stays fixed)
         document.getElementById('applyWorldSize')!.addEventListener('click', () => {
             const w = parseInt((document.getElementById('worldW') as HTMLInputElement).value) || 1600;
             const h = parseInt((document.getElementById('worldH') as HTMLInputElement).value) || 900;
-            this.setCanvasSize(w, h);
             this.sim?.setWorldSize(w, h);
             this.updateZoomDisplay();
         });
@@ -178,6 +196,14 @@ class ParticleLifeApp {
         // Edge mode
         document.getElementById('edgeLoopBtn')!.addEventListener('click', () => this.setEdgeMode(0));
         document.getElementById('edgeOpenBtn')!.addEventListener('click', () => this.setEdgeMode(1));
+
+        // Blend mode
+        document.getElementById('blendStandardBtn')!.addEventListener('click', () => this.setBlendMode(0));
+        document.getElementById('blendAdditiveBtn')!.addEventListener('click', () => this.setBlendMode(1));
+
+        // Shape mode
+        document.getElementById('shapeCircleBtn')!.addEventListener('click', () => this.setShapeMode(0));
+        document.getElementById('shapePolyBtn')!.addEventListener('click', () => this.setShapeMode(1));
 
         // Background color
         const bgPicker = document.getElementById('bgColorPicker') as HTMLInputElement;
@@ -200,6 +226,22 @@ class ParticleLifeApp {
             const v = parseFloat(glowSlider.value);
             document.getElementById('glowValue')!.textContent = v.toFixed(2);
             this.sim?.setParticleGlow(v);
+        });
+
+        // Particle opacity
+        const alphaSlider = document.getElementById('alphaSlider') as HTMLInputElement;
+        alphaSlider.addEventListener('input', () => {
+            const v = parseFloat(alphaSlider.value);
+            document.getElementById('alphaValue')!.textContent = v.toFixed(2);
+            this.sim?.setParticleAlpha(v);
+        });
+
+        // Additive blend strength
+        const addStrSlider = document.getElementById('addStrSlider') as HTMLInputElement;
+        addStrSlider.addEventListener('input', () => {
+            const v = parseFloat(addStrSlider.value);
+            document.getElementById('addStrValue')!.textContent = v.toFixed(2);
+            this.sim?.setAdditiveStrength(v);
         });
 
         // Export / Import
@@ -238,6 +280,18 @@ class ParticleLifeApp {
         document.getElementById('edgeLoopBtn')!.classList.toggle('selected', mode === 0);
         document.getElementById('edgeOpenBtn')!.classList.toggle('selected', mode === 1);
         this.updateZoomDisplay();
+    }
+
+    private setBlendMode(mode: 0 | 1): void {
+        this.sim?.setBlendMode(mode);
+        document.getElementById('blendStandardBtn')!.classList.toggle('selected', mode === 0);
+        document.getElementById('blendAdditiveBtn')!.classList.toggle('selected', mode === 1);
+    }
+
+    private setShapeMode(mode: 0 | 1): void {
+        this.sim?.setShapeMode(mode);
+        document.getElementById('shapeCircleBtn')!.classList.toggle('selected', mode === 0);
+        document.getElementById('shapePolyBtn')!.classList.toggle('selected', mode === 1);
     }
 
     // ── Pan / zoom ────────────────────────────────────────────────────────────
@@ -303,7 +357,7 @@ class ParticleLifeApp {
 
     // ── Force matrices ────────────────────────────────────────────────────────
 
-    private buildMatrixTable(tableId: string, kind: 'strength' | 'radius'): void {
+    private buildMatrixTable(tableId: string, kind: 'strength' | 'radius' | 'minRadius'): void {
         const table  = document.getElementById(tableId) as HTMLTableElement;
         const params = this.sim!.getParams();
         const n      = this.sim!.getNumTypes();
@@ -318,7 +372,9 @@ class ParticleLifeApp {
             row.innerHTML = `<th class="row-header"><span class="type-pip" style="background:${TYPE_HEX[from]}"></span>${TYPE_LABELS[from]}</th>`;
             for (let to = 0; to < n; to++) {
                 const c  = params.forceMatrix[from]?.[to];
-                const v  = kind === 'strength' ? (c?.strength ?? 0) : (c?.radius ?? 100);
+                const v  = kind === 'strength' ? (c?.strength ?? 0)
+                         : kind === 'radius'   ? (c?.radius   ?? 100)
+                         :                       (c?.minRadius ?? 0);
                 const td = document.createElement('td');
                 td.className = 'mcell';
                 td.dataset.from = String(from); td.dataset.to = String(to); td.dataset.kind = kind;
@@ -330,18 +386,21 @@ class ParticleLifeApp {
         }
     }
 
-    private styleForceCellValue(td: HTMLTableCellElement, kind: 'strength' | 'radius', v: number): void {
-        td.style.background = kind === 'strength' ? strengthToColor(v) : radiusToColor(v);
-        td.textContent      = kind === 'strength' ? v.toFixed(2) : String(Math.round(v));
-        td.title            = String(v.toFixed(3));
+    private styleForceCellValue(td: HTMLTableCellElement, kind: 'strength' | 'radius' | 'minRadius', v: number): void {
+        td.style.background = kind === 'strength' ? strengthToColor(v)
+                            : kind === 'radius'   ? radiusToColor(v)
+                            :                       minRadiusToColor(v);
+        td.textContent = kind === 'strength' ? v.toFixed(2) : String(Math.round(v));
+        td.title       = String(v.toFixed(3));
     }
 
     private refreshForceMatrices(): void {
-        (['strength-table', 'radius-table'] as const).forEach(id => {
+        (['strength-table', 'radius-table', 'min-radius-table'] as const).forEach(id => {
             (document.getElementById(id) as HTMLTableElement).innerHTML = '';
         });
-        this.buildMatrixTable('strength-table', 'strength');
-        this.buildMatrixTable('radius-table',   'radius');
+        this.buildMatrixTable('strength-table',    'strength');
+        this.buildMatrixTable('radius-table',      'radius');
+        this.buildMatrixTable('min-radius-table',  'minRadius');
     }
 
     // ── Transform matrix ──────────────────────────────────────────────────────
@@ -458,27 +517,52 @@ class ParticleLifeApp {
         this.closeTransformEditor();
         const from = parseInt(td.dataset.from!);
         const to   = parseInt(td.dataset.to!);
-        const kind = td.dataset.kind as 'strength' | 'radius';
+        const kind = td.dataset.kind as 'strength' | 'radius' | 'minRadius';
         const c    = this.sim!.getParams().forceMatrix[from]?.[to];
-        const cur  = kind === 'strength' ? (c?.strength ?? 0) : (c?.radius ?? 100);
+        const cur  = kind === 'strength' ? (c?.strength  ?? 0)
+                   : kind === 'radius'   ? (c?.radius    ?? 100)
+                   :                       (c?.minRadius ?? 0);
 
-        const editor  = document.getElementById('cell-editor')!;
-        const title   = document.getElementById('cell-editor-title')!;
-        const slider  = document.getElementById('cell-slider') as HTMLInputElement;
-        const display = document.getElementById('cell-value-display')!;
+        const editor   = document.getElementById('cell-editor')!;
+        const title    = document.getElementById('cell-editor-title')!;
+        const slider   = document.getElementById('cell-slider')  as HTMLInputElement;
+        const display  = document.getElementById('cell-value-display')!;
+        const row2     = document.getElementById('cell-editor-row2')!;
+        const slider2  = document.getElementById('cell-slider2') as HTMLInputElement;
+        const display2 = document.getElementById('cell-value-display2')!;
 
         const pip = (i: number) =>
             `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${TYPE_HEX[i]};margin-right:2px;vertical-align:middle"></span>`;
-        title.innerHTML = `${pip(from)}${TYPE_LABELS[from]} → ${pip(to)}${TYPE_LABELS[to]} <span style="color:#888">${kind}</span>`;
+        const kindLabel = kind === 'minRadius' ? 'min radius' : kind;
+        title.innerHTML = `${pip(from)}${TYPE_LABELS[from]} → ${pip(to)}${TYPE_LABELS[to]} <span style="color:#888">${kindLabel}</span>`;
 
-        Object.assign(slider, kind === 'strength' ? { min:'-1', max:'1', step:'0.01' } : { min:'10', max:'250', step:'1' });
+        if (kind === 'strength') {
+            Object.assign(slider, { min: '-1', max: '1', step: '0.01' });
+            display.textContent = cur.toFixed(2);
+            row2.style.display = 'none';
+        } else if (kind === 'radius') {
+            Object.assign(slider, { min: '10', max: '250', step: '1' });
+            display.textContent = String(Math.round(cur));
+            const curMin = c?.minRadius ?? 0;
+            slider2.min   = '0';
+            slider2.max   = String(Math.max(0, Math.round(cur) - 1));
+            slider2.step  = '1';
+            slider2.value = String(Math.min(curMin, Math.max(0, Math.round(cur) - 1)));
+            display2.textContent = String(Math.round(parseFloat(slider2.value)));
+            row2.style.display = '';
+        } else {
+            // minRadius: single slider, range [0, maxRadius - 1]
+            const maxR = c?.radius ?? 100;
+            Object.assign(slider, { min: '0', max: String(Math.max(0, Math.round(maxR) - 1)), step: '1' });
+            display.textContent = String(Math.round(cur));
+            row2.style.display = 'none';
+        }
         slider.value = String(cur);
-        display.textContent = kind === 'strength' ? cur.toFixed(2) : String(Math.round(cur));
 
         const rect = td.getBoundingClientRect();
         let left = rect.left, top = rect.bottom + 4;
         if (left + 180 > window.innerWidth)  left = window.innerWidth - 184;
-        if (top  + 70  > window.innerHeight) top  = rect.top - 74;
+        if (top  + 100 > window.innerHeight) top  = rect.top - (kind === 'radius' ? 104 : 74);
         editor.style.left = `${left}px`; editor.style.top = `${top}px`;
         editor.classList.add('visible');
         this.editorCell = td;
@@ -488,6 +572,26 @@ class ParticleLifeApp {
             display.textContent = kind === 'strength' ? v.toFixed(2) : String(Math.round(v));
             this.styleForceCellValue(td, kind, v);
             this.applyForceCell(from, to, kind, v);
+            if (kind === 'radius') {
+                // Keep min slider max in sync with max radius
+                slider2.max = String(Math.max(0, Math.round(v) - 1));
+                if (parseFloat(slider2.value) >= v) {
+                    const clamped = Math.max(0, Math.round(v) - 1);
+                    slider2.value = String(clamped);
+                    display2.textContent = String(clamped);
+                    this.applyForceCell(from, to, 'minRadius', clamped);
+                    const minCell = document.querySelector(`#min-radius-table td[data-from="${from}"][data-to="${to}"]`) as HTMLTableCellElement | null;
+                    if (minCell) this.styleForceCellValue(minCell, 'minRadius', clamped);
+                }
+            }
+        };
+
+        slider2.oninput = () => {
+            const v = parseFloat(slider2.value);
+            display2.textContent = String(Math.round(v));
+            this.applyForceCell(from, to, 'minRadius', v);
+            const minCell = document.querySelector(`#min-radius-table td[data-from="${from}"][data-to="${to}"]`) as HTMLTableCellElement | null;
+            if (minCell) this.styleForceCellValue(minCell, 'minRadius', v);
         };
 
         const dismiss = (e: MouseEvent) => {
@@ -503,12 +607,14 @@ class ParticleLifeApp {
         this.editorCell = null;
     }
 
-    private applyForceCell(from: number, to: number, kind: 'strength' | 'radius', value: number): void {
+    private applyForceCell(from: number, to: number, kind: 'strength' | 'radius' | 'minRadius', value: number): void {
         if (!this.sim) return;
         const fm = this.sim.getParams().forceMatrix;
         if (!fm[from]) fm[from] = {};
-        if (!fm[from][to]) fm[from][to] = { strength: 0, radius: 100 };
-        if (kind === 'strength') fm[from][to].strength = value; else fm[from][to].radius = value;
+        if (!fm[from][to]) fm[from][to] = { strength: 0, radius: 100, minRadius: 0 };
+        if (kind === 'strength')  fm[from][to].strength  = value;
+        else if (kind === 'radius') fm[from][to].radius  = value;
+        else                      fm[from][to].minRadius = value;
         this.sim.updateParams({ forceMatrix: fm });
     }
 
@@ -677,6 +783,17 @@ class ParticleLifeApp {
         (document.getElementById('glowSlider') as HTMLInputElement).value = String(glow);
         document.getElementById('glowValue')!.textContent = glow.toFixed(2);
 
+        const alpha = this.sim.getParticleAlpha();
+        (document.getElementById('alphaSlider') as HTMLInputElement).value = String(alpha);
+        document.getElementById('alphaValue')!.textContent = alpha.toFixed(2);
+
+        const addStr = this.sim.getAdditiveStrength();
+        (document.getElementById('addStrSlider') as HTMLInputElement).value = String(addStr);
+        document.getElementById('addStrValue')!.textContent = addStr.toFixed(2);
+
+        this.setBlendMode(this.sim.getBlendMode() as 0 | 1);
+        this.setShapeMode(this.sim.getShapeMode() as 0 | 1);
+
         this.refreshForceMatrices();
         this.refreshTransformMatrix();  // also calls buildPolePanel()
         this.updateZoomDisplay();
@@ -720,8 +837,8 @@ class ParticleLifeApp {
     // ── Entry point ───────────────────────────────────────────────────────────
 
     async initialize(): Promise<void> {
-        const worldW = parseInt((document.getElementById('worldW') as HTMLInputElement).value) || 1600;
-        const worldH = parseInt((document.getElementById('worldH') as HTMLInputElement).value) || 900;
+        const worldW = parseInt((document.getElementById('worldW') as HTMLInputElement).value) || 4800;
+        const worldH = parseInt((document.getElementById('worldH') as HTMLInputElement).value) || 2700;
         this.setCanvasSize(worldW, worldH);
 
         this.sim = new ParticleSimulation(this.canvas);
@@ -738,8 +855,9 @@ class ParticleLifeApp {
         document.getElementById('particleCountDisplay')!.textContent = String(this.sim.getParams().particleCount);
         this.updateZoomDisplay();
 
-        this.buildMatrixTable('strength-table', 'strength');
-        this.buildMatrixTable('radius-table',   'radius');
+        this.buildMatrixTable('strength-table',   'strength');
+        this.buildMatrixTable('radius-table',     'radius');
+        this.buildMatrixTable('min-radius-table', 'minRadius');
         this.buildTransformMatrix();
         this.buildPolePanel();
 
