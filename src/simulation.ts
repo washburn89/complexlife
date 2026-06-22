@@ -320,7 +320,7 @@ export class ParticleSimulation {
             this.view.cx, this.view.cy, this.view.zoom,
             this.colorSaturation, this.particleGlow, this.particleAlpha,
             this.canvas.width, this.canvas.height,
-            this.additiveStrength, this.shapeMode, 0, 0,
+            this.additiveStrength, this.shapeMode, this.simulationTime, 0,
         ]) as Float32Array<ArrayBuffer>, U);
 
         const quad = new Float32Array([-1,-1, 1,-1, 1,1, -1,-1, 1,1, -1,1]);
@@ -620,14 +620,15 @@ export class ParticleSimulation {
             }
 
             // Probability of transformation per tick.
-            // x = force / threshold (same-sign values → x > 0 when condition met).
-            // Ramps from 0 at x=0.5 up to 50% at x=3, using smoothstep.
+            // x = force / threshold. Same sign → x > 0 (condition met).
+            // Non-zero for any force in the right direction; quadratic ramp
+            // reaches 50% at x=1 (force equals threshold) and stays there.
             fn transformProb(force: f32, threshold: f32) -> f32 {
                 if (abs(threshold) < 0.001) { return 0.0; }
                 let x = force / threshold;
-                if (x < 0.5) { return 0.0; }
-                let t = clamp((x - 0.5) / 2.5, 0.0, 1.0);
-                return t * t * (3.0 - 2.0 * t) * 0.5;
+                if (x <= 0.0) { return 0.0; }
+                let t = min(x, 1.0);
+                return t * t * 0.5;
             }
 
             @compute @workgroup_size(256)
@@ -725,23 +726,29 @@ export class ParticleSimulation {
                 if (simMode == 1u) {
                     let baseSeed = uhash(idx) ^ uhash(u32(abs(p.pos.x) * 157.0 + 1.0))
                                               ^ uhash(u32(abs(p.pos.y) * 239.0 + 1.0));
+                    var maxProb: f32 = 0.0;
+                    var newType: i32 = -1;
                     for (var t: u32 = 0u; t < numTypes; t++) {
                         let rule = transformRules[myType * 20u + t];
                         if (rule.upperEnabled > 0.5) {
                             let prob = transformProb(typeForce[t], rule.upperThreshold);
-                            if (prob > 0.0 && rand01(baseSeed ^ uhash(t * 3u + 0u)) < prob) {
-                                p.typeId = rule.upperTarget;
-                                break;
+                            maxProb = max(maxProb, prob);
+                            if (newType < 0 && prob > 0.0 && rand01(baseSeed ^ uhash(t * 3u + 0u)) < prob) {
+                                newType = i32(rule.upperTarget);
                             }
                         }
                         if (rule.lowerEnabled > 0.5) {
                             let prob = transformProb(typeForce[t], rule.lowerThreshold);
-                            if (prob > 0.0 && rand01(baseSeed ^ uhash(t * 3u + 1u)) < prob) {
-                                p.typeId = rule.lowerTarget;
-                                break;
+                            maxProb = max(maxProb, prob);
+                            if (newType < 0 && prob > 0.0 && rand01(baseSeed ^ uhash(t * 3u + 1u)) < prob) {
+                                newType = i32(rule.lowerTarget);
                             }
                         }
                     }
+                    if (newType >= 0) { p.typeId = f32(newType); }
+                    p._pad = maxProb;  // drives instability pulse in render shader
+                } else {
+                    p._pad = 0.0;
                 }
 
                 particles[idx] = p;
@@ -759,9 +766,9 @@ export class ParticleSimulation {
                 @location(2) @interpolate(flat) glow:   f32,
                 @location(3) @interpolate(flat) typeId: f32,
             }
-            // view: cx,cy,zoom, sat,glow,alpha, canvasW,canvasH, additiveStr,shapeMode,_p2,_p3  (48 B)
+            // view: cx,cy,zoom, sat,glow,alpha, canvasW,canvasH, additiveStr,shapeMode,simTime,_p3  (48 B)
             struct View { cx:f32, cy:f32, zoom:f32, sat:f32, glow:f32, alpha:f32,
-                          canvasW:f32, canvasH:f32, additiveStr:f32, shapeMode:f32, _p2:f32, _p3:f32 }
+                          canvasW:f32, canvasH:f32, additiveStr:f32, shapeMode:f32, simTime:f32, _p3:f32 }
 
             @group(0) @binding(0) var<storage, read> particles: array<Particle>;
             @group(0) @binding(1) var<uniform>       params:    vec4f;
@@ -790,7 +797,14 @@ export class ParticleSimulation {
                 let ny = -(p.pos.y - view.cy) * 2.0 * zoom / worldH;
                 // World-space constant size: 20 world-units radius, scales with zoom so
                 // zooming in reveals larger particles. aspectX keeps quads square in pixels.
-                let quadScale = 20.0 * 2.0 * zoom / worldH * (1.0 + view.glow * 3.5);
+                // Instability pulse: _pad stores max transform probability [0, 0.5].
+                // At max prob (50%/tick ≈ 10 Hz visual), particle oscillates ±10% in size.
+                let prob     = p._pad;
+                let normProb = clamp(prob * 2.0, 0.0, 1.0);          // 0→0, 0.5→1
+                let freq     = normProb * 62.83184;                   // up to 10 Hz × 2π
+                let phase    = f32(inst) * 2.39996 + view.simTime * freq;
+                let pulse    = 1.0 + normProb * 0.1 * sin(phase);
+                let quadScale = 20.0 * 2.0 * zoom / worldH * (1.0 + view.glow * 3.5) * pulse;
                 let aspectX   = view.canvasH / view.canvasW;
                 var o: VOut;
                 o.pos    = vec4f(nx + quad.x * quadScale * aspectX, ny + quad.y * quadScale, 0.0, 1.0);
@@ -905,7 +919,7 @@ export class ParticleSimulation {
             this.view.cx, this.view.cy, this.view.zoom,
             this.colorSaturation, this.particleGlow, this.particleAlpha,
             this.canvas.width, this.canvas.height,
-            this.additiveStrength, this.shapeMode, 0, 0,
+            this.additiveStrength, this.shapeMode, this.simulationTime, 0,
         ]) as Float32Array<ArrayBuffer>);
 
         const enc = this.device.createCommandEncoder();
