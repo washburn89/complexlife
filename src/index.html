@@ -203,6 +203,49 @@
 
         .hint { font-size: 10px; color: #555; margin-top: 6px; line-height: 1.4; }
 
+        /* ── Panel collapse ──────────────────────────────────────────────────── */
+        #ui { transition: transform 0.2s ease; }
+        #ui.collapsed { transform: translateX(-340px); }
+
+        #collapseBtn {
+            position: fixed; top: 50%; left: 340px;
+            transform: translateY(-50%);
+            flex: none; width: 16px; height: 48px;
+            padding: 0; border-radius: 0 5px 5px 0;
+            border-left: none; font-size: 10px;
+            cursor: pointer; z-index: 201;
+            transition: left 0.2s ease;
+            background: rgba(10,10,14,0.96); color: #0af;
+            border: 1px solid #333;
+        }
+        #collapseBtn:hover { background: #0af; color: #000; }
+
+        /* ── Bottom bar ──────────────────────────────────────────────────────── */
+        #bottom-bar {
+            position: fixed; bottom: 14px; left: 50%;
+            transform: translateX(-50%);
+            display: flex; gap: 8px; align-items: center;
+            background: rgba(8,8,12,0.88); border: 1px solid #333;
+            border-radius: 8px; padding: 6px 12px;
+            z-index: 100; backdrop-filter: blur(6px);
+        }
+        #bottom-bar button {
+            flex: none; width: auto; padding: 6px 16px;
+            font-size: 12px; border-radius: 5px;
+        }
+        #bottom-bar button.danger { border-color: #f55; color: #f55; }
+        #bottom-bar button.danger:hover { background: #f55; color: #000; }
+
+        /* ── Overlay canvas ──────────────────────────────────────────────────── */
+        #overlay {
+            position: fixed; top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            pointer-events: none; z-index: 50;
+            background: transparent;
+            transform: none;
+        }
+        body.track-selecting #sim-canvas { cursor: crosshair; }
+
         /* ── Pole panel ──────────────────────────────────────────────────────── */
         .pole-row { display: flex; align-items: center; gap: 5px; margin-bottom: 5px; flex-wrap: wrap; }
         .pole-count-btns { display: flex; gap: 2px; }
@@ -459,5 +502,11 @@
     </div>
 
     <canvas id="sim-canvas" oncontextmenu="return false" onmousedown="if(event.button===1)event.preventDefault()"></canvas>
+    <canvas id="overlay"></canvas>
+    <button id="collapseBtn" title="Toggle panel">&#9664;</button>
+    <div id="bottom-bar">
+        <button id="btmPauseBtn">&#9646;&#9646; Pause</button>
+        <button id="btmTrackBtn">&#8982; Track Entity</button>
+    </div>
 </body>
 </html>

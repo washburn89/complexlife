@@ -112,6 +112,22 @@ export class ParticleSimulation {
     private shapeMode        = 1;    // 0 = circles, 1 = procedural polygons
     private blendMode        = 1;    // 0 = standard over, 1 = additive (bloom)
 
+    // ── Entity tracking ────────────────────────────────────────────────────────
+    private isTracking        = false;
+    private trackComX         = 0;
+    private trackComY         = 0;
+    private trackRadius       = 200;
+    private trackDeathRadius  = 800;
+    private trackReadPending  = false;
+    private trackingParamBuffer:    GPUBuffer | null = null;
+    private trackingStatsBuffer:    GPUBuffer | null = null;
+    private trackingStagingBuffer:  GPUBuffer | null = null;
+    private trackingBGL:            GPUBindGroupLayout | null = null;
+    private trackingBindGroup:      GPUBindGroup | null = null;
+    private clearTrackPipeline:     GPUComputePipeline | null = null;
+    private accumTrackPipeline:     GPUComputePipeline | null = null;
+    onTrackingStop: (() => void) | null = null;
+
     private transformRules: TransformRule[] = [];
     private poleConfigs = new Uint32Array(MAX_TYPES);
     private poleBuffer: GPUBuffer | null = null;
@@ -315,6 +331,11 @@ export class ParticleSimulation {
         this.gridCellStartBuffer = this.device!.createBuffer({ label: 'gridCellStart', size: MAX_CELLS * 4, usage: GS });
         this.gridListBuffer      = this.device!.createBuffer({ label: 'gridList',      size: MAX_PARTICLE_CAPACITY * 4, usage: GS });
         this.gridParamsBuffer    = this.device!.createBuffer({ label: 'gridParams',    size: 16, usage: GS });
+
+        // Entity tracking buffers
+        this.trackingParamBuffer   = this.device!.createBuffer({ label: 'trackParam',   size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.trackingStatsBuffer   = this.device!.createBuffer({ label: 'trackStats',   size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        this.trackingStagingBuffer = this.device!.createBuffer({ label: 'trackStaging', size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     }
 
     private async createPipelines(): Promise<void> {
@@ -379,6 +400,17 @@ export class ParticleSimulation {
                 } }] },
         });
 
+        // Entity tracking pipeline (separate bind group layout)
+        this.trackingBGL = this.device.createBindGroupLayout({ entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // particles
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // trackParams
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // stats (atomics)
+        ]});
+        const trackPipeLayout = this.device.createPipelineLayout({ bindGroupLayouts: [this.trackingBGL] });
+        const trackModule = this.device.createShaderModule({ code: this.getTrackingShaderCode() });
+        this.clearTrackPipeline = this.device.createComputePipeline({ layout: trackPipeLayout, compute: { module: trackModule, entryPoint: 'clearStats' } });
+        this.accumTrackPipeline = this.device.createComputePipeline({ layout: trackPipeLayout, compute: { module: trackModule, entryPoint: 'accumStats' } });
+
         this.rebuildBindGroups();
     }
 
@@ -412,6 +444,17 @@ export class ParticleSimulation {
                 { binding: 2, resource: { buffer: this.viewBuffer     } },
             ],
         });
+
+        if (this.trackingBGL && this.trackingParamBuffer && this.trackingStatsBuffer) {
+            this.trackingBindGroup = this.device.createBindGroup({
+                layout: this.trackingBGL,
+                entries: [
+                    { binding: 0, resource: { buffer: this.particleBuffer      } },
+                    { binding: 1, resource: { buffer: this.trackingParamBuffer } },
+                    { binding: 2, resource: { buffer: this.trackingStatsBuffer } },
+                ],
+            });
+        }
     }
 
     // ── Grid helpers ──────────────────────────────────────────────────────────
@@ -816,15 +859,48 @@ export class ParticleSimulation {
         `;
     }
 
+    private getTrackingShaderCode(): string {
+        return /* wgsl */`
+            struct Particle    { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
+            struct TrackParams { comX: f32, comY: f32, trackRadius: f32, enabled: u32 }
+
+            @group(0) @binding(0) var<storage, read>       particles: array<Particle>;
+            @group(0) @binding(1) var<uniform>             tp: TrackParams;
+            @group(0) @binding(2) var<storage, read_write> stats: array<atomic<u32>>;
+
+            // Pass 1: zero the 4 slots (run 1 workgroup, only threads 0-3 do work)
+            @compute @workgroup_size(256)
+            fn clearStats(@builtin(global_invocation_id) gid: vec3u) {
+                if (gid.x < 4u) { atomicStore(&stats[gid.x], 0u); }
+            }
+
+            // Pass 2: accumulate (pos - com) offset and spread for particles in radius.
+            // Stats layout: [sumDX, sumDY, count, maxDist] all as u32.
+            // sumDX/sumDY are signed via bitcast; atomicAdd on u32 is modular = correct i32 arithmetic.
+            @compute @workgroup_size(256)
+            fn accumStats(@builtin(global_invocation_id) gid: vec3u) {
+                if (tp.enabled == 0u) { return; }
+                let i = gid.x;
+                if (i >= arrayLength(&particles)) { return; }
+                let p  = particles[i];
+                let dx = p.pos.x - tp.comX;
+                let dy = p.pos.y - tp.comY;
+                let r  = tp.trackRadius;
+                if (dx * dx + dy * dy < r * r) {
+                    atomicAdd(&stats[0], bitcast<u32>(i32(dx)));
+                    atomicAdd(&stats[1], bitcast<u32>(i32(dy)));
+                    atomicAdd(&stats[2], 1u);
+                    atomicMax(&stats[3], u32(sqrt(dx * dx + dy * dy)));
+                }
+            }
+        `;
+    }
+
     // ── Public API ────────────────────────────────────────────────────────────
 
     update(): void {
-        if (!this.isInitialized || !this.device || !this.queue || !this.context || this.isPaused) return;
+        if (!this.isInitialized || !this.device || !this.queue || !this.context) return;
 
-        this.queue.writeBuffer(this.paramsBuffer!,    0, this.paramsArray());
-        this.queue.writeBuffer(this.forcesBuffer!,    0, this.generateForcesData());
-        this.queue.writeBuffer(this.transformBuffer!, 0, this.generateTransformData());
-        this.queue.writeBuffer(this.poleBuffer!,      0, this.generatePoleData());
         this.queue.writeBuffer(this.viewBuffer!, 0, new Float32Array([
             this.view.cx, this.view.cy, this.view.zoom,
             this.colorSaturation, this.particleGlow, this.particleAlpha,
@@ -832,45 +908,70 @@ export class ParticleSimulation {
             this.additiveStrength, this.shapeMode, 0, 0,
         ]) as Float32Array<ArrayBuffer>);
 
-        // Upload grid params (cellSize must always ≥ maxRadius so 3×3 neighbourhood is sufficient)
-        const gp = this.computeGridParams();
-        const gpData = new Uint32Array(4);
-        gpData[0] = gp.gridW; gpData[1] = gp.gridH; gpData[2] = gp.numCells;
-        new Float32Array(gpData.buffer)[3] = gp.cellSize;
-        this.queue.writeBuffer(this.gridParamsBuffer!, 0, gpData);
-
         const enc = this.device.createCommandEncoder();
         const N   = this.params.particleCount;
 
-        const clearCp = enc.beginComputePass();
-        clearCp.setPipeline(this.clearGridPipeline!);
-        clearCp.setBindGroup(0, this.computeBindGroup!);
-        clearCp.dispatchWorkgroups(Math.ceil(MAX_CELLS / 256));
-        clearCp.end();
+        if (!this.isPaused) {
+            this.queue.writeBuffer(this.paramsBuffer!,    0, this.paramsArray());
+            this.queue.writeBuffer(this.forcesBuffer!,    0, this.generateForcesData());
+            this.queue.writeBuffer(this.transformBuffer!, 0, this.generateTransformData());
+            this.queue.writeBuffer(this.poleBuffer!,      0, this.generatePoleData());
 
-        const countCp = enc.beginComputePass();
-        countCp.setPipeline(this.countParticlesPipeline!);
-        countCp.setBindGroup(0, this.computeBindGroup!);
-        countCp.dispatchWorkgroups(Math.ceil(N / 256));
-        countCp.end();
+            const gp = this.computeGridParams();
+            const gpData = new Uint32Array(4);
+            gpData[0] = gp.gridW; gpData[1] = gp.gridH; gpData[2] = gp.numCells;
+            new Float32Array(gpData.buffer)[3] = gp.cellSize;
+            this.queue.writeBuffer(this.gridParamsBuffer!, 0, gpData);
 
-        const prefixCp = enc.beginComputePass();
-        prefixCp.setPipeline(this.prefixSumPipeline!);
-        prefixCp.setBindGroup(0, this.computeBindGroup!);
-        prefixCp.dispatchWorkgroups(1);
-        prefixCp.end();
+            const clearCp = enc.beginComputePass();
+            clearCp.setPipeline(this.clearGridPipeline!);
+            clearCp.setBindGroup(0, this.computeBindGroup!);
+            clearCp.dispatchWorkgroups(Math.ceil(MAX_CELLS / 256));
+            clearCp.end();
 
-        const scatterCp = enc.beginComputePass();
-        scatterCp.setPipeline(this.scatterPipeline!);
-        scatterCp.setBindGroup(0, this.computeBindGroup!);
-        scatterCp.dispatchWorkgroups(Math.ceil(N / 256));
-        scatterCp.end();
+            const countCp = enc.beginComputePass();
+            countCp.setPipeline(this.countParticlesPipeline!);
+            countCp.setBindGroup(0, this.computeBindGroup!);
+            countCp.dispatchWorkgroups(Math.ceil(N / 256));
+            countCp.end();
 
-        const forceCp = enc.beginComputePass();
-        forceCp.setPipeline(this.computePipeline!);
-        forceCp.setBindGroup(0, this.computeBindGroup!);
-        forceCp.dispatchWorkgroups(Math.ceil(N / 256));
-        forceCp.end();
+            const prefixCp = enc.beginComputePass();
+            prefixCp.setPipeline(this.prefixSumPipeline!);
+            prefixCp.setBindGroup(0, this.computeBindGroup!);
+            prefixCp.dispatchWorkgroups(1);
+            prefixCp.end();
+
+            const scatterCp = enc.beginComputePass();
+            scatterCp.setPipeline(this.scatterPipeline!);
+            scatterCp.setBindGroup(0, this.computeBindGroup!);
+            scatterCp.dispatchWorkgroups(Math.ceil(N / 256));
+            scatterCp.end();
+
+            const forceCp = enc.beginComputePass();
+            forceCp.setPipeline(this.computePipeline!);
+            forceCp.setBindGroup(0, this.computeBindGroup!);
+            forceCp.dispatchWorkgroups(Math.ceil(N / 256));
+            forceCp.end();
+
+            this.simulationTime += 0.016;
+        }
+
+        // Entity tracking passes (run every frame so CoM updates even while paused)
+        if (this.isTracking && this.trackingBindGroup && this.clearTrackPipeline && this.accumTrackPipeline) {
+            this.queue.writeBuffer(this.trackingParamBuffer!, 0, new Float32Array([
+                this.trackComX, this.trackComY, this.trackRadius, 1.0,
+            ]));
+            const clrCp = enc.beginComputePass();
+            clrCp.setPipeline(this.clearTrackPipeline);
+            clrCp.setBindGroup(0, this.trackingBindGroup);
+            clrCp.dispatchWorkgroups(1);
+            clrCp.end();
+            const accCp = enc.beginComputePass();
+            accCp.setPipeline(this.accumTrackPipeline);
+            accCp.setBindGroup(0, this.trackingBindGroup);
+            accCp.dispatchWorkgroups(Math.ceil(N / 256));
+            accCp.end();
+        }
 
         const bg = this.backgroundColor;
         const rp = enc.beginRenderPass({
@@ -886,8 +987,38 @@ export class ParticleSimulation {
         rp.draw(6, this.params.particleCount);
         rp.end();
 
+        const doReadback = this.isTracking && !this.trackReadPending;
+        if (doReadback) {
+            enc.copyBufferToBuffer(this.trackingStatsBuffer!, 0, this.trackingStagingBuffer!, 0, 16);
+        }
+
         this.queue.submit([enc.finish()]);
-        this.simulationTime += 0.016;
+
+        if (doReadback) {
+            this.trackReadPending = true;
+            this.trackingStagingBuffer!.mapAsync(GPUMapMode.READ).then(() => {
+                const buf = this.trackingStagingBuffer!.getMappedRange();
+                const u32 = new Uint32Array(buf);
+                const i32 = new Int32Array(buf);
+                const count     = u32[2];
+                const maxSpread = u32[3];
+                if (count >= 3) {
+                    this.trackComX += i32[0] / count;
+                    this.trackComY += i32[1] / count;
+                    if (maxSpread > this.trackDeathRadius) {
+                        this.isTracking = false;
+                        this.onTrackingStop?.();
+                    } else {
+                        this.view = { ...this.view, cx: this.trackComX, cy: this.trackComY };
+                    }
+                } else if (count === 0) {
+                    this.isTracking = false;
+                    this.onTrackingStop?.();
+                }
+                this.trackingStagingBuffer!.unmap();
+                this.trackReadPending = false;
+            });
+        }
     }
 
     updateParams(p: Partial<SimulationParams>): void {
@@ -973,6 +1104,21 @@ export class ParticleSimulation {
 
     setView(cx: number, cy: number, zoom: number): void { this.view = { cx, cy, zoom }; }
     getView(): ViewState { return { ...this.view }; }
+
+    startTracking(comX: number, comY: number, radius: number): void {
+        this.isTracking       = true;
+        this.trackComX        = comX;
+        this.trackComY        = comY;
+        this.trackRadius      = Math.max(10, radius);
+        this.trackDeathRadius = radius * 4;
+        this.trackReadPending = false;
+    }
+    stopTracking(): void { this.isTracking = false; }
+    isEntityTracking(): boolean { return this.isTracking; }
+    getTrackingInfo(): { comX: number; comY: number; radius: number } | null {
+        if (!this.isTracking) return null;
+        return { comX: this.trackComX, comY: this.trackComY, radius: this.trackRadius };
+    }
 
     setTransformRule(source: number, trigger: number, rule: TransformRule): void {
         this.transformRules[source * MAX_TYPES + trigger] = { ...rule };

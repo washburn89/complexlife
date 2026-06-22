@@ -63,13 +63,32 @@ class ParticleLifeApp {
     private frameCount    = 0;
     private lastTime      = performance.now();
     private autoPause     = true;
-    private lowFpsFrames  = 0;  // counts consecutive 1-second windows below threshold
+    private lowFpsFrames  = 0;
+
+    // ── Panel + overlay ───────────────────────────────────────────────────────
+    private panelCollapsed  = false;
+    private overlayCanvas:  HTMLCanvasElement | null = null;
+    private overlayCtx:     CanvasRenderingContext2D | null = null;
+
+    // ── Entity tracking ───────────────────────────────────────────────────────
+    private trackMode: 'idle' | 'selecting' | 'tracking' = 'idle';
+    private selBoxActive = false;
+    private selBox = { sx0: 0, sy0: 0, sx1: 0, sy1: 0 };
 
     constructor() {
         this.canvas = document.getElementById('sim-canvas') as HTMLCanvasElement;
+        this.overlayCanvas = document.getElementById('overlay') as HTMLCanvasElement;
+        this.overlayCtx = this.overlayCanvas.getContext('2d');
+        this.resizeOverlay();
         this.setupUI();
         this.setupCanvasEvents();
-        window.addEventListener('resize', () => this.fitCanvas());
+        window.addEventListener('resize', () => { this.fitCanvas(); this.resizeOverlay(); });
+    }
+
+    private resizeOverlay(): void {
+        if (!this.overlayCanvas) return;
+        this.overlayCanvas.width  = window.innerWidth;
+        this.overlayCanvas.height = window.innerHeight;
     }
 
     // ── Canvas sizing ─────────────────────────────────────────────────────────
@@ -256,8 +275,37 @@ class ParticleLifeApp {
         });
 
         document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') { this.closeForceEditor(); this.closeTransformEditor(); }
+            if (e.key === 'Escape') {
+                this.closeForceEditor(); this.closeTransformEditor();
+                if (this.trackMode === 'selecting') { this.trackMode = 'idle'; this.syncTrackButton(); }
+            }
+            if (e.key === ' ' && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
+                e.preventDefault();
+                if (!this.sim) return;
+                this.sim.togglePause();
+                this.syncPauseButton();
+            }
         });
+
+        // Panel collapse
+        document.getElementById('collapseBtn')!.addEventListener('click', () => {
+            this.panelCollapsed = !this.panelCollapsed;
+            document.getElementById('ui')!.classList.toggle('collapsed', this.panelCollapsed);
+            const btn = document.getElementById('collapseBtn')!;
+            btn.style.left = this.panelCollapsed ? '0' : '340px';
+            btn.innerHTML  = this.panelCollapsed ? '&#9654;' : '&#9664;';
+        });
+
+        // Bottom bar
+        document.getElementById('btmPauseBtn')!.addEventListener('click', () => {
+            if (!this.sim) return;
+            this.sim.togglePause();
+            this.syncPauseButton();
+        });
+        document.getElementById('btmTrackBtn')!.addEventListener('click', () => this.handleTrackButton());
+
+        // Tracking-stop callback (fires when entity dies)
+        // wired once sim is created — done in the sim init callback
     }
 
     private syncPauseButton(): void {
@@ -265,6 +313,10 @@ class ParticleLifeApp {
         const btn = document.getElementById('pauseBtn')!;
         btn.textContent = paused ? 'Resume' : 'Pause';
         btn.classList.toggle('active', paused);
+        const btm = document.getElementById('btmPauseBtn')!;
+        btm.textContent = paused ? '&#9654; Resume' : '&#9646;&#9646; Pause';
+        btm.innerHTML   = paused ? '&#9654; Resume' : '&#9646;&#9646; Pause';
+        btm.classList.toggle('active', paused);
     }
 
     private setSimMode(mode: 0 | 1): void {
@@ -294,34 +346,173 @@ class ParticleLifeApp {
         document.getElementById('shapePolyBtn')!.classList.toggle('selected', mode === 1);
     }
 
-    // ── Pan / zoom ────────────────────────────────────────────────────────────
+    // ── Entity tracking helpers ───────────────────────────────────────────────
 
-    private setupCanvasEvents(): void {
-        let panning = false, lastX = 0, lastY = 0;
+    private screenToWorld(sx: number, sy: number): { wx: number; wy: number } {
+        if (!this.sim) return { wx: 0, wy: 0 };
+        const rect   = this.canvas.getBoundingClientRect();
+        const params = this.sim.getParams();
+        const view   = this.sim.getView();
+        return {
+            wx: view.cx + (sx - rect.left - rect.width  / 2) * params.worldWidth  / (rect.width  * view.zoom),
+            wy: view.cy + (sy - rect.top  - rect.height / 2) * params.worldHeight / (rect.height * view.zoom),
+        };
+    }
 
-        this.canvas.addEventListener('mousedown', (e) => {
-            if (e.button !== 1) return;
-            e.preventDefault();
-            panning = true; lastX = e.clientX; lastY = e.clientY;
-            this.canvas.style.cursor = 'grabbing';
-        });
+    private handleTrackButton(): void {
+        if (this.trackMode === 'tracking') {
+            this.sim?.stopTracking();
+            this.trackMode = 'idle';
+        } else if (this.trackMode === 'selecting') {
+            this.trackMode = 'idle';
+            document.body.classList.remove('track-selecting');
+        } else {
+            this.trackMode = 'selecting';
+            document.body.classList.add('track-selecting');
+        }
+        this.syncTrackButton();
+    }
 
-        window.addEventListener('mousemove', (e) => {
-            if (!panning || !this.sim) return;
+    private syncTrackButton(): void {
+        // If the entity died externally, snap back to idle
+        if (this.trackMode === 'tracking' && !this.sim?.isEntityTracking()) {
+            this.trackMode = 'idle';
+        }
+        const btn = document.getElementById('btmTrackBtn')!;
+        if (this.trackMode === 'tracking') {
+            btn.innerHTML = '&#9633; Stop Track';
+            btn.classList.add('danger');
+            btn.classList.remove('active');
+        } else if (this.trackMode === 'selecting') {
+            btn.innerHTML = '&#10005; Cancel';
+            btn.classList.add('active');
+            btn.classList.remove('danger');
+        } else {
+            btn.innerHTML = '&#8982; Track Entity';
+            btn.classList.remove('active', 'danger');
+        }
+    }
+
+    private drawOverlay(): void {
+        if (!this.overlayCtx || !this.overlayCanvas) return;
+        const ctx = this.overlayCtx;
+        ctx.clearRect(0, 0, this.overlayCanvas.width, this.overlayCanvas.height);
+
+        if (this.trackMode === 'selecting' && this.selBoxActive) {
+            const { sx0, sy0, sx1, sy1 } = this.selBox;
+            ctx.strokeStyle = '#0af';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([5, 4]);
+            ctx.strokeRect(Math.min(sx0, sx1), Math.min(sy0, sy1),
+                           Math.abs(sx1 - sx0), Math.abs(sy1 - sy0));
+            ctx.setLineDash([]);
+        }
+
+        if (this.trackMode === 'tracking' && this.sim) {
+            const info = this.sim.getTrackingInfo();
+            if (!info) { this.trackMode = 'idle'; this.syncTrackButton(); return; }
             const rect   = this.canvas.getBoundingClientRect();
             const params = this.sim.getParams();
             const view   = this.sim.getView();
-            this.sim.setView(
-                view.cx - (e.clientX - lastX) * params.worldWidth  / (rect.width  * view.zoom),
-                view.cy - (e.clientY - lastY) * params.worldHeight / (rect.height * view.zoom),
-                view.zoom
-            );
-            lastX = e.clientX; lastY = e.clientY;
+            const sx = rect.left + rect.width  / 2 + (info.comX - view.cx) * view.zoom * rect.width  / params.worldWidth;
+            const sy = rect.top  + rect.height / 2 + (info.comY - view.cy) * view.zoom * rect.height / params.worldHeight;
+            const sr = info.radius * view.zoom * rect.width / params.worldWidth;
+
+            const drift = (performance.now() * 0.02) % 20;
+            ctx.save();
+            ctx.strokeStyle = 'rgba(255,200,0,0.55)';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([6, 6]);
+            ctx.lineDashOffset = -drift;
+            ctx.beginPath();
+            ctx.arc(sx, sy, Math.max(4, sr), 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            ctx.strokeStyle = 'rgba(255,200,0,0.8)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(sx - 10, sy); ctx.lineTo(sx + 10, sy);
+            ctx.moveTo(sx, sy - 10); ctx.lineTo(sx, sy + 10);
+            ctx.stroke();
+            ctx.restore();
+        }
+    }
+
+    // ── Pan / zoom ────────────────────────────────────────────────────────────
+
+    private stopTracking(): void {
+        if (this.trackMode === 'tracking') {
+            this.sim?.stopTracking();
+            this.trackMode = 'idle';
+            this.syncTrackButton();
+        }
+    }
+
+    private setupCanvasEvents(): void {
+        let panning = false, lastX = 0, lastY = 0, panDist = 0;
+        const PAN_BREAK_THRESHOLD = 30; // pixels before tracking breaks
+
+        this.canvas.addEventListener('mousedown', (e) => {
+            // Middle-click → pan
+            if (e.button === 1) {
+                e.preventDefault();
+                panning = true; lastX = e.clientX; lastY = e.clientY; panDist = 0;
+                this.canvas.style.cursor = 'grabbing';
+                return;
+            }
+            // Left-click in selecting mode → start selection box
+            if (e.button === 0 && this.trackMode === 'selecting') {
+                e.preventDefault();
+                this.selBoxActive = true;
+                this.selBox = { sx0: e.clientX, sy0: e.clientY, sx1: e.clientX, sy1: e.clientY };
+            }
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (panning && this.sim) {
+                const dx = e.clientX - lastX, dy = e.clientY - lastY;
+                const rect   = this.canvas.getBoundingClientRect();
+                const params = this.sim.getParams();
+                const view   = this.sim.getView();
+                this.sim.setView(
+                    view.cx - dx * params.worldWidth  / (rect.width  * view.zoom),
+                    view.cy - dy * params.worldHeight / (rect.height * view.zoom),
+                    view.zoom
+                );
+                lastX = e.clientX; lastY = e.clientY;
+                panDist += Math.sqrt(dx * dx + dy * dy);
+                if (panDist > PAN_BREAK_THRESHOLD) this.stopTracking();
+            }
+            if (this.selBoxActive && this.trackMode === 'selecting') {
+                this.selBox.sx1 = e.clientX;
+                this.selBox.sy1 = e.clientY;
+            }
         });
 
         window.addEventListener('mouseup', (e) => {
-            if (e.button !== 1) return;
-            panning = false; this.canvas.style.cursor = '';
+            if (e.button === 1) {
+                panning = false; this.canvas.style.cursor = '';
+            }
+            if (e.button === 0 && this.selBoxActive && this.trackMode === 'selecting') {
+                this.selBoxActive = false;
+                document.body.classList.remove('track-selecting');
+                const { sx0, sy0, sx1, sy1 } = this.selBox;
+                const w = Math.abs(sx1 - sx0), h = Math.abs(sy1 - sy0);
+                if (w > 8 && h > 8 && this.sim) {
+                    const { wx: wx0, wy: wy0 } = this.screenToWorld(Math.min(sx0, sx1), Math.min(sy0, sy1));
+                    const { wx: wx1, wy: wy1 } = this.screenToWorld(Math.max(sx0, sx1), Math.max(sy0, sy1));
+                    const comX   = (wx0 + wx1) / 2;
+                    const comY   = (wy0 + wy1) / 2;
+                    const radius = Math.max(wx1 - wx0, wy1 - wy0) * 0.75;
+                    this.sim.startTracking(comX, comY, radius);
+                    this.sim.onTrackingStop = () => { this.trackMode = 'idle'; this.syncTrackButton(); };
+                    this.trackMode = 'tracking';
+                } else {
+                    this.trackMode = 'idle';
+                }
+                this.syncTrackButton();
+            }
         });
 
         this.canvas.addEventListener('wheel', (e) => {
@@ -829,6 +1020,7 @@ class ParticleLifeApp {
         const tick = () => {
             this.sim?.update();
             this.updateStats();
+            this.drawOverlay();
             this.animId = requestAnimationFrame(tick);
         };
         this.animId = requestAnimationFrame(tick);
