@@ -124,6 +124,19 @@
         #transform-panel { display: none; }
         #transform-panel.visible { display: block; }
 
+        #mode2-panel { display: none; }
+        #mode2-panel.visible { display: block; }
+
+        /* ── Mass per-type table ─────────────────────────────────────────────── */
+        .mass-table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+        .mass-table td { padding: 2px 4px; font-size: 10px; vertical-align: middle; }
+        .mass-table .mass-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+        .mass-table input[type=number] {
+            width: 40px; background: #1e1e28; border: 1px solid #333; color: #fff;
+            font-size: 10px; padding: 2px 4px; border-radius: 3px; text-align: center;
+        }
+        .mass-table input[type=number]:focus { border-color: #0af; outline: none; }
+
         .tr-hint {
             font-size: 10px; color: #555; margin-bottom: 8px; line-height: 1.4;
         }
@@ -156,6 +169,13 @@
         }
         .te-rule-header input[type="checkbox"] { accent-color: #0af; width: 13px; height: 13px; }
         .te-rule-header label { cursor: pointer; }
+        .te-op-toggle { display: flex; gap: 2px; margin-left: 2px; }
+        .te-op {
+            padding: 1px 4px; font-size: 9px; font-family: monospace;
+            background: #0e0e18; color: #666; border: 1px solid #333;
+            border-radius: 3px; cursor: pointer; line-height: 1.4;
+        }
+        .te-op.selected { background: #0a2535; color: #0af; border-color: #0af; }
         .te-threshold-row {
             display: flex; align-items: center; gap: 6px; font-size: 10px; color: #888;
             padding-left: 18px;
@@ -245,6 +265,7 @@
             transform: none;
         }
         body.track-selecting #sim-canvas { cursor: crosshair; }
+        body.inspect-mode #sim-canvas { cursor: cell; }
 
         /* ── Pole panel ──────────────────────────────────────────────────────── */
         .pole-row { display: flex; align-items: center; gap: 5px; margin-bottom: 5px; flex-wrap: wrap; }
@@ -262,6 +283,114 @@
         }
         .pole-sign-pos { color: #0f8; border-color: #0f8; }
         .pole-sign-neg { color: #f55; border-color: #f55; }
+
+        /* ── Cursor tools panel ──────────────────────────────────────────────── */
+        #cursor-panel {
+            position: fixed; top: 0; right: 0; width: 150px; height: 100vh;
+            background: rgba(10,10,14,0.96); border-left: 1px solid #1a1a28;
+            z-index: 190; display: flex; flex-direction: column;
+            font-size: 11px; overflow-y: auto;
+            transition: transform 0.2s ease;
+        }
+        #cursor-panel.collapsed { transform: translateX(150px); }
+        #cursor-panel .cpanel-header {
+            font-size: 9px; font-weight: bold; letter-spacing: 0.08em;
+            color: #555; padding: 10px 10px 8px;
+            border-bottom: 1px solid #1a1a28; text-transform: uppercase;
+        }
+        .ctool-btn {
+            width: 100%; text-align: left; padding: 9px 10px;
+            font-size: 11px; background: transparent;
+            border: none; border-bottom: 1px solid #111;
+            color: #777; cursor: pointer; transition: background 0.1s, color 0.1s;
+        }
+        .ctool-btn:hover { background: #1a1a28; color: #ccc; }
+        .ctool-btn.active { background: #0a1f30; color: #0af; border-left: 2px solid #0af; }
+        .cpanel-section {
+            padding: 10px; border-bottom: 1px solid #1a1a28;
+            display: flex; flex-direction: column; gap: 5px;
+        }
+        .cpanel-label {
+            font-size: 9px; color: #555; font-weight: bold;
+            letter-spacing: 0.06em; text-transform: uppercase;
+        }
+        .cpanel-slider { width: 100%; accent-color: #0af; }
+        .cpanel-val { font-size: 10px; color: #888; font-family: monospace; }
+        .cpanel-hint { font-size: 9px; color: #444; line-height: 1.5; }
+
+        #cursorCollapseBtn {
+            position: fixed; top: 50%; right: 150px;
+            transform: translateY(-50%);
+            width: 16px; height: 48px; padding: 0; margin: 0;
+            border: 1px solid #333; border-right: none;
+            border-radius: 4px 0 0 4px;
+            background: rgba(10,10,14,0.96); color: #0af;
+            cursor: pointer; font-size: 10px; text-align: center;
+            z-index: 191; transition: right 0.2s ease;
+            line-height: 48px;
+        }
+        body.cursor-panel-collapsed #cursorCollapseBtn { right: 0; }
+        #cursorCollapseBtn:hover { background: #0af; color: #000; }
+
+        /* Shift inspector left of cursor panel when both visible */
+        body:not(.cursor-panel-collapsed) #diag-panel { right: 150px; }
+
+        /* ── Diagnostic / inspector panel ───────────────────────────────────── */
+        #diag-panel {
+            position: fixed; top: 0; right: 0;
+            width: 260px; height: 100vh;
+            background: rgba(10,10,14,0.96);
+            color: #ddd; display: none; flex-direction: column;
+            font-size: 11px; z-index: 200;
+            border-left: 1px solid #333;
+        }
+        #diag-panel.visible { display: flex; }
+        #diag-header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 8px 10px; border-bottom: 1px solid #333;
+            font-size: 10px; color: #0af; font-weight: bold;
+            flex-shrink: 0;
+        }
+        #diag-close {
+            flex: none; width: 20px; height: 20px; padding: 0;
+            font-size: 12px; border-radius: 3px; line-height: 1;
+        }
+        #diag-body { flex: 1; overflow-y: auto; padding: 8px 10px; display: flex; flex-direction: column; gap: 4px; }
+        .diag-kv { display: flex; align-items: baseline; gap: 6px; font-size: 11px; }
+        .diag-key { color: #666; flex-shrink: 0; width: 70px; }
+        .diag-val { color: #ddd; font-family: monospace; }
+        .diag-type-swatch {
+            display: inline-block; width: 9px; height: 9px;
+            border-radius: 50%; margin-right: 4px; vertical-align: middle;
+        }
+        .diag-section {
+            margin-top: 8px; margin-bottom: 3px;
+            font-size: 9px; color: #555; letter-spacing: 0.06em;
+            border-top: 1px solid #222; padding-top: 6px;
+        }
+        .diag-force-row {
+            display: flex; align-items: center; gap: 5px; font-size: 10px; margin-bottom: 2px;
+        }
+        .diag-force-pip {
+            display: inline-block; width: 7px; height: 7px;
+            border-radius: 50%; flex-shrink: 0;
+        }
+        .diag-force-bar-wrap {
+            flex: 1; height: 6px; background: #1a1a22; border-radius: 2px;
+            position: relative; overflow: hidden;
+        }
+        .diag-force-bar {
+            position: absolute; top: 0; height: 100%; border-radius: 2px;
+        }
+        .diag-force-val { font-family: monospace; width: 42px; text-align: right; color: #aaa; }
+        .diag-prob-row {
+            display: flex; align-items: center; gap: 5px; font-size: 10px; margin-bottom: 2px;
+        }
+        .diag-prob-bar-wrap {
+            flex: 1; height: 6px; background: #1a1a22; border-radius: 2px; overflow: hidden;
+        }
+        .diag-prob-bar { height: 100%; background: #fa0; border-radius: 2px; }
+        .diag-prob-val { font-family: monospace; width: 36px; text-align: right; color: #fa0; }
     </style>
 </head>
 <body>
@@ -270,7 +399,7 @@
             <h3>Particle Life</h3>
             <div id="stats-bar">
                 <span>FPS: <span id="fps">0</span></span>
-                <label class="ap-label" title="Auto-pause when FPS drops below 5">
+                <label class="ap-label" title="Auto-pause when FPS drops below threshold (set in Settings)">
                     <input type="checkbox" id="autoPauseChk" checked> AP
                 </label>
                 <span id="fps-warn">⚠ low FPS</span>
@@ -337,6 +466,18 @@
                 <div class="mode-toggle-row">
                     <button class="mode-btn selected" id="mode0-btn">0 · Classic</button>
                     <button class="mode-btn"          id="mode1-btn">1 · Transform</button>
+                    <button class="mode-btn"          id="mode2-btn">2 · Mass</button>
+                </div>
+
+                <div id="mode2-panel">
+                    <p class="tr-hint">
+                        Each particle type has an integer mass (1–8). Mass attenuates applied force
+                        (inertia). Transforms must conserve mass: a mass-4 particle can split into
+                        2×mass-2 or 4×mass-1; to form a higher-mass type it consumes same-type
+                        neighbors within range.
+                    </p>
+                    <p class="matrix-label">Mass per type</p>
+                    <table class="mass-table" id="mass-table"></table>
                 </div>
 
                 <div id="transform-panel">
@@ -443,6 +584,35 @@
                 </div>
 
                 <div class="settings-section">
+                    <h4>Physics</h4>
+                    <div class="settings-row">
+                        <label>Friction</label>
+                        <input type="range" id="frictionSlider" min="0" max="0.99" step="0.01" value="0.85">
+                        <span class="val" id="frictionValue">0.85</span>
+                    </div>
+                    <div class="settings-row">
+                        <label>Max Transform</label>
+                        <input type="range" id="maxTransformSlider" min="0.01" max="1.0" step="0.01" value="0.5">
+                        <span class="val" id="maxTransformValue">0.50</span>
+                    </div>
+                    <p class="hint" style="margin-top:4px">
+                        Friction: velocity multiplier per tick (lower = more drag). Max Transform: peak chance per tick to change type at threshold.
+                    </p>
+                </div>
+
+                <div class="settings-section">
+                    <h4>Performance</h4>
+                    <div class="settings-row">
+                        <label>Auto-pause below</label>
+                        <input type="number" id="autoPauseMinFps" min="1" max="120" step="1" value="45" style="width:50px">
+                        <span class="val">FPS</span>
+                    </div>
+                    <p class="hint" style="margin-top:4px">
+                        Simulation pauses automatically when FPS stays below this threshold for 2 consecutive seconds. The AP checkbox in the header toggles this on/off.
+                    </p>
+                </div>
+
+                <div class="settings-section">
                     <h4>Config</h4>
                     <div class="btn-row">
                         <button id="exportBtn">Export JSON</button>
@@ -475,7 +645,11 @@
         <div class="te-rule" id="te-upper">
             <div class="te-rule-header">
                 <input type="checkbox" id="te-upper-enabled">
-                <label for="te-upper-enabled">↑ force from trigger &gt;</label>
+                <label for="te-upper-enabled">↑ force from trigger</label>
+                <div class="te-op-toggle">
+                    <button class="te-op selected" id="te-upper-gt">&gt;</button>
+                    <button class="te-op" id="te-upper-gte">&gt;=</button>
+                </div>
             </div>
             <div class="te-threshold-row">
                 threshold: <input type="number" id="te-upper-threshold" step="0.05" value="0.5">
@@ -489,7 +663,11 @@
         <div class="te-rule" id="te-lower">
             <div class="te-rule-header">
                 <input type="checkbox" id="te-lower-enabled">
-                <label for="te-lower-enabled">↓ force from trigger &lt;</label>
+                <label for="te-lower-enabled">↓ force from trigger</label>
+                <div class="te-op-toggle">
+                    <button class="te-op selected" id="te-lower-lt">&lt;</button>
+                    <button class="te-op" id="te-lower-lte">&lt;=</button>
+                </div>
             </div>
             <div class="te-threshold-row">
                 threshold: <input type="number" id="te-lower-threshold" step="0.05" value="-0.5">
@@ -507,6 +685,60 @@
     <div id="bottom-bar">
         <button id="btmPauseBtn">&#9646;&#9646; Pause</button>
         <button id="btmTrackBtn">&#8982; Track Entity</button>
+        <button id="btmInspectBtn">&#128270; Inspect</button>
+    </div>
+
+    <!-- Cursor tools panel (right side) -->
+    <div id="cursor-panel">
+        <div class="cpanel-header">Cursor Tools</div>
+        <button class="ctool-btn" id="ctool-grab">&#9995; Grab</button>
+        <button class="ctool-btn" id="ctool-force">&#9889; Force</button>
+        <div class="cpanel-section">
+            <div class="cpanel-label">Brush Size</div>
+            <input type="range" class="cpanel-slider" id="brushSizeSlider" min="20" max="800" step="10" value="150">
+            <span class="cpanel-val" id="brushSizeVal">150</span>
+        </div>
+        <div class="cpanel-section" id="force-section" style="display:none">
+            <div class="cpanel-label">Strength</div>
+            <input type="range" class="cpanel-slider" id="forceStrSlider" min="0.1" max="10" step="0.1" value="2">
+            <span class="cpanel-val" id="forceStrVal">2.0</span>
+            <div class="cpanel-hint">Left click: push out<br>Right click: pull in</div>
+        </div>
+    </div>
+    <button id="cursorCollapseBtn" title="Toggle cursor tools">&#9654;</button>
+
+    <!-- Particle inspector panel (right side) -->
+    <div id="diag-panel">
+        <div id="diag-header">
+            <span id="diag-title">PARTICLE INSPECTOR</span>
+            <button id="diag-close" title="Close (Esc)">&#10005;</button>
+        </div>
+        <div id="diag-body">
+            <div class="diag-kv">
+                <span class="diag-key">Index</span>
+                <span class="diag-val" id="diag-index">—</span>
+            </div>
+            <div class="diag-kv">
+                <span class="diag-key">Type</span>
+                <span class="diag-val" id="diag-type">—</span>
+            </div>
+            <div class="diag-kv">
+                <span class="diag-key">Speed</span>
+                <span class="diag-val" id="diag-speed">—</span>
+            </div>
+            <div class="diag-kv">
+                <span class="diag-key">Direction</span>
+                <span class="diag-val" id="diag-dir">—</span>
+            </div>
+            <div class="diag-kv">
+                <span class="diag-key">Position</span>
+                <span class="diag-val" id="diag-pos">—</span>
+            </div>
+            <div class="diag-section">FORCES BY TYPE</div>
+            <div id="diag-forces"></div>
+            <div class="diag-section">TRANSFORM CHANCES</div>
+            <div id="diag-transforms"></div>
+        </div>
     </div>
 </body>
 </html>

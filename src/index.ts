@@ -1,4 +1,4 @@
-import { ParticleSimulation, TransformRule, MAX_TYPES, TYPE_COLORS_HEX } from './simulation';
+import { ParticleSimulation, TransformRule, MAX_TYPES, TYPE_COLORS_HEX, DiagnosticData } from './simulation';
 
 const TYPE_LABELS = [
     'R', 'G', 'B', 'Y', 'M', 'C', 'O', 'P', 'K', 'S',
@@ -60,10 +60,11 @@ class ParticleLifeApp {
     private teTrigger = -1;
     private teDismiss: ((e: MouseEvent) => void) | null = null;
 
-    private frameCount    = 0;
-    private lastTime      = performance.now();
-    private autoPause     = true;
-    private lowFpsFrames  = 0;
+    private frameCount      = 0;
+    private lastTime        = performance.now();
+    private autoPause       = true;
+    private autoPauseMinFps = 45;
+    private lowFpsFrames    = 0;
 
     // ── Panel + overlay ───────────────────────────────────────────────────────
     private panelCollapsed  = false;
@@ -75,14 +76,35 @@ class ParticleLifeApp {
     private selBoxActive = false;
     private selBox = { sx0: 0, sy0: 0, sx1: 0, sy1: 0 };
 
+    // ── Particle inspector ────────────────────────────────────────────────────
+    private diagPanelEl:  HTMLElement | null = null;
+    private inspectMode = false;
+
+    // ── Cursor tools ──────────────────────────────────────────────────────────
+    private activeCursorTool:     'none' | 'grab' | 'force' = 'none';
+    private brushWorldRadius      = 150;
+    private forceStrength         = 2.0;
+    private cursorMouseX          = -9999;
+    private cursorMouseY          = -9999;
+    private cursorMouseButtons    = 0;   // bitmask: bit 0 = left, bit 2 = right
+    private cursorPanelCollapsed  = false;
+
     constructor() {
         this.canvas = document.getElementById('sim-canvas') as HTMLCanvasElement;
         this.overlayCanvas = document.getElementById('overlay') as HTMLCanvasElement;
         this.overlayCtx = this.overlayCanvas.getContext('2d');
+        this.diagPanelEl = document.getElementById('diag-panel');
         this.resizeOverlay();
         this.setupUI();
         this.setupCanvasEvents();
+        this.setupCursorPanel();
         window.addEventListener('resize', () => { this.fitCanvas(); this.resizeOverlay(); });
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') { this.stopInspect(); }
+        });
+        document.getElementById('diag-close')!.addEventListener('click', () => {
+            this.stopInspect();
+        });
     }
 
     private resizeOverlay(): void {
@@ -153,6 +175,7 @@ class ParticleLifeApp {
                 this.sim.setNumTypes(n);
                 this.refreshForceMatrices();
                 this.refreshTransformMatrix();
+                this.refreshMassTable();
             }
         };
         typeEl.addEventListener('change', applyTypes);
@@ -166,13 +189,20 @@ class ParticleLifeApp {
             this.syncPauseButton();
         });
 
-        // Auto-pause checkbox
+        // Auto-pause checkbox + min-FPS input
         const apChk = document.getElementById('autoPauseChk') as HTMLInputElement;
         apChk.addEventListener('change', () => { this.autoPause = apChk.checked; });
+        const apFpsEl = document.getElementById('autoPauseMinFps') as HTMLInputElement;
+        apFpsEl.value = String(this.autoPauseMinFps);
+        apFpsEl.addEventListener('change', () => {
+            this.autoPauseMinFps = Math.max(1, Math.min(120, Math.round(Number(apFpsEl.value))));
+            apFpsEl.value = String(this.autoPauseMinFps);
+        });
 
         // Sim mode
         document.getElementById('mode0-btn')!.addEventListener('click', () => this.setSimMode(0));
         document.getElementById('mode1-btn')!.addEventListener('click', () => this.setSimMode(1));
+        document.getElementById('mode2-btn')!.addEventListener('click', () => this.setSimMode(2));
 
         // Per-matrix randomize buttons
         document.getElementById('randomizeStrengthBtn')!.addEventListener('click', () => {
@@ -263,6 +293,22 @@ class ParticleLifeApp {
             this.sim?.setAdditiveStrength(v);
         });
 
+        // Friction
+        const frictionSlider = document.getElementById('frictionSlider') as HTMLInputElement;
+        frictionSlider.addEventListener('input', () => {
+            const v = parseFloat(frictionSlider.value);
+            document.getElementById('frictionValue')!.textContent = v.toFixed(2);
+            this.sim?.setFriction(v);
+        });
+
+        // Max transform rate
+        const maxTransformSlider = document.getElementById('maxTransformSlider') as HTMLInputElement;
+        maxTransformSlider.addEventListener('input', () => {
+            const v = parseFloat(maxTransformSlider.value);
+            document.getElementById('maxTransformValue')!.textContent = v.toFixed(2);
+            this.sim?.setMaxTransformRate(v);
+        });
+
         // Export / Import
         document.getElementById('exportBtn')!.addEventListener('click', () => this.exportConfig());
         document.getElementById('importBtn')!.addEventListener('click', () => {
@@ -303,6 +349,11 @@ class ParticleLifeApp {
             this.syncPauseButton();
         });
         document.getElementById('btmTrackBtn')!.addEventListener('click', () => this.handleTrackButton());
+        document.getElementById('btmInspectBtn')!.addEventListener('click', () => {
+            this.inspectMode = !this.inspectMode;
+            if (!this.inspectMode) this.stopInspect();
+            this.syncInspectButton();
+        });
 
         // Tracking-stop callback (fires when entity dies)
         // wired once sim is created — done in the sim init callback
@@ -319,11 +370,14 @@ class ParticleLifeApp {
         btm.classList.toggle('active', paused);
     }
 
-    private setSimMode(mode: 0 | 1): void {
+    private setSimMode(mode: 0 | 1 | 2): void {
         this.sim?.setSimMode(mode);
         document.getElementById('mode0-btn')!.classList.toggle('selected', mode === 0);
         document.getElementById('mode1-btn')!.classList.toggle('selected', mode === 1);
-        document.getElementById('transform-panel')!.classList.toggle('visible', mode === 1);
+        document.getElementById('mode2-btn')!.classList.toggle('selected', mode === 2);
+        document.getElementById('transform-panel')!.classList.toggle('visible', mode === 1 || mode === 2);
+        document.getElementById('mode2-panel')!.classList.toggle('visible', mode === 2);
+        if (mode === 2) this.refreshMassTable();
     }
 
     private setEdgeMode(mode: 0 | 1): void {
@@ -391,12 +445,32 @@ class ParticleLifeApp {
             btn.innerHTML = '&#8982; Track Entity';
             btn.classList.remove('active', 'danger');
         }
+        this.syncCanvasCursor();
     }
 
     private drawOverlay(): void {
         if (!this.overlayCtx || !this.overlayCanvas) return;
         const ctx = this.overlayCtx;
         ctx.clearRect(0, 0, this.overlayCanvas.width, this.overlayCanvas.height);
+
+        // Brush circle for cursor tools (suppressed during inspect/track override)
+        if (this.activeCursorTool !== 'none' && !this.inspectMode && this.trackMode === 'idle'
+                && this.cursorMouseX > -9000 && this.sim) {
+            const rect   = this.canvas.getBoundingClientRect();
+            const params = this.sim.getParams();
+            const view   = this.sim.getView();
+            const sr = this.brushWorldRadius * view.zoom * rect.width / params.worldWidth;
+            const pressing = this.cursorMouseButtons !== 0;
+            ctx.save();
+            ctx.strokeStyle = pressing ? 'rgba(0,170,255,0.7)' : 'rgba(255,255,255,0.4)';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 4]);
+            ctx.beginPath();
+            ctx.arc(this.cursorMouseX, this.cursorMouseY, Math.max(2, sr), 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.restore();
+        }
 
         if (this.trackMode === 'selecting' && this.selBoxActive) {
             const { sx0, sy0, sx1, sy1 } = this.selBox;
@@ -437,6 +511,118 @@ class ParticleLifeApp {
             ctx.stroke();
             ctx.restore();
         }
+
+        // Selected particle: highlight ring + velocity arrow
+        const diagData = this.sim?.diagData;
+        if (diagData && this.sim) {
+            const rect   = this.canvas.getBoundingClientRect();
+            const params = this.sim.getParams();
+            const view   = this.sim.getView();
+            const scaleX = view.zoom * rect.width  / params.worldWidth;
+            const scaleY = view.zoom * rect.height / params.worldHeight;
+            const sx = rect.left + rect.width  / 2 + (diagData.pos[0] - view.cx) * scaleX;
+            const sy = rect.top  + rect.height / 2 + (diagData.pos[1] - view.cy) * scaleY;
+
+            // Highlight ring around selected particle
+            ctx.save();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(sx, sy, 8, 0, Math.PI * 2);
+            ctx.stroke();
+
+            // Velocity arrow
+            const speed = diagData.speed;
+            if (speed > 0.001) {
+                const arrowPx = Math.min(speed * scaleY * 8, 120);
+                const nx = diagData.vel[0] / speed;
+                const ny = diagData.vel[1] / speed;
+                const ex = sx + nx * arrowPx;
+                const ey = sy + ny * arrowPx;
+                const hw = 5, hl = 10;
+                const px = -ny, py = nx;
+
+                ctx.strokeStyle = '#0f8';
+                ctx.fillStyle   = '#0f8';
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                ctx.moveTo(sx, sy);
+                ctx.lineTo(ex - nx * hl, ey - ny * hl);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(ex, ey);
+                ctx.lineTo(ex - nx * hl + px * hw, ey - ny * hl + py * hw);
+                ctx.lineTo(ex - nx * hl - px * hw, ey - ny * hl - py * hw);
+                ctx.closePath();
+                ctx.fill();
+            }
+            ctx.restore();
+        }
+    }
+
+    private updateDiagPanel(data: DiagnosticData | null): void {
+        if (!this.diagPanelEl) return;
+        if (!data) {
+            this.diagPanelEl.classList.remove('visible');
+            this.inspectMode = false;
+            this.syncInspectButton();
+            return;
+        }
+        this.diagPanelEl.classList.add('visible');
+        const n = data.typeForces.length;
+
+        document.getElementById('diag-index')!.textContent = String(data.index);
+
+        const typeEl = document.getElementById('diag-type')!;
+        typeEl.innerHTML = `<span class="diag-type-swatch" style="background:${TYPE_HEX[data.typeId] ?? '#888'}"></span>${TYPE_LABELS[data.typeId] ?? '?'} (${data.typeId})`;
+
+        document.getElementById('diag-speed')!.textContent = `${data.speed.toFixed(3)} u/t`;
+
+        const deg = data.directionDeg;
+        document.getElementById('diag-dir')!.textContent = `${deg.toFixed(1)}°`;
+
+        document.getElementById('diag-pos')!.textContent = `${data.pos[0].toFixed(0)}, ${data.pos[1].toFixed(0)}`;
+
+        // Forces
+        const forcesEl = document.getElementById('diag-forces')!;
+        forcesEl.innerHTML = '';
+        const maxForce = Math.max(...data.typeForces.map(Math.abs), 0.001);
+        for (let t = 0; t < n; t++) {
+            const f = data.typeForces[t];
+            const row = document.createElement('div');
+            row.className = 'diag-force-row';
+            const pct = (f / maxForce) * 50;
+            const color = f >= 0 ? '#0d6' : '#e44';
+            row.innerHTML = `
+                <span class="diag-force-pip" style="background:${TYPE_HEX[t] ?? '#888'}"></span>
+                <span style="color:#888;width:12px;text-align:center">${TYPE_LABELS[t] ?? t}</span>
+                <div class="diag-force-bar-wrap">
+                    <div class="diag-force-bar" style="background:${color};width:${Math.abs(pct)}%;${f >= 0 ? 'left:50%' : `left:${50 + pct}%`}"></div>
+                </div>
+                <span class="diag-force-val" style="color:${color}">${f.toFixed(3)}</span>`;
+            forcesEl.appendChild(row);
+        }
+
+        // Transform probabilities
+        const transEl = document.getElementById('diag-transforms')!;
+        transEl.innerHTML = '';
+        for (let t = 0; t < n; t++) {
+            const p = data.transformProbs[t];
+            if (p <= 0) continue;
+            const row = document.createElement('div');
+            row.className = 'diag-prob-row';
+            row.innerHTML = `
+                <span class="diag-force-pip" style="background:${TYPE_HEX[t] ?? '#888'}"></span>
+                <span style="color:#888;width:12px;text-align:center">${TYPE_LABELS[t] ?? t}</span>
+                <div class="diag-prob-bar-wrap">
+                    <div class="diag-prob-bar" style="width:${(p * 100).toFixed(1)}%"></div>
+                </div>
+                <span class="diag-prob-val">${(p * 100).toFixed(1)}%</span>`;
+            transEl.appendChild(row);
+        }
+        if (transEl.children.length === 0) {
+            transEl.innerHTML = '<span style="color:#444;font-size:10px">none active</span>';
+        }
     }
 
     // ── Pan / zoom ────────────────────────────────────────────────────────────
@@ -449,23 +635,60 @@ class ParticleLifeApp {
         }
     }
 
+    private stopInspect(): void {
+        this.inspectMode = false;
+        this.sim?.clearParticleSelection();
+        this.syncInspectButton();
+    }
+
+    private syncInspectButton(): void {
+        const btn = document.getElementById('btmInspectBtn')!;
+        btn.classList.toggle('active', this.inspectMode);
+        btn.textContent = this.inspectMode ? '⦳ Click a particle' : '🔍 Inspect';
+        document.body.classList.toggle('inspect-mode', this.inspectMode);
+        this.syncCanvasCursor();
+    }
+
     private setupCanvasEvents(): void {
         let panning = false, lastX = 0, lastY = 0, panDist = 0;
         const PAN_BREAK_THRESHOLD = 30; // pixels before tracking breaks
 
         this.canvas.addEventListener('mousedown', (e) => {
-            // Middle-click → pan
+            // Middle-click → always pans regardless of tool
             if (e.button === 1) {
                 e.preventDefault();
                 panning = true; lastX = e.clientX; lastY = e.clientY; panDist = 0;
                 this.canvas.style.cursor = 'grabbing';
                 return;
             }
-            // Left-click in selecting mode → start selection box
+            // Track / Inspect override cursor tools — check first
             if (e.button === 0 && this.trackMode === 'selecting') {
                 e.preventDefault();
                 this.selBoxActive = true;
                 this.selBox = { sx0: e.clientX, sy0: e.clientY, sx1: e.clientX, sy1: e.clientY };
+                return;
+            }
+            if (e.button === 0 && this.inspectMode && this.sim) {
+                const { wx, wy } = this.screenToWorld(e.clientX, e.clientY);
+                this.sim.selectParticleAt(wx, wy);
+                this.inspectMode = false;
+                this.syncInspectButton();
+                return;
+            }
+            // Cursor tools (only when no track/inspect override is active)
+            if (e.button === 0 && this.activeCursorTool === 'grab') {
+                e.preventDefault();
+                panning = true; lastX = e.clientX; lastY = e.clientY; panDist = 0;
+                this.cursorMouseButtons |= 1;
+                this.syncCanvasCursor();
+                return;
+            }
+            if (this.activeCursorTool === 'force') {
+                e.preventDefault();
+                if (e.button === 0) this.cursorMouseButtons |= 1;
+                if (e.button === 2) this.cursorMouseButtons |= 4;
+                this.syncCanvasCursor();
+                return;
             }
         });
 
@@ -491,8 +714,8 @@ class ParticleLifeApp {
         });
 
         window.addEventListener('mouseup', (e) => {
-            if (e.button === 1) {
-                panning = false; this.canvas.style.cursor = '';
+            if (e.button === 1 || (e.button === 0 && this.activeCursorTool === 'grab')) {
+                panning = false;
             }
             if (e.button === 0 && this.selBoxActive && this.trackMode === 'selecting') {
                 this.selBoxActive = false;
@@ -544,6 +767,69 @@ class ParticleLifeApp {
     private updateZoomDisplay(): void {
         const view = this.sim?.getView();
         if (view) document.getElementById('zoomDisplay')!.textContent = `${view.zoom.toFixed(2)}×`;
+    }
+
+    // ── Cursor tools ──────────────────────────────────────────────────────────
+
+    private setupCursorPanel(): void {
+        document.getElementById('ctool-grab')!.addEventListener('click',  () => this.setActiveCursorTool('grab'));
+        document.getElementById('ctool-force')!.addEventListener('click', () => this.setActiveCursorTool('force'));
+
+        const brushSlider = document.getElementById('brushSizeSlider') as HTMLInputElement;
+        const brushVal    = document.getElementById('brushSizeVal')!;
+        brushSlider.addEventListener('input', () => {
+            this.brushWorldRadius = parseInt(brushSlider.value);
+            brushVal.textContent  = String(this.brushWorldRadius);
+        });
+
+        const forceSlider = document.getElementById('forceStrSlider') as HTMLInputElement;
+        const forceVal    = document.getElementById('forceStrVal')!;
+        forceSlider.addEventListener('input', () => {
+            this.forceStrength   = parseFloat(forceSlider.value);
+            forceVal.textContent = this.forceStrength.toFixed(1);
+        });
+
+        document.getElementById('cursorCollapseBtn')!.addEventListener('click', () => {
+            this.cursorPanelCollapsed = !this.cursorPanelCollapsed;
+            document.getElementById('cursor-panel')!.classList.toggle('collapsed', this.cursorPanelCollapsed);
+            document.body.classList.toggle('cursor-panel-collapsed', this.cursorPanelCollapsed);
+            const btn = document.getElementById('cursorCollapseBtn')!;
+            btn.innerHTML = this.cursorPanelCollapsed ? '&#9664;' : '&#9654;';
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            this.cursorMouseX = e.clientX;
+            this.cursorMouseY = e.clientY;
+        });
+        window.addEventListener('mouseup', (e) => {
+            if (e.button === 0) this.cursorMouseButtons &= ~1;
+            if (e.button === 2) this.cursorMouseButtons &= ~4;
+            this.syncCanvasCursor();
+        });
+        window.addEventListener('blur', () => { this.cursorMouseButtons = 0; });
+    }
+
+    private setActiveCursorTool(tool: 'grab' | 'force'): void {
+        this.activeCursorTool = (this.activeCursorTool === tool) ? 'none' : tool;
+        document.getElementById('ctool-grab')!.classList.toggle('active',  this.activeCursorTool === 'grab');
+        document.getElementById('ctool-force')!.classList.toggle('active', this.activeCursorTool === 'force');
+        document.getElementById('force-section')!.style.display = this.activeCursorTool === 'force' ? '' : 'none';
+        this.syncCanvasCursor();
+    }
+
+    private syncCanvasCursor(): void {
+        // Inspect/track override: clear inline style so CSS body-class cursor takes effect
+        if (this.inspectMode || this.trackMode !== 'idle') {
+            this.canvas.style.cursor = '';
+            return;
+        }
+        if (this.activeCursorTool === 'grab') {
+            this.canvas.style.cursor = (this.cursorMouseButtons & 1) ? 'grabbing' : 'grab';
+        } else if (this.activeCursorTool === 'force') {
+            this.canvas.style.cursor = 'crosshair';
+        } else {
+            this.canvas.style.cursor = '';
+        }
     }
 
     // ── Force matrices ────────────────────────────────────────────────────────
@@ -633,6 +919,44 @@ class ParticleLifeApp {
     private refreshTransformMatrix(): void {
         this.buildTransformMatrix();
         this.buildPolePanel();
+    }
+
+    private refreshMassTable(): void {
+        const tbl = document.getElementById('mass-table') as HTMLTableElement;
+        if (!tbl || !this.sim) return;
+        tbl.innerHTML = '';
+        const n      = this.sim.getNumTypes();
+        const masses = this.sim.getTypeMass();
+        for (let t = 0; t < n; t++) {
+            const row   = tbl.insertRow();
+            const swCell = row.insertCell();
+            const swatch = document.createElement('span');
+            swatch.className = 'mass-swatch';
+            swatch.style.background = TYPE_HEX[t];
+            swCell.appendChild(swatch);
+
+            const labelCell = row.insertCell();
+            labelCell.textContent = TYPE_LABELS[t];
+            labelCell.style.color = TYPE_HEX[t];
+
+            const inputCell = row.insertCell();
+            const inp = document.createElement('input');
+            inp.type  = 'number';
+            inp.min   = '1'; inp.max = '8'; inp.step = '1';
+            inp.value = String(masses[t] ?? 1);
+            inp.addEventListener('change', () => {
+                const v = Math.max(1, Math.min(8, Math.round(Number(inp.value))));
+                inp.value = String(v);
+                this.sim?.setTypeMass(t, v);
+            });
+            inputCell.appendChild(inp);
+
+            const hintCell = row.insertCell();
+            hintCell.style.fontSize = '9px';
+            hintCell.style.color    = '#555';
+            hintCell.textContent    = `mass ${masses[t] ?? 1}`;
+            inp.addEventListener('change', () => { hintCell.textContent = `mass ${inp.value}`; });
+        }
     }
 
     private buildPolePanel(): void {
@@ -851,13 +1175,21 @@ class ParticleLifeApp {
 
         const upperEnabled   = document.getElementById('te-upper-enabled')   as HTMLInputElement;
         const upperThreshold = document.getElementById('te-upper-threshold') as HTMLInputElement;
+        const upperGt        = document.getElementById('te-upper-gt')        as HTMLButtonElement;
+        const upperGte       = document.getElementById('te-upper-gte')       as HTMLButtonElement;
         const lowerEnabled   = document.getElementById('te-lower-enabled')   as HTMLInputElement;
         const lowerThreshold = document.getElementById('te-lower-threshold') as HTMLInputElement;
+        const lowerLt        = document.getElementById('te-lower-lt')        as HTMLButtonElement;
+        const lowerLte       = document.getElementById('te-lower-lte')       as HTMLButtonElement;
 
-        upperEnabled.checked   = rule.upperEnabled;
-        upperThreshold.value   = rule.upperThreshold.toFixed(3);
-        lowerEnabled.checked   = rule.lowerEnabled;
-        lowerThreshold.value   = rule.lowerThreshold.toFixed(3);
+        upperEnabled.checked = rule.upperEnabled;
+        upperThreshold.value = rule.upperThreshold.toFixed(3);
+        upperGt.classList.toggle('selected',  !rule.upperInclusive);
+        upperGte.classList.toggle('selected',  rule.upperInclusive);
+        lowerEnabled.checked = rule.lowerEnabled;
+        lowerThreshold.value = rule.lowerThreshold.toFixed(3);
+        lowerLt.classList.toggle('selected',  !rule.lowerInclusive);
+        lowerLte.classList.toggle('selected',  rule.lowerInclusive);
 
         const applyRule = () => {
             rule.upperEnabled   = upperEnabled.checked;
@@ -874,6 +1206,11 @@ class ParticleLifeApp {
         upperThreshold.onchange = applyRule;
         lowerThreshold.oninput  = applyRule;
         lowerThreshold.onchange = applyRule;
+
+        upperGt.onclick  = () => { rule.upperInclusive = false; upperGt.classList.add('selected');  upperGte.classList.remove('selected'); applyRule(); };
+        upperGte.onclick = () => { rule.upperInclusive = true;  upperGte.classList.add('selected'); upperGt.classList.remove('selected');  applyRule(); };
+        lowerLt.onclick  = () => { rule.lowerInclusive = false; lowerLt.classList.add('selected');  lowerLte.classList.remove('selected'); applyRule(); };
+        lowerLte.onclick = () => { rule.lowerInclusive = true;  lowerLte.classList.add('selected'); lowerLt.classList.remove('selected');  applyRule(); };
 
         // Clamp existing targets to valid range before showing picker
         rule.upperTarget = Math.min(rule.upperTarget, n - 1);
@@ -956,7 +1293,7 @@ class ParticleLifeApp {
         document.getElementById('speedValue')!.textContent = `${this.sim.getParams().simulationSpeed.toFixed(1)}×`;
         document.getElementById('particleCountDisplay')!.textContent = String(this.sim.getParams().particleCount);
 
-        const simMode  = this.sim.getSimMode()  as 0 | 1;
+        const simMode  = this.sim.getSimMode()  as 0 | 1 | 2;
         const edgeMode = this.sim.getEdgeMode() as 0 | 1;
         this.setSimMode(simMode);
         document.getElementById('edgeLoopBtn')!.classList.toggle('selected', edgeMode === 0);
@@ -985,6 +1322,14 @@ class ParticleLifeApp {
         this.setBlendMode(this.sim.getBlendMode() as 0 | 1);
         this.setShapeMode(this.sim.getShapeMode() as 0 | 1);
 
+        const friction = this.sim.getFriction();
+        (document.getElementById('frictionSlider') as HTMLInputElement).value = String(friction);
+        document.getElementById('frictionValue')!.textContent = friction.toFixed(2);
+
+        const maxTransform = this.sim.getMaxTransformRate();
+        (document.getElementById('maxTransformSlider') as HTMLInputElement).value = String(maxTransform);
+        document.getElementById('maxTransformValue')!.textContent = maxTransform.toFixed(2);
+
         this.refreshForceMatrices();
         this.refreshTransformMatrix();  // also calls buildPolePanel()
         this.updateZoomDisplay();
@@ -1001,7 +1346,7 @@ class ParticleLifeApp {
             this.frameCount = 0; this.lastTime = now;
 
             const warnEl = document.getElementById('fps-warn')!;
-            if (fps < 5) {
+            if (fps < this.autoPauseMinFps) {
                 warnEl.style.display = 'inline';
                 this.lowFpsFrames++;
                 if (this.autoPause && this.lowFpsFrames >= 2 && !this.sim?.isPaused_()) {
@@ -1018,6 +1363,11 @@ class ParticleLifeApp {
 
     private startLoop(): void {
         const tick = () => {
+            if (this.activeCursorTool === 'force' && this.cursorMouseButtons !== 0 && this.sim) {
+                const { wx, wy } = this.screenToWorld(this.cursorMouseX, this.cursorMouseY);
+                const dir = (this.cursorMouseButtons & 1) ? 1 : -1;
+                this.sim.applyCursorForce(wx, wy, this.brushWorldRadius, this.forceStrength * dir);
+            }
             this.sim?.update();
             this.updateStats();
             this.drawOverlay();
@@ -1046,6 +1396,8 @@ class ParticleLifeApp {
 
         document.getElementById('particleCountDisplay')!.textContent = String(this.sim.getParams().particleCount);
         this.updateZoomDisplay();
+
+        this.sim.onDiagnosticUpdate = (data) => this.updateDiagPanel(data);
 
         this.buildMatrixTable('strength-table',   'strength');
         this.buildMatrixTable('radius-table',     'radius');

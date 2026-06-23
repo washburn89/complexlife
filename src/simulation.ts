@@ -31,11 +31,24 @@ export interface ViewState {
 
 export interface TransformRule {
     upperEnabled:   boolean;
+    upperInclusive: boolean;   // false = ramp from zero (>), true = step at threshold (>=)
     upperThreshold: number;
     upperTarget:    number;
     lowerEnabled:   boolean;
+    lowerInclusive: boolean;   // false = ramp from zero (<), true = step at threshold (<=)
     lowerThreshold: number;
     lowerTarget:    number;
+}
+
+export interface DiagnosticData {
+    index:          number;
+    typeId:         number;
+    pos:            [number, number];
+    vel:            [number, number];
+    speed:          number;
+    directionDeg:   number;
+    typeForces:     number[];   // length = numTypes
+    transformProbs: number[];   // length = numTypes
 }
 
 export const MAX_TYPES = 20;
@@ -111,6 +124,8 @@ export class ParticleSimulation {
     private additiveStrength = 0.7;  // scales per-particle light contribution in additive mode
     private shapeMode        = 1;    // 0 = circles, 1 = procedural polygons
     private blendMode        = 1;    // 0 = standard over, 1 = additive (bloom)
+    private friction         = 0.85; // velocity multiplier per tick (1 = no drag, 0 = full stop)
+    private maxTransformRate = 0.5;  // peak probability per tick for type conversion in mode 1
 
     // ── Entity tracking ────────────────────────────────────────────────────────
     private isTracking        = false;
@@ -127,6 +142,45 @@ export class ParticleSimulation {
     private clearTrackPipeline:     GPUComputePipeline | null = null;
     private accumTrackPipeline:     GPUComputePipeline | null = null;
     onTrackingStop: (() => void) | null = null;
+
+    // ── Particle diagnostic / inspector ───────────────────────────────────────
+    private selectedParticleIdx    = -1;
+    private snapStagingBuffer:       GPUBuffer | null = null;
+    private snapReadPending          = false;
+    private diagParamBuffer:         GPUBuffer | null = null;
+    private diagOutputBuffer:        GPUBuffer | null = null;
+    private diagStagingBuffer:       GPUBuffer | null = null;
+    private diagBGL:                 GPUBindGroupLayout | null = null;
+    private diagPipeline:            GPUComputePipeline | null = null;
+    private diagBindGroup:           GPUBindGroup | null = null;
+    private diagReadPending          = false;
+    public  diagData:                DiagnosticData | null = null;
+    public  onDiagnosticUpdate:      ((data: DiagnosticData | null) => void) | null = null;
+
+    // ── Remap types pipeline (non-destructive type count change) ──────────────
+    private remapParamsBuffer: GPUBuffer | null = null;
+    private remapBGL:          GPUBindGroupLayout | null = null;
+    private remapPipeline:     GPUComputePipeline | null = null;
+    private remapBindGroup:    GPUBindGroup | null = null;
+
+    // ── Cursor force pipeline ──────────────────────────────────────────────────
+    private cursorParamBuffer: GPUBuffer | null = null;
+    private cursorBGL:         GPUBindGroupLayout | null = null;
+    private cursorPipeline:    GPUComputePipeline | null = null;
+    private cursorBindGroup:   GPUBindGroup | null = null;
+
+    // ── Mode 2 (mass) ─────────────────────────────────────────────────────────
+    private typeMass: number[] = Array(MAX_TYPES).fill(1);
+    private typeMassBuffer:       GPUBuffer | null = null;
+    private m2ClaimedBuffer:      GPUBuffer | null = null;
+    private m2ActiveCountBuffer:  GPUBuffer | null = null;
+    private m2StagingBuffer:      GPUBuffer | null = null;
+    private m2FrameCounterBuffer: GPUBuffer | null = null;
+    private m2TransformBGL:       GPUBindGroupLayout | null = null;
+    private m2TransformPipeline:  GPUComputePipeline | null = null;
+    private m2TransformBindGroup: GPUBindGroup | null = null;
+    private m2FrameCounter = 1;
+    private m2CountPending = false;
 
     private transformRules: TransformRule[] = [];
     private poleConfigs = new Uint32Array(MAX_TYPES);
@@ -180,9 +234,11 @@ export class ParticleSimulation {
             };
             return {
                 upperEnabled:   Math.random() < 0.25,
+                upperInclusive: false,
                 upperThreshold: 0.3 + Math.random() * 0.5,
                 upperTarget:    randTarget(),
                 lowerEnabled:   Math.random() < 0.25,
+                lowerInclusive: false,
                 lowerThreshold: -(0.3 + Math.random() * 0.5),
                 lowerTarget:    randTarget(),
             };
@@ -198,6 +254,12 @@ export class ParticleSimulation {
         const data = new Float32Array(ab);
         for (let i = 0; i < MAX_TYPES; i++) data[i] = this.poleConfigs[i];
         return data as Float32Array<ArrayBuffer>;
+    }
+
+    private generateTypeMassData(): Uint32Array<ArrayBuffer> {
+        const data = new Uint32Array(MAX_TYPES);
+        for (let i = 0; i < MAX_TYPES; i++) data[i] = Math.max(1, Math.min(8, this.typeMass[i] ?? 1));
+        return data as Uint32Array<ArrayBuffer>;
     }
 
     // ── WebGPU init ───────────────────────────────────────────────────────────
@@ -261,18 +323,19 @@ export class ParticleSimulation {
         for (let i = 0; i < MAX_TYPES * MAX_TYPES; i++) {
             const r = this.transformRules[i];
             const b = i * 6;
-            data[b + 0] = r.upperEnabled   ? 1 : 0;
+            data[b + 0] = r.upperEnabled ? (r.upperInclusive ? 2 : 1) : 0;
             data[b + 1] = r.upperThreshold;
             data[b + 2] = r.upperTarget;
-            data[b + 3] = r.lowerEnabled   ? 1 : 0;
+            data[b + 3] = r.lowerEnabled ? (r.lowerInclusive ? 2 : 1) : 0;
             data[b + 4] = r.lowerThreshold;
             data[b + 5] = r.lowerTarget;
         }
         return data;
     }
 
-    // params.w packs three values: numTypes (bits 16-23), edgeMode (bits 8-15), simMode (bits 0-7).
-    // All fit as small unsigned ints stored as a float32 (exact for integers up to 2^24).
+    // params: two vec4f (32 bytes).
+    // [0] speed, worldW, worldH, packed(simMode|edgeMode|numTypes as float)
+    // [1] friction, maxTransformRate, 0, 0
     private paramsArray(): Float32Array<ArrayBuffer> {
         const packed = (this.numTypes << 16) | (this.edgeMode << 8) | this.simMode;
         return new Float32Array([
@@ -280,6 +343,9 @@ export class ParticleSimulation {
             this.params.worldWidth,
             this.params.worldHeight,
             packed,
+            this.friction,
+            this.maxTransformRate,
+            0, 0,
         ]) as Float32Array<ArrayBuffer>;
     }
 
@@ -306,8 +372,8 @@ export class ParticleSimulation {
     }
 
     private async createBuffers(): Promise<void> {
-        const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
-        const U = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+        const S  = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+        const U  = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
 
         this.particleBuffer  = this.makeBuffer('particles', this.generateParticleData(), S);
         this.paramsBuffer    = this.makeBuffer('params',    this.paramsArray(),           U);
@@ -336,6 +402,26 @@ export class ParticleSimulation {
         this.trackingParamBuffer   = this.device!.createBuffer({ label: 'trackParam',   size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.trackingStatsBuffer   = this.device!.createBuffer({ label: 'trackStats',   size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
         this.trackingStagingBuffer = this.device!.createBuffer({ label: 'trackStaging', size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+        // Diagnostic / inspector buffers
+        // snapStagingBuffer: used to copy entire particle array to CPU for nearest-particle search
+        const snapSize = MAX_PARTICLE_CAPACITY * 6 * 4; // 6 floats per particle
+        this.snapStagingBuffer = this.device!.createBuffer({ label: 'snapStaging', size: snapSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        this.diagParamBuffer   = this.device!.createBuffer({ label: 'diagParam',   size: 16,       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.diagOutputBuffer  = this.device!.createBuffer({ label: 'diagOutput',  size: 192,      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        this.diagStagingBuffer = this.device!.createBuffer({ label: 'diagStaging', size: 192,      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+        this.remapParamsBuffer  = this.device!.createBuffer({ label: 'remapParams',  size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.cursorParamBuffer  = this.device!.createBuffer({ label: 'cursorParams', size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+        // Mode 2 (mass) buffers
+        this.typeMassBuffer      = this.device!.createBuffer({ label: 'typeMass',       size: 80,  usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
+        this.m2ClaimedBuffer     = this.device!.createBuffer({ label: 'm2Claimed',      size: MAX_PARTICLE_CAPACITY * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        this.m2ActiveCountBuffer = this.device!.createBuffer({ label: 'm2ActiveCount',  size: 16,  usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+        this.m2StagingBuffer     = this.device!.createBuffer({ label: 'm2Staging',      size: 16,  usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        this.m2FrameCounterBuffer = this.device!.createBuffer({ label: 'm2FrameCounter', size: 16, usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
+        // Initialize type masses to 1
+        this.queue!.writeBuffer(this.typeMassBuffer, 0, this.generateTypeMassData());
     }
 
     private async createPipelines(): Promise<void> {
@@ -347,7 +433,7 @@ export class ParticleSimulation {
             throw new Error('Buffers not initialized');
         }
 
-        // Single shared layout for all compute pipelines (9 bindings).
+        // Single shared layout for all compute pipelines (10 bindings).
         // Each shader only declares the subset it needs; the layout can have extras.
         this.computeBindGroupLayout = this.device.createBindGroupLayout({ entries: [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },            // particles
@@ -359,6 +445,7 @@ export class ParticleSimulation {
             { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // gridCellCount
             { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // gridCellStart
             { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // gridList
+            { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },           // typeMasses (mode 2)
         ]});
         const computePipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [this.computeBindGroupLayout] });
         const mkCompute = (code: string) => this.device!.createComputePipeline({
@@ -411,6 +498,61 @@ export class ParticleSimulation {
         this.clearTrackPipeline = this.device.createComputePipeline({ layout: trackPipeLayout, compute: { module: trackModule, entryPoint: 'clearStats' } });
         this.accumTrackPipeline = this.device.createComputePipeline({ layout: trackPipeLayout, compute: { module: trackModule, entryPoint: 'accumStats' } });
 
+        // Diagnostic pipeline (uses spatial hash + force rules; poleConfigs omitted to stay within 8 storage limit)
+        this.diagBGL = this.device.createBindGroupLayout({ entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // particles
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // simParams
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // forces
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // transformRules
+            { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // gridParams
+            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellCount
+            { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellStart
+            { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // gridList
+            { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // diagParams
+            { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // output
+        ]});
+        this.diagPipeline = this.device.createComputePipeline({
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.diagBGL] }),
+            compute: { module: this.device.createShaderModule({ code: this.getDiagnosticShaderCode() }), entryPoint: 'main' },
+        });
+
+        // Remap types pipeline
+        this.remapBGL = this.device.createBindGroupLayout({ entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ]});
+        this.remapPipeline = this.device.createComputePipeline({
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.remapBGL] }),
+            compute: { module: this.device.createShaderModule({ code: this.getRemapTypesShaderCode() }), entryPoint: 'main' },
+        });
+
+        // Cursor force pipeline
+        this.cursorBGL = this.device.createBindGroupLayout({ entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ]});
+        this.cursorPipeline = this.device.createComputePipeline({
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.cursorBGL] }),
+            compute: { module: this.device.createShaderModule({ code: this.getCursorForceShaderCode() }), entryPoint: 'main' },
+        });
+
+        // Mode 2 mass-conserving transform pipeline (separate BGL with 7 storage + 2 uniform)
+        this.m2TransformBGL = this.device.createBindGroupLayout({ entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // particles
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // claimed (atomic)
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // activeCount (atomic)
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellCount
+            { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellStart
+            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // gridList
+            { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // gridParams
+            { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // typeMasses
+            { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // frameCounter
+        ]});
+        this.m2TransformPipeline = this.device.createComputePipeline({
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.m2TransformBGL] }),
+            compute: { module: this.device.createShaderModule({ code: this.getMode2TransformShaderCode() }), entryPoint: 'main' },
+        });
+
         this.rebuildBindGroups();
     }
 
@@ -419,7 +561,7 @@ export class ParticleSimulation {
             !this.particleBuffer || !this.paramsBuffer || !this.forcesBuffer ||
             !this.transformBuffer || !this.viewBuffer || !this.poleBuffer ||
             !this.gridCellCountBuffer || !this.gridCellStartBuffer ||
-            !this.gridListBuffer || !this.gridParamsBuffer ||
+            !this.gridListBuffer || !this.gridParamsBuffer || !this.typeMassBuffer ||
             !this.computePipeline || !this.renderPipeline || !this.renderPipelineAdd) return;
 
         this.computeBindGroup = this.device.createBindGroup({
@@ -434,6 +576,7 @@ export class ParticleSimulation {
                 { binding: 6, resource: { buffer: this.gridCellCountBuffer  } },
                 { binding: 7, resource: { buffer: this.gridCellStartBuffer  } },
                 { binding: 8, resource: { buffer: this.gridListBuffer       } },
+                { binding: 9, resource: { buffer: this.typeMassBuffer       } },
             ],
         });
         this.renderBindGroup = this.device.createBindGroup({
@@ -452,6 +595,62 @@ export class ParticleSimulation {
                     { binding: 0, resource: { buffer: this.particleBuffer      } },
                     { binding: 1, resource: { buffer: this.trackingParamBuffer } },
                     { binding: 2, resource: { buffer: this.trackingStatsBuffer } },
+                ],
+            });
+        }
+
+        if (this.diagBGL && this.diagParamBuffer && this.diagOutputBuffer) {
+            this.diagBindGroup = this.device.createBindGroup({
+                layout: this.diagBGL,
+                entries: [
+                    { binding: 0, resource: { buffer: this.particleBuffer      } },
+                    { binding: 1, resource: { buffer: this.paramsBuffer        } },
+                    { binding: 2, resource: { buffer: this.forcesBuffer        } },
+                    { binding: 3, resource: { buffer: this.transformBuffer     } },
+                    { binding: 4, resource: { buffer: this.gridParamsBuffer    } },
+                    { binding: 5, resource: { buffer: this.gridCellCountBuffer } },
+                    { binding: 6, resource: { buffer: this.gridCellStartBuffer } },
+                    { binding: 7, resource: { buffer: this.gridListBuffer      } },
+                    { binding: 8, resource: { buffer: this.diagParamBuffer     } },
+                    { binding: 9, resource: { buffer: this.diagOutputBuffer    } },
+                ],
+            });
+        }
+
+        if (this.remapBGL && this.remapParamsBuffer) {
+            this.remapBindGroup = this.device.createBindGroup({
+                layout: this.remapBGL,
+                entries: [
+                    { binding: 0, resource: { buffer: this.particleBuffer   } },
+                    { binding: 1, resource: { buffer: this.remapParamsBuffer } },
+                ],
+            });
+        }
+
+        if (this.cursorBGL && this.cursorParamBuffer) {
+            this.cursorBindGroup = this.device.createBindGroup({
+                layout: this.cursorBGL,
+                entries: [
+                    { binding: 0, resource: { buffer: this.particleBuffer   } },
+                    { binding: 1, resource: { buffer: this.cursorParamBuffer } },
+                ],
+            });
+        }
+
+        if (this.m2TransformBGL && this.m2ClaimedBuffer && this.m2ActiveCountBuffer &&
+            this.typeMassBuffer && this.m2FrameCounterBuffer) {
+            this.m2TransformBindGroup = this.device.createBindGroup({
+                layout: this.m2TransformBGL,
+                entries: [
+                    { binding: 0, resource: { buffer: this.particleBuffer        } },
+                    { binding: 1, resource: { buffer: this.m2ClaimedBuffer       } },
+                    { binding: 2, resource: { buffer: this.m2ActiveCountBuffer   } },
+                    { binding: 3, resource: { buffer: this.gridCellCountBuffer!  } },
+                    { binding: 4, resource: { buffer: this.gridCellStartBuffer!  } },
+                    { binding: 5, resource: { buffer: this.gridListBuffer!       } },
+                    { binding: 6, resource: { buffer: this.gridParamsBuffer!     } },
+                    { binding: 7, resource: { buffer: this.typeMassBuffer        } },
+                    { binding: 8, resource: { buffer: this.m2FrameCounterBuffer  } },
                 ],
             });
         }
@@ -499,6 +698,7 @@ export class ParticleSimulation {
                 let idx = id.x;
                 if (idx >= arrayLength(&particles)) { return; }
                 let p  = particles[idx];
+                if (p.typeId < 0.0) { return; }  // dead particle (mode 2)
                 let gw = gridParams.gridW;
                 let gh = gridParams.gridH;
                 let cs = gridParams.cellSize;
@@ -543,6 +743,7 @@ export class ParticleSimulation {
                 let idx = id.x;
                 if (idx >= arrayLength(&particles)) { return; }
                 let p  = particles[idx];
+                if (p.typeId < 0.0) { return; }  // dead particle (mode 2)
                 let gw = gridParams.gridW;
                 let gh = gridParams.gridH;
                 let cs = gridParams.cellSize;
@@ -564,9 +765,13 @@ export class ParticleSimulation {
                 lowerEnabled: f32, lowerThreshold: f32, lowerTarget: f32,
             }
             struct GridParams  { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
+            struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
+                                friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+
+            struct TypeMasses { m: array<vec4u, 5> }
 
             @group(0) @binding(0) var<storage, read_write> particles:      array<Particle>;
-            @group(0) @binding(1) var<uniform>             params:         vec4f;
+            @group(0) @binding(1) var<uniform>             params:         SimParams;
             @group(0) @binding(2) var<storage, read>       forces:         array<ForceEntry>;
             @group(0) @binding(3) var<storage, read>       transformRules: array<TransformRule>;
             @group(0) @binding(4) var<storage, read>       poleConfigs:    array<f32>;
@@ -574,6 +779,9 @@ export class ParticleSimulation {
             @group(0) @binding(6) var<storage, read_write> cellCount:      array<u32>;
             @group(0) @binding(7) var<storage, read_write> cellStart:      array<u32>;
             @group(0) @binding(8) var<storage, read_write> gridList:       array<u32>;
+            @group(0) @binding(9) var<uniform>             typeMasses:     TypeMasses;
+
+            fn getMass(t: u32) -> u32 { return typeMasses.m[t >> 2u][t & 3u]; }
 
             // Polar field mask. ux,uy = unit vector from emitter to receiver.
             // poleData bits 0-3 = poleCount, bits 4+ = sign bits for each lobe.
@@ -619,16 +827,25 @@ export class ParticleSimulation {
                 return f32(uhash(seed)) / 4294967295.0;
             }
 
-            // Probability of transformation per tick.
-            // x = force / threshold. Same sign → x > 0 (condition met).
-            // Non-zero for any force in the right direction; quadratic ramp
-            // reaches 50% at x=1 (force equals threshold) and stays there.
-            fn transformProb(force: f32, threshold: f32) -> f32 {
-                if (abs(threshold) < 0.001) { return 0.0; }
-                let x = force / threshold;
-                if (x <= 0.0) { return 0.0; }
-                let t = min(x, 1.0);
-                return t * t * 0.5;
+            // enabled: 1 = strict (> / <), 2 = inclusive (>= / <=).
+            // isUpper: 1 = upper rule (fire when high), 0 = lower (fire when low).
+            fn transformProb(force: f32, threshold: f32, enabled: f32, isUpper: f32) -> f32 {
+                if (enabled > 1.5) {
+                    // Inclusive: direct comparison, no division needed.
+                    if (isUpper > 0.5) { return select(0.0, params.maxRate, force >= threshold); }
+                    else               { return select(0.0, params.maxRate, force <= threshold); }
+                } else {
+                    // Strict: ramp from zero toward threshold.
+                    if (abs(threshold) < 0.001) {
+                        // threshold = 0: step at zero — fire for any force in the right direction.
+                        if (isUpper > 0.5) { return select(0.0, params.maxRate, force > 0.0); }
+                        else               { return select(0.0, params.maxRate, force < 0.0); }
+                    }
+                    let x = force / threshold;
+                    if (x <= 0.0) { return 0.0; }
+                    let t = min(x, 1.0);
+                    return t * t * params.maxRate;
+                }
             }
 
             @compute @workgroup_size(256)
@@ -636,15 +853,16 @@ export class ParticleSimulation {
                 let idx = id.x;
                 if (idx >= arrayLength(&particles)) { return; }
 
-                let speed    = params.x;
-                let width    = params.y;
-                let height   = params.z;
-                let packed   = u32(params.w);
+                let speed    = params.speed;
+                let width    = params.worldW;
+                let height   = params.worldH;
+                let packed   = u32(params.packed);
                 let simMode  = packed & 0xFFu;
                 let edgeMode = (packed >> 8u) & 0xFFu;
                 let numTypes = packed >> 16u;
 
                 var p      = particles[idx];
+                if (p.typeId < 0.0) { return; }  // dead particle (mode 2 merge victim)
                 let myType = u32(p.typeId);
                 var accel  = vec2f(0.0);
                 var typeForce: array<f32, 20>;
@@ -671,7 +889,8 @@ export class ParticleSimulation {
                         for (var k = start; k < end; k++) {
                             let i = gridList[k];
                             if (i == idx) { continue; }
-                            let other     = particles[i];
+                            let other = particles[i];
+                            if (other.typeId < 0.0) { continue; }  // skip dead particles
                             let otherType = u32(other.typeId);
 
                             var dx = other.pos.x - p.pos.x;
@@ -693,22 +912,30 @@ export class ParticleSimulation {
 
                             let norm = (dist - f.minRadius) / range;
                             var mag: f32;
+                            var outerMag: f32 = 0.0;
                             if (norm < 0.3) {
                                 mag = (norm / 0.3 - 1.0);
                             } else {
                                 mag = f.strength * (1.0 - abs(1.0 - norm) / 0.7);
+                                outerMag = mag;
                             }
 
                             let poleData = u32(poleConfigs[otherType]);
                             let mask     = poleMask(-dx / dist, -dy / dist, other.vel, poleData);
                             let contrib  = mag * 0.1 * mask;
                             accel += vec2f(dx, dy) / dist * contrib;
-                            typeForce[otherType] += contrib;
+                            typeForce[otherType] += outerMag * 0.1 * mask;
                         }
                     }
                 }
 
-                p.vel = p.vel * 0.85 + accel * speed;
+                // Mode 2: mass-based inertia — higher mass = less acceleration
+                if (simMode == 2u) {
+                    let myMass = f32(getMass(myType));
+                    p.vel = p.vel * params.friction + accel * speed / max(myMass, 1.0);
+                } else {
+                    p.vel = p.vel * params.friction + accel * speed;
+                }
                 p.pos = p.pos + p.vel;
 
                 if (edgeMode == 0u) {
@@ -723,7 +950,7 @@ export class ParticleSimulation {
                     if (p.pos.y > height) { p.pos.y = height; p.vel.y = -abs(p.vel.y) * 0.5; }
                 }
 
-                if (simMode == 1u) {
+                if (simMode == 1u || simMode == 2u) {
                     let baseSeed = uhash(idx) ^ uhash(u32(abs(p.pos.x) * 157.0 + 1.0))
                                               ^ uhash(u32(abs(p.pos.y) * 239.0 + 1.0));
                     var maxProb: f32 = 0.0;
@@ -731,22 +958,28 @@ export class ParticleSimulation {
                     for (var t: u32 = 0u; t < numTypes; t++) {
                         let rule = transformRules[myType * 20u + t];
                         if (rule.upperEnabled > 0.5) {
-                            let prob = transformProb(typeForce[t], rule.upperThreshold);
+                            let prob = transformProb(typeForce[t], rule.upperThreshold, rule.upperEnabled, 1.0);
                             maxProb = max(maxProb, prob);
                             if (newType < 0 && prob > 0.0 && rand01(baseSeed ^ uhash(t * 3u + 0u)) < prob) {
                                 newType = i32(rule.upperTarget);
                             }
                         }
                         if (rule.lowerEnabled > 0.5) {
-                            let prob = transformProb(typeForce[t], rule.lowerThreshold);
+                            let prob = transformProb(typeForce[t], rule.lowerThreshold, rule.lowerEnabled, 0.0);
                             maxProb = max(maxProb, prob);
                             if (newType < 0 && prob > 0.0 && rand01(baseSeed ^ uhash(t * 3u + 1u)) < prob) {
                                 newType = i32(rule.lowerTarget);
                             }
                         }
                     }
-                    if (newType >= 0) { p.typeId = f32(newType); }
-                    p._pad = maxProb;  // drives instability pulse in render shader
+                    if (simMode == 1u) {
+                        // Mode 1: apply transform immediately
+                        if (newType >= 0) { p.typeId = f32(newType); }
+                        p._pad = maxProb;  // drives instability pulse in render shader
+                    } else {
+                        // Mode 2: store desired target in _pad; second pass handles mass conservation
+                        p._pad = select(-1.0, f32(newType), newType >= 0);
+                    }
                 } else {
                     p._pad = 0.0;
                 }
@@ -770,8 +1003,11 @@ export class ParticleSimulation {
             struct View { cx:f32, cy:f32, zoom:f32, sat:f32, glow:f32, alpha:f32,
                           canvasW:f32, canvasH:f32, additiveStr:f32, shapeMode:f32, simTime:f32, _p3:f32 }
 
+            struct SimParams { speed: f32, worldW: f32, worldH: f32, packed: f32,
+                              friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+
             @group(0) @binding(0) var<storage, read> particles: array<Particle>;
-            @group(0) @binding(1) var<uniform>       params:    vec4f;
+            @group(0) @binding(1) var<uniform>       params:    SimParams;
             @group(0) @binding(2) var<uniform>       view:      View;
 
             const COLORS = array<vec4f, 20>(
@@ -790,8 +1026,16 @@ export class ParticleSimulation {
             @vertex
             fn vertexMain(@location(0) quad: vec2f, @builtin(instance_index) inst: u32) -> VOut {
                 let p      = particles[inst];
-                let worldW = params.y;
-                let worldH = params.z;
+                // Dead particles (mode 2 merge victims): render off-screen so all 6 verts
+                // form zero-area triangles and no fragments are produced.
+                if (p.typeId < 0.0) {
+                    var o: VOut;
+                    o.pos = vec4f(2.0, 2.0, 2.0, 1.0);
+                    o.uv = vec2f(0.0); o.color = vec4f(0.0); o.glow = 0.0; o.typeId = 0.0;
+                    return o;
+                }
+                let worldW = params.worldW;
+                let worldH = params.worldH;
                 let zoom   = view.zoom;
                 let nx = (p.pos.x - view.cx) * 2.0 * zoom / worldW;
                 let ny = -(p.pos.y - view.cy) * 2.0 * zoom / worldH;
@@ -910,6 +1154,313 @@ export class ParticleSimulation {
         `;
     }
 
+    private getDiagnosticShaderCode(): string {
+        return /* wgsl */`
+            struct Particle   { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
+            struct ForceEntry { strength: f32, radius: f32, minRadius: f32 }
+            struct TRule      { uEnabled: f32, uThresh: f32, uTarget: f32,
+                                lEnabled: f32, lThresh: f32, lTarget: f32 }
+            struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
+            struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
+                                friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+            struct DiagParams { selectedIdx: u32, _p1: u32, _p2: u32, _p3: u32 }
+            struct DiagOutput {
+                pos:           vec2f,
+                vel:           vec2f,
+                typeId:        f32,
+                speed:         f32,
+                typeForce:     array<f32, 20>,
+                transformProb: array<f32, 20>,
+            }
+
+            @group(0) @binding(0) var<storage, read>       particles: array<Particle>;
+            @group(0) @binding(1) var<uniform>             sp:        SimParams;
+            @group(0) @binding(2) var<storage, read>       forces:    array<ForceEntry>;
+            @group(0) @binding(3) var<storage, read>       tRules:    array<TRule>;
+            @group(0) @binding(4) var<storage, read>       gridP:     GridParams;
+            @group(0) @binding(5) var<storage, read>       cellCount: array<u32>;
+            @group(0) @binding(6) var<storage, read>       cellStart: array<u32>;
+            @group(0) @binding(7) var<storage, read>       gridList:  array<u32>;
+            @group(0) @binding(8) var<uniform>             dp:        DiagParams;
+            @group(0) @binding(9) var<storage, read_write> output:    DiagOutput;
+
+            fn dTransformProb(force: f32, threshold: f32, enabled: f32, isUpper: f32) -> f32 {
+                if (enabled > 1.5) {
+                    if (isUpper > 0.5) { return select(0.0, sp.maxRate, force >= threshold); }
+                    else               { return select(0.0, sp.maxRate, force <= threshold); }
+                } else {
+                    if (abs(threshold) < 0.001) {
+                        if (isUpper > 0.5) { return select(0.0, sp.maxRate, force > 0.0); }
+                        else               { return select(0.0, sp.maxRate, force < 0.0); }
+                    }
+                    let x = force / threshold;
+                    if (x <= 0.0) { return 0.0; }
+                    let t = min(x, 1.0);
+                    return t * t * sp.maxRate;
+                }
+            }
+
+            @compute @workgroup_size(1)
+            fn main() {
+                let idx = dp.selectedIdx;
+                if (idx >= arrayLength(&particles)) { return; }
+                let p      = particles[idx];
+                let myType = u32(p.typeId);
+
+                let packed   = u32(sp.packed);
+                let edgeMode = (packed >> 8u) & 0xFFu;
+                let width    = sp.worldW;
+                let height   = sp.worldH;
+
+                var typeForce: array<f32, 20>;
+
+                let gw   = i32(gridP.gridW);
+                let gh   = i32(gridP.gridH);
+                let cs   = gridP.cellSize;
+                let myGx = clamp(i32(p.pos.x / cs), 0, gw - 1);
+                let myGy = clamp(i32(p.pos.y / cs), 0, gh - 1);
+
+                for (var goy = -1; goy <= 1; goy++) {
+                    for (var gox = -1; gox <= 1; gox++) {
+                        var ngx = myGx + gox;
+                        var ngy = myGy + goy;
+                        if (edgeMode == 0u) {
+                            ngx = ((ngx % gw) + gw) % gw;
+                            ngy = ((ngy % gh) + gh) % gh;
+                        } else {
+                            if (ngx < 0 || ngx >= gw || ngy < 0 || ngy >= gh) { continue; }
+                        }
+                        let cell  = u32(ngy) * gridP.gridW + u32(ngx);
+                        let start = cellStart[cell];
+                        let end   = start + cellCount[cell];
+                        for (var k = start; k < end; k++) {
+                            let i         = gridList[k];
+                            if (i == idx) { continue; }
+                            let other     = particles[i];
+                            let otherType = u32(other.typeId);
+
+                            var dx = other.pos.x - p.pos.x;
+                            var dy = other.pos.y - p.pos.y;
+                            if (edgeMode == 0u) {
+                                if (dx >  width  * 0.5) { dx -= width;  }
+                                if (dx < -width  * 0.5) { dx += width;  }
+                                if (dy >  height * 0.5) { dy -= height; }
+                                if (dy < -height * 0.5) { dy += height; }
+                            }
+                            let dist = sqrt(dx * dx + dy * dy);
+                            if (dist < 0.1) { continue; }
+
+                            let f     = forces[myType * 20u + otherType];
+                            let range = f.radius - f.minRadius;
+                            if (dist < f.minRadius || dist > f.radius || range <= 0.0) { continue; }
+
+                            let norm = (dist - f.minRadius) / range;
+                            if (norm >= 0.3) {
+                                let mag = f.strength * (1.0 - abs(1.0 - norm) / 0.7);
+                                typeForce[otherType] += mag * 0.1;
+                            }
+                        }
+                    }
+                }
+
+                output.pos    = p.pos;
+                output.vel    = p.vel;
+                output.typeId = p.typeId;
+                output.speed  = length(p.vel);
+
+                for (var t: u32 = 0u; t < 20u; t++) {
+                    output.typeForce[t] = typeForce[t];
+                    let rule = tRules[myType * 20u + t];
+                    var prob: f32 = 0.0;
+                    if (rule.uEnabled > 0.5) { prob = max(prob, dTransformProb(typeForce[t], rule.uThresh, rule.uEnabled, 1.0)); }
+                    if (rule.lEnabled > 0.5) { prob = max(prob, dTransformProb(typeForce[t], rule.lThresh, rule.lEnabled, 0.0)); }
+                    output.transformProb[t] = prob;
+                }
+            }
+        `;
+    }
+
+    private getCursorForceShaderCode(): string {
+        return /* wgsl */`
+            struct Particle    { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
+            struct CursorParams { x: f32, y: f32, radius: f32, strength: f32 }
+
+            @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
+            @group(0) @binding(1) var<uniform> cp: CursorParams;
+
+            @compute @workgroup_size(256)
+            fn main(@builtin(global_invocation_id) id: vec3u) {
+                let i = id.x;
+                if (i >= arrayLength(&particles)) { return; }
+                var p = particles[i];
+                let dx = p.pos.x - cp.x;
+                let dy = p.pos.y - cp.y;
+                let dist2 = dx * dx + dy * dy;
+                if (dist2 > cp.radius * cp.radius || dist2 < 0.0001) { return; }
+                let dist    = sqrt(dist2);
+                let falloff = 1.0 - dist / cp.radius;
+                p.vel += vec2f(dx / dist, dy / dist) * cp.strength * falloff;
+                particles[i] = p;
+            }
+        `;
+    }
+
+    private getRemapTypesShaderCode(): string {
+        return /* wgsl */`
+            struct Particle    { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
+            struct RemapParams { newN: u32, _p1: u32, _p2: u32, _p3: u32 }
+
+            @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
+            @group(0) @binding(1) var<uniform> rp: RemapParams;
+
+            fn uhash(v: u32) -> u32 {
+                var x = v ^ (v >> 16u);
+                x *= 0x45d9f3bu;
+                x ^= (x >> 16u);
+                return x;
+            }
+
+            @compute @workgroup_size(256)
+            fn main(@builtin(global_invocation_id) id: vec3u) {
+                let i = id.x;
+                if (i >= arrayLength(&particles)) { return; }
+                let t = u32(particles[i].typeId);
+                if (t >= rp.newN) {
+                    particles[i].typeId = f32(uhash(i ^ uhash(t)) % rp.newN);
+                }
+            }
+        `;
+    }
+
+    private getMode2TransformShaderCode(): string {
+        return /* wgsl */`
+            struct Particle    { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
+            struct GridParams  { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
+            struct TypeMasses  { m: array<vec4u, 5> }
+            struct ActiveCount { n: atomic<u32> }
+            struct FrameCount  { n: u32, baseCount: u32, _p2: u32, _p3: u32 }
+
+            @group(0) @binding(0) var<storage, read_write> particles:   array<Particle>;
+            @group(0) @binding(1) var<storage, read_write> claimed:     array<atomic<u32>>;
+            @group(0) @binding(2) var<storage, read_write> activeCount: ActiveCount;
+            @group(0) @binding(3) var<storage, read>       cellCount:   array<u32>;
+            @group(0) @binding(4) var<storage, read>       cellStart:   array<u32>;
+            @group(0) @binding(5) var<storage, read>       gridList:    array<u32>;
+            @group(0) @binding(6) var<storage, read>       gridP:       GridParams;
+            @group(0) @binding(7) var<uniform>             tm:          TypeMasses;
+            @group(0) @binding(8) var<uniform>             fc:          FrameCount;
+
+            fn getMass(t: u32) -> u32 { return tm.m[t >> 2u][t & 3u]; }
+
+            @compute @workgroup_size(256)
+            fn main(@builtin(global_invocation_id) id: vec3u) {
+                let idx = id.x;
+                if (idx >= fc.baseCount) { return; }
+
+                var p = particles[idx];
+                if (p.typeId < 0.0) { return; }  // already dead
+
+                let desiredTarget = i32(p._pad);
+                if (desiredTarget < 0) { return; }  // no transform pending
+
+                // Claim self atomically — prevents being consumed while we process
+                let ownClaim = atomicExchange(&claimed[idx], fc.n);
+                if (ownClaim == fc.n) { return; }  // another particle already claimed us
+
+                let srcType = u32(p.typeId);
+                let dstType = u32(desiredTarget);
+                if (dstType >= 20u || srcType == dstType) {
+                    atomicStore(&claimed[idx], 0u);
+                    p._pad = 0.0; particles[idx] = p; return;
+                }
+
+                let srcMass = getMass(srcType);
+                let dstMass = getMass(dstType);
+                let canSplit = (srcMass >= dstMass) && (srcMass % dstMass == 0u);
+                let canMerge = (dstMass > srcMass)  && (dstMass % srcMass == 0u);
+
+                if (!canSplit && !canMerge) {
+                    // Incompatible masses — cannot conserve mass; block this transform
+                    atomicStore(&claimed[idx], 0u);
+                    p._pad = 0.0; particles[idx] = p; return;
+                }
+
+                if (canSplit) {
+                    let n = srcMass / dstMass;
+                    p.typeId = f32(dstType);
+                    p._pad   = 1.0;  // instability pulse: just transformed
+                    particles[idx] = p;
+                    // Spawn n-1 additional particles at nearby positions
+                    for (var s = 1u; s < n; s++) {
+                        let slot = atomicAdd(&activeCount.n, 1u);
+                        if (slot < arrayLength(&particles)) {
+                            let angle = f32(s) * 2.399963f;  // golden-angle offset
+                            var np: Particle;
+                            np.pos    = p.pos + vec2f(cos(angle), sin(angle)) * 3.0;
+                            np.vel    = p.vel * 0.7;
+                            np.typeId = f32(dstType);
+                            np._pad   = 0.0;
+                            particles[slot] = np;
+                        }
+                    }
+                    return;
+                }
+
+                // Merge: need dstMass/srcMass − 1 additional same-type neighbors
+                let needed = dstMass / srcMass - 1u;
+                var claimedCount = 0u;
+                var claimedSlots: array<u32, 8>;  // max needed = 7 (mass-1 → mass-8)
+
+                let gw = i32(gridP.gridW);
+                let gh = i32(gridP.gridH);
+                let cs = gridP.cellSize;
+                let myGx = clamp(i32(p.pos.x / cs), 0, gw - 1);
+                let myGy = clamp(i32(p.pos.y / cs), 0, gh - 1);
+
+                for (var goy = -1; goy <= 1 && claimedCount < needed; goy++) {
+                    for (var gox = -1; gox <= 1 && claimedCount < needed; gox++) {
+                        let ngx = myGx + gox;
+                        let ngy = myGy + goy;
+                        if (ngx < 0 || ngx >= gw || ngy < 0 || ngy >= gh) { continue; }
+                        let cell  = u32(ngy * gw + ngx);
+                        let start = cellStart[cell];
+                        let cnt   = cellCount[cell];
+                        for (var k = 0u; k < cnt && claimedCount < needed; k++) {
+                            let j = gridList[start + k];
+                            if (j == idx) { continue; }
+                            let q = particles[j];
+                            if (q.typeId < 0.0 || u32(q.typeId) != srcType) { continue; }
+                            // Atomically try to claim neighbor j
+                            let old = atomicExchange(&claimed[j], fc.n);
+                            if (old != fc.n) {
+                                claimedSlots[claimedCount] = j;
+                                claimedCount++;
+                            }
+                        }
+                    }
+                }
+
+                if (claimedCount >= needed) {
+                    // Success: transform self, kill consumed neighbors
+                    p.typeId = f32(dstType);
+                    p._pad   = 1.0;
+                    particles[idx] = p;
+                    for (var k = 0u; k < needed; k++) {
+                        particles[claimedSlots[k]].typeId = -1.0;
+                        particles[claimedSlots[k]]._pad   =  0.0;
+                    }
+                } else {
+                    // Failure: release all partial claims and self
+                    for (var k = 0u; k < claimedCount; k++) {
+                        atomicStore(&claimed[claimedSlots[k]], 0u);
+                    }
+                    atomicStore(&claimed[idx], 0u);
+                    p._pad = 0.0; particles[idx] = p;
+                }
+            }
+        `;
+    }
+
     // ── Public API ────────────────────────────────────────────────────────────
 
     update(): void {
@@ -967,6 +1518,22 @@ export class ParticleSimulation {
             forceCp.dispatchWorkgroups(Math.ceil(N / 256));
             forceCp.end();
 
+            // Mode 2: mass-conserving transform pass (runs after main physics)
+            if (this.simMode === 2 && this.m2TransformPipeline && this.m2TransformBindGroup &&
+                this.m2ActiveCountBuffer && this.m2FrameCounterBuffer && this.typeMassBuffer) {
+                this.m2FrameCounter = ((this.m2FrameCounter % 0xFFFFFFFE) + 1) >>> 0;
+                this.queue.writeBuffer(this.typeMassBuffer, 0, this.generateTypeMassData());
+                const m2AcData = new Uint32Array(4); m2AcData[0] = N;
+                this.queue.writeBuffer(this.m2ActiveCountBuffer, 0, m2AcData);
+                const m2FcData = new Uint32Array(4); m2FcData[0] = this.m2FrameCounter; m2FcData[1] = N;
+                this.queue.writeBuffer(this.m2FrameCounterBuffer, 0, m2FcData);
+                const m2Cp = enc.beginComputePass();
+                m2Cp.setPipeline(this.m2TransformPipeline);
+                m2Cp.setBindGroup(0, this.m2TransformBindGroup);
+                m2Cp.dispatchWorkgroups(Math.ceil(N / 256));
+                m2Cp.end();
+            }
+
             this.simulationTime += 0.016;
         }
 
@@ -987,6 +1554,25 @@ export class ParticleSimulation {
             accCp.end();
         }
 
+        // Diagnostic pass (runs every frame when a particle is selected)
+        if (this.selectedParticleIdx >= this.params.particleCount) {
+            this.selectedParticleIdx = -1;
+            this.diagData = null;
+            this.onDiagnosticUpdate?.(null);
+        }
+        const doDiag = this.selectedParticleIdx >= 0 && !this.diagReadPending &&
+                       !!this.diagPipeline && !!this.diagBindGroup;
+        if (doDiag) {
+            const dp = new Uint32Array(4);
+            dp[0] = this.selectedParticleIdx;
+            this.queue.writeBuffer(this.diagParamBuffer!, 0, dp);
+            const diagCp = enc.beginComputePass();
+            diagCp.setPipeline(this.diagPipeline!);
+            diagCp.setBindGroup(0, this.diagBindGroup!);
+            diagCp.dispatchWorkgroups(1);
+            diagCp.end();
+        }
+
         const bg = this.backgroundColor;
         const rp = enc.beginRenderPass({
             colorAttachments: [{
@@ -1005,8 +1591,40 @@ export class ParticleSimulation {
         if (doReadback) {
             enc.copyBufferToBuffer(this.trackingStatsBuffer!, 0, this.trackingStagingBuffer!, 0, 16);
         }
+        if (doDiag) {
+            enc.copyBufferToBuffer(this.diagOutputBuffer!, 0, this.diagStagingBuffer!, 0, 192);
+        }
+
+        // Mode 2: copy active count to staging so CPU can track spawns/deaths
+        const doM2Count = this.simMode === 2 && !this.isPaused && !this.m2CountPending &&
+                          !!this.m2ActiveCountBuffer && !!this.m2StagingBuffer;
+        if (doM2Count) {
+            enc.copyBufferToBuffer(this.m2ActiveCountBuffer!, 0, this.m2StagingBuffer!, 0, 4);
+        }
 
         this.queue.submit([enc.finish()]);
+
+        if (doDiag) {
+            this.diagReadPending = true;
+            this.diagStagingBuffer!.mapAsync(GPUMapMode.READ).then(() => {
+                const f32  = new Float32Array(this.diagStagingBuffer!.getMappedRange());
+                const n    = this.numTypes;
+                const data: DiagnosticData = {
+                    index:        this.selectedParticleIdx,
+                    typeId:       Math.round(f32[4]),
+                    pos:          [f32[0], f32[1]],
+                    vel:          [f32[2], f32[3]],
+                    speed:        f32[5],
+                    directionDeg: Math.atan2(f32[3], f32[2]) * 180 / Math.PI,
+                    typeForces:   Array.from({ length: n }, (_, t) => f32[6  + t]),
+                    transformProbs: Array.from({ length: n }, (_, t) => f32[26 + t]),
+                };
+                this.diagStagingBuffer!.unmap();
+                this.diagReadPending = false;
+                this.diagData = data;
+                this.onDiagnosticUpdate?.(data);
+            });
+        }
 
         if (doReadback) {
             this.trackReadPending = true;
@@ -1033,6 +1651,20 @@ export class ParticleSimulation {
                 this.trackReadPending = false;
             });
         }
+
+        if (doM2Count) {
+            this.m2CountPending = true;
+            this.m2StagingBuffer!.mapAsync(GPUMapMode.READ, 0, 4).then(() => {
+                const u32 = new Uint32Array(this.m2StagingBuffer!.getMappedRange(0, 4));
+                const newCount = Math.min(u32[0], MAX_PARTICLE_CAPACITY);
+                this.m2StagingBuffer!.unmap();
+                this.m2CountPending = false;
+                if (newCount !== this.params.particleCount) {
+                    this.params.particleCount = newCount;
+                    this.queue?.writeBuffer(this.paramsBuffer!, 0, this.paramsArray());
+                }
+            });
+        }
     }
 
     updateParams(p: Partial<SimulationParams>): void {
@@ -1040,28 +1672,135 @@ export class ParticleSimulation {
         if (p.forceMatrix)                   this.params.forceMatrix = p.forceMatrix;
     }
 
+    applyCursorForce(worldX: number, worldY: number, worldRadius: number, strength: number): void {
+        if (!this.isInitialized || !this.device || !this.queue ||
+            !this.cursorPipeline || !this.cursorBindGroup || !this.cursorParamBuffer) return;
+        this.queue.writeBuffer(this.cursorParamBuffer, 0, new Float32Array([worldX, worldY, worldRadius, strength]));
+        const enc = this.device.createCommandEncoder();
+        const cp  = enc.beginComputePass();
+        cp.setPipeline(this.cursorPipeline);
+        cp.setBindGroup(0, this.cursorBindGroup);
+        cp.dispatchWorkgroups(Math.ceil(this.params.particleCount / 256));
+        cp.end();
+        this.queue.submit([enc.finish()]);
+    }
+
+    selectParticleAt(worldX: number, worldY: number): void {
+        if (!this.isInitialized || !this.device || !this.queue ||
+            !this.particleBuffer || !this.snapStagingBuffer || this.snapReadPending) return;
+
+        const n        = this.params.particleCount;
+        const byteSize = n * 6 * 4; // 6 floats per particle
+        const enc = this.device.createCommandEncoder();
+        enc.copyBufferToBuffer(this.particleBuffer, 0, this.snapStagingBuffer, 0, byteSize);
+        this.queue.submit([enc.finish()]);
+
+        this.snapReadPending = true;
+        this.snapStagingBuffer.mapAsync(GPUMapMode.READ, 0, byteSize).then(() => {
+            const f32 = new Float32Array(this.snapStagingBuffer!.getMappedRange(0, byteSize));
+            let bestDist = Infinity, bestIdx = -1;
+            for (let i = 0; i < n; i++) {
+                const dx = f32[i * 6] - worldX;
+                const dy = f32[i * 6 + 1] - worldY;
+                const d  = dx * dx + dy * dy;
+                if (d < bestDist) { bestDist = d; bestIdx = i; }
+            }
+            this.snapStagingBuffer!.unmap();
+            this.snapReadPending = false;
+            if (bestIdx >= 0) { this.selectedParticleIdx = bestIdx; }
+        });
+    }
+
+    clearParticleSelection(): void {
+        this.selectedParticleIdx = -1;
+        this.diagData = null;
+        this.onDiagnosticUpdate?.(null);
+    }
+
+    getSelectedParticleIndex(): number { return this.selectedParticleIdx; }
+
     setParticleCount(count: number): void {
         if (!this.isInitialized || !this.device || !this.queue) return;
         this.params.particleCount = count;
         this.particleBuffer?.destroy();
         this.particleBuffer = this.makeBuffer(
             'particles', this.generateParticleData(),
-            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
         );
         this.rebuildBindGroups();
     }
 
     setNumTypes(n: number): void {
-        this.numTypes = Math.max(1, Math.min(MAX_TYPES, Math.round(n)));
-        // Clamp all transform targets to the new active range
-        const maxT = this.numTypes - 1;
-        for (const r of this.transformRules) {
-            r.upperTarget = Math.min(r.upperTarget, maxT);
-            r.lowerTarget = Math.min(r.lowerTarget, maxT);
+        const newN = Math.max(1, Math.min(MAX_TYPES, Math.round(n)));
+        const oldN = this.numTypes;
+        if (newN === oldN) return;
+
+        if (newN > oldN) {
+            // Add force matrix entries for the new types with random values
+            for (let t = oldN; t < newN; t++) {
+                if (!this.params.forceMatrix[t]) this.params.forceMatrix[t] = {};
+                for (let other = 0; other < newN; other++) {
+                    if (this.params.forceMatrix[t][other] == null) {
+                        this.params.forceMatrix[t][other] = {
+                            strength:  (Math.random() * 2 - 1) * 0.7,
+                            radius:    triRand(10, 100, 250),
+                            minRadius: 0,
+                        };
+                    }
+                    if (!this.params.forceMatrix[other]) this.params.forceMatrix[other] = {};
+                    if (other !== t && this.params.forceMatrix[other][t] == null) {
+                        this.params.forceMatrix[other][t] = {
+                            strength:  (Math.random() * 2 - 1) * 0.7,
+                            radius:    triRand(10, 100, 250),
+                            minRadius: 0,
+                        };
+                    }
+                }
+            }
+            // New types start with all transform rules disabled
+            for (let t = oldN; t < newN; t++) {
+                for (let other = 0; other < MAX_TYPES; other++) {
+                    this.transformRules[t * MAX_TYPES + other].upperEnabled   = false;
+                    this.transformRules[t * MAX_TYPES + other].upperInclusive = false;
+                    this.transformRules[t * MAX_TYPES + other].lowerEnabled   = false;
+                    this.transformRules[t * MAX_TYPES + other].lowerInclusive = false;
+                    if (other !== t) {
+                        this.transformRules[other * MAX_TYPES + t].upperEnabled   = false;
+                        this.transformRules[other * MAX_TYPES + t].upperInclusive = false;
+                        this.transformRules[other * MAX_TYPES + t].lowerEnabled   = false;
+                        this.transformRules[other * MAX_TYPES + t].lowerInclusive = false;
+                    }
+                }
+            }
+            this.numTypes = newN;
+        } else {
+            // Clamp transform targets to the new active range
+            const maxT = newN - 1;
+            for (const r of this.transformRules) {
+                r.upperTarget = Math.min(r.upperTarget, maxT);
+                r.lowerTarget = Math.min(r.lowerTarget, maxT);
+            }
+            this.numTypes = newN;
+            // GPU pass: particles with typeId >= newN get remapped to random [0, newN)
+            if (this.isInitialized && this.device && this.queue &&
+                this.remapPipeline && this.remapBindGroup && this.remapParamsBuffer) {
+                const rp = new Uint32Array(4);
+                rp[0] = newN;
+                this.queue.writeBuffer(this.remapParamsBuffer, 0, rp);
+                const enc = this.device.createCommandEncoder();
+                const cp  = enc.beginComputePass();
+                cp.setPipeline(this.remapPipeline);
+                cp.setBindGroup(0, this.remapBindGroup);
+                cp.dispatchWorkgroups(Math.ceil(this.params.particleCount / 256));
+                cp.end();
+                this.queue.submit([enc.finish()]);
+            }
         }
-        if (!this.isInitialized || !this.queue || !this.particleBuffer || !this.paramsBuffer) return;
-        this.queue.writeBuffer(this.particleBuffer, 0, this.generateParticleData());
-        this.queue.writeBuffer(this.paramsBuffer,   0, this.paramsArray());
+
+        if (!this.isInitialized || !this.queue || !this.paramsBuffer) return;
+        this.queue.writeBuffer(this.paramsBuffer, 0, this.paramsArray());
+        if (this.forcesBuffer)    this.queue.writeBuffer(this.forcesBuffer,    0, this.generateForcesData());
+        if (this.transformBuffer) this.queue.writeBuffer(this.transformBuffer, 0, this.generateTransformData());
     }
 
     setWorldSize(w: number, h: number): void {
@@ -1087,9 +1826,18 @@ export class ParticleSimulation {
         this.simulationTime = 0;
     }
 
-    setSimMode(mode: 0 | 1): void { this.simMode = mode; }
+    setSimMode(mode: 0 | 1 | 2): void { this.simMode = mode; }
     getEdgeMode():    number    { return this.edgeMode; }
     getSimMode():     number    { return this.simMode; }
+
+    setTypeMass(typeIdx: number, mass: number): void {
+        if (typeIdx < 0 || typeIdx >= MAX_TYPES) return;
+        this.typeMass[typeIdx] = Math.max(1, Math.min(8, Math.round(mass)));
+        if (this.queue && this.typeMassBuffer) {
+            this.queue.writeBuffer(this.typeMassBuffer, 0, this.generateTypeMassData());
+        }
+    }
+    getTypeMass(): number[] { return this.typeMass.slice(0, this.numTypes); }
     getNumTypes():    number    { return this.numTypes; }
     getDefaultView(): ViewState { return this.defaultView(); }
 
@@ -1115,6 +1863,12 @@ export class ParticleSimulation {
 
     setShapeMode(m: 0 | 1): void { this.shapeMode = m; }
     getShapeMode(): number { return this.shapeMode; }
+
+    setFriction(v: number): void { this.friction = Math.max(0, Math.min(0.99,v)); }
+    getFriction(): number { return this.friction; }
+
+    setMaxTransformRate(v: number): void { this.maxTransformRate = Math.max(0.01, Math.min(1.0, v)); }
+    getMaxTransformRate(): number { return this.maxTransformRate; }
 
     setView(cx: number, cy: number, zoom: number): void { this.view = { cx, cy, zoom }; }
     getView(): ViewState { return { ...this.view }; }
@@ -1239,6 +1993,7 @@ export class ParticleSimulation {
             poleCount: this.poleConfigs[t] & 0xF,
             signBits:  this.poleConfigs[t] >> 4,
         }));
+        const masses = Array.from({ length: n }, (_, t) => this.typeMass[t] ?? 1);
         return {
             version:          3,
             numTypes:         n,
@@ -1255,9 +2010,12 @@ export class ParticleSimulation {
             additiveStrength:  this.additiveStrength,
             blendMode:         this.blendMode,
             shapeMode:         this.shapeMode,
+            friction:          this.friction,
+            maxTransformRate:  this.maxTransformRate,
             forceMatrix:      fm,
             transformRules:   tr,
             poleConfigs:      poles,
+            typeMass:         masses,
         };
     }
 
@@ -1266,7 +2024,7 @@ export class ParticleSimulation {
         this.numTypes = n;
 
         if (state.simulationSpeed != null) this.params.simulationSpeed = Number(state.simulationSpeed);
-        if (state.simMode  != null) this.simMode  = Number(state.simMode)  as 0 | 1;
+        if (state.simMode  != null) this.simMode  = Number(state.simMode)  as 0 | 1 | 2;
         if (state.edgeMode != null) this.edgeMode = Number(state.edgeMode) as 0 | 1;
 
         if (state.backgroundColor) {
@@ -1279,6 +2037,8 @@ export class ParticleSimulation {
         if (state.additiveStrength != null) this.additiveStrength = Number(state.additiveStrength);
         if (state.blendMode        != null) this.blendMode        = Number(state.blendMode) as 0 | 1;
         if (state.shapeMode        != null) this.shapeMode        = Number(state.shapeMode) as 0 | 1;
+        if (state.friction         != null) this.friction         = Math.max(0, Math.min(0.99,Number(state.friction)));
+        if (state.maxTransformRate != null) this.maxTransformRate = Math.max(0.01, Math.min(1.0, Number(state.maxTransformRate)));
 
         if (Array.isArray(state.forceMatrix)) {
             for (let from = 0; from < n; from++) {
@@ -1295,9 +2055,11 @@ export class ParticleSimulation {
                     const r = state.transformRules[from * n + to];
                     if (r) this.transformRules[from * MAX_TYPES + to] = {
                         upperEnabled:   Boolean(r.upperEnabled),
+                        upperInclusive: Boolean(r.upperInclusive),
                         upperThreshold: Number(r.upperThreshold),
                         upperTarget:    Number(r.upperTarget),
                         lowerEnabled:   Boolean(r.lowerEnabled),
+                        lowerInclusive: Boolean(r.lowerInclusive),
                         lowerThreshold: Number(r.lowerThreshold),
                         lowerTarget:    Number(r.lowerTarget),
                     };
@@ -1314,6 +2076,12 @@ export class ParticleSimulation {
         this.view = this.defaultView();
         if (state.particleCount) this.params.particleCount = Number(state.particleCount);
 
+        if (Array.isArray(state.typeMass)) {
+            for (let t = 0; t < n; t++) {
+                const m = state.typeMass[t];
+                if (m != null) this.typeMass[t] = Math.max(1, Math.min(8, Math.round(Number(m))));
+            }
+        }
         if (Array.isArray(state.poleConfigs)) {
             for (let t = 0; t < n; t++) {
                 const pc = state.poleConfigs[t];
@@ -1325,13 +2093,14 @@ export class ParticleSimulation {
         this.particleBuffer?.destroy();
         this.particleBuffer = this.makeBuffer(
             'particles', this.generateParticleData(),
-            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
         );
         this.rebuildBindGroups();
         this.queue.writeBuffer(this.forcesBuffer!,    0, this.generateForcesData());
         this.queue.writeBuffer(this.transformBuffer!, 0, this.generateTransformData());
         this.queue.writeBuffer(this.poleBuffer!,      0, this.generatePoleData());
         this.queue.writeBuffer(this.paramsBuffer!,    0, this.paramsArray());
+        if (this.typeMassBuffer) this.queue.writeBuffer(this.typeMassBuffer, 0, this.generateTypeMassData());
         this.simulationTime = 0;
     }
 }
