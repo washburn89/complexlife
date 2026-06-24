@@ -1,6 +1,6 @@
 # Particle Life Simulator
 
-A GPU-accelerated particle life simulator built with WebGPU and Babylon.js. Simulates emergent behavior from simple interaction rules between particles, with support for 1M+ particles.
+A GPU-accelerated particle life simulator built on raw WebGPU compute shaders. Simulates emergent behavior from simple interaction rules between particles.
 
 ## Features
 
@@ -155,4 +155,4 @@ MIT
 
 - [Particle Life - Visualizing Artificial Life](https://www.youtube.com/watch?v=p4YirERTVF0)
 - [WebGPU Documentation](https://www.w3.org/TR/webgpu/)
-- [Babylon.js Documentation](https://doc.babylonjs.com/)
+- [WGSL Specification](https://www.w3.org/TR/WGSL/)

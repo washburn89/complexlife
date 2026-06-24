@@ -196,6 +196,11 @@ export class ParticleSimulation {
     private isPaused       = false;
     private simulationTime = 0;
 
+    // Dirty flags: config buffers are only re-uploaded to the GPU when their
+    // CPU-side data actually changes, instead of every frame.
+    private forcesDirty    = true;
+    private transformDirty = true;
+
     constructor(canvas: HTMLCanvasElement) {
         this.canvas       = canvas;
         this.configWidth  = canvas.width;
@@ -227,6 +232,7 @@ export class ParticleSimulation {
                 };
             }
         }
+        this.forcesDirty = true;
     }
 
     private initializeTransformRules(): void {
@@ -249,6 +255,7 @@ export class ParticleSimulation {
                 lowerTarget:    randTarget(),
             };
         });
+        this.transformDirty = true;
     }
 
     private initializePoleConfigs(): void {
@@ -735,21 +742,52 @@ export class ParticleSimulation {
         `;
     }
 
+    // Exclusive prefix sum over all grid cells, computed by a single workgroup of
+    // 256 threads instead of one serial thread. Each thread scans a contiguous
+    // chunk of cells; the per-chunk totals are scanned, then the chunk offsets are
+    // folded back in. cellCount is reset to 0 so the scatter pass can reuse it as
+    // an atomic write cursor. Cells beyond numCells are already 0 (cleared by the
+    // clear pass), so scanning the full fixed range is equivalent and uniform.
     private getPrefixSumShaderCode(): string {
+        const CHUNK = MAX_CELLS / 256;  // 4096 / 256 = 16
         return /* wgsl */`
-            struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
-            @group(0) @binding(5) var<storage, read>       gridParams: GridParams;
             @group(0) @binding(6) var<storage, read_write> cellCount:  array<u32>;
             @group(0) @binding(7) var<storage, read_write> cellStart:  array<u32>;
-            @compute @workgroup_size(1)
-            fn main() {
-                var running = 0u;
-                let nc = gridParams.numCells;
-                for (var i = 0u; i < nc; i++) {
-                    let cnt    = cellCount[i];
-                    cellStart[i] = running;
-                    running   += cnt;
-                    cellCount[i] = 0u;
+
+            var<workgroup> chunkTotal: array<u32, 256>;
+
+            const CHUNK = ${CHUNK}u;
+
+            @compute @workgroup_size(256)
+            fn main(@builtin(local_invocation_id) lid: vec3u) {
+                let t    = lid.x;
+                let base = t * CHUNK;
+
+                // Phase 1: sequential sum of this thread's chunk.
+                var sum = 0u;
+                for (var i = 0u; i < CHUNK; i++) { sum += cellCount[base + i]; }
+                chunkTotal[t] = sum;
+                workgroupBarrier();
+
+                // Phase 2: exclusive scan of the 256 chunk totals (one thread).
+                if (t == 0u) {
+                    var running = 0u;
+                    for (var k = 0u; k < 256u; k++) {
+                        let c = chunkTotal[k];
+                        chunkTotal[k] = running;
+                        running += c;
+                    }
+                }
+                workgroupBarrier();
+
+                // Phase 3: write exclusive prefix for each cell, reset count to 0.
+                var running = chunkTotal[t];
+                for (var i = 0u; i < CHUNK; i++) {
+                    let idx = base + i;
+                    let cnt = cellCount[idx];
+                    cellStart[idx] = running;
+                    running += cnt;
+                    cellCount[idx] = 0u;
                 }
             }
         `;
@@ -1533,11 +1571,19 @@ export class ParticleSimulation {
         const enc = this.device.createCommandEncoder();
         const N   = this.params.particleCount;
 
+        // Config buffers are uploaded only when their CPU-side data changed.
+        // (poles are written immediately by their setters, so no flag is needed.)
+        if (this.forcesDirty) {
+            this.queue.writeBuffer(this.forcesBuffer!, 0, this.generateForcesData());
+            this.forcesDirty = false;
+        }
+        if (this.transformDirty) {
+            this.queue.writeBuffer(this.transformBuffer!, 0, this.generateTransformData());
+            this.transformDirty = false;
+        }
+
         if (!this.isPaused) {
             this.queue.writeBuffer(this.paramsBuffer!,    0, this.paramsArray());
-            this.queue.writeBuffer(this.forcesBuffer!,    0, this.generateForcesData());
-            this.queue.writeBuffer(this.transformBuffer!, 0, this.generateTransformData());
-            this.queue.writeBuffer(this.poleBuffer!,      0, this.generatePoleData());
 
             const gp = this.computeGridParams();
             const gpData = new Uint32Array(4);
@@ -1726,7 +1772,7 @@ export class ParticleSimulation {
 
     updateParams(p: Partial<SimulationParams>): void {
         if (p.simulationSpeed !== undefined) this.params.simulationSpeed = p.simulationSpeed;
-        if (p.forceMatrix)                   this.params.forceMatrix = p.forceMatrix;
+        if (p.forceMatrix)                 { this.params.forceMatrix = p.forceMatrix; this.forcesDirty = true; }
     }
 
     applyCursorForce(worldX: number, worldY: number, worldRadius: number, strength: number): void {
@@ -1890,10 +1936,12 @@ export class ParticleSimulation {
             }
         }
 
+        // Force/transform matrices changed: defer upload to the next frame.
+        this.forcesDirty    = true;
+        this.transformDirty = true;
+
         if (!this.isInitialized || !this.queue || !this.paramsBuffer) return;
         this.queue.writeBuffer(this.paramsBuffer, 0, this.paramsArray());
-        if (this.forcesBuffer)    this.queue.writeBuffer(this.forcesBuffer,    0, this.generateForcesData());
-        if (this.transformBuffer) this.queue.writeBuffer(this.transformBuffer, 0, this.generateTransformData());
     }
 
     setWorldSize(w: number, h: number): void {
@@ -2023,6 +2071,7 @@ export class ParticleSimulation {
 
     setTransformRule(source: number, trigger: number, rule: TransformRule): void {
         this.transformRules[source * MAX_TYPES + trigger] = { ...rule };
+        this.transformDirty = true;
     }
     getTransformRules(): TransformRule[] { return this.transformRules; }
 
@@ -2034,6 +2083,7 @@ export class ParticleSimulation {
                 const c = this.params.forceMatrix[from]?.[to];
                 if (c) c.strength = (Math.random() * 2 - 1) * 0.7;
             }
+        this.forcesDirty = true;
     }
 
     randomizeMaxRadii(): void {
@@ -2045,6 +2095,7 @@ export class ParticleSimulation {
                     if (c.minRadius >= c.radius) c.minRadius = 0;
                 }
             }
+        this.forcesDirty = true;
     }
 
     randomizeMinRadii(): void {
@@ -2054,6 +2105,7 @@ export class ParticleSimulation {
                 // Triangular: mode at 15% of max radius, tail up to 80%
                 if (c) c.minRadius = Math.min(c.radius - 1, triRand(0, c.radius * 0.15, c.radius * 0.8));
             }
+        this.forcesDirty = true;
     }
 
     zeroMinRadii(): void {
@@ -2062,6 +2114,7 @@ export class ParticleSimulation {
                 const c = this.params.forceMatrix[from]?.[to];
                 if (c) c.minRadius = 0;
             }
+        this.forcesDirty = true;
     }
 
     randomizeTransformRules(): void { this.initializeTransformRules(); }
