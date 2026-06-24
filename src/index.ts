@@ -248,6 +248,16 @@ class ParticleLifeApp {
             this.buildPolePanel();
         });
 
+        // Pole reference frame (velocity vs world) for 3+ poles
+        document.getElementById('poleFrameVelBtn')!.addEventListener('click', () => {
+            this.sim?.setPoleFrame(false);
+            this.syncPoleFrameButtons();
+        });
+        document.getElementById('poleFrameWorldBtn')!.addEventListener('click', () => {
+            this.sim?.setPoleFrame(true);
+            this.syncPoleFrameButtons();
+        });
+
         // World size (physics space only — canvas pixel resolution stays fixed)
         document.getElementById('applyWorldSize')!.addEventListener('click', () => {
             const w = parseInt((document.getElementById('worldW') as HTMLInputElement).value) || 1600;
@@ -1174,6 +1184,13 @@ class ParticleLifeApp {
     private refreshTransformMatrix(): void {
         this.buildTransformMatrix();
         this.buildPolePanel();
+        this.syncPoleFrameButtons();
+    }
+
+    private syncPoleFrameButtons(): void {
+        const world = this.sim?.getPoleFrame() ?? false;
+        document.getElementById('poleFrameVelBtn')?.classList.toggle('selected', !world);
+        document.getElementById('poleFrameWorldBtn')?.classList.toggle('selected', world);
     }
 
     private refreshMassTable(): void {
@@ -1682,6 +1699,7 @@ class ParticleLifeApp {
         this.buildPolePanel();
         this.refreshPaintTypePicker();
         this.syncExportButtons();
+        this.syncPoleFrameButtons();
 
         this.startLoop();
     }

@@ -489,6 +489,19 @@
                     <div id="pole-panel" style="margin-top:14px;">
                         <p class="matrix-label">Polar field per type</p>
                         <div id="pole-list"></div>
+                        <div class="settings-row" style="margin-top:8px;">
+                            <label style="width:auto">Frame</label>
+                            <div class="edge-toggle-row" style="flex:1">
+                                <button class="edge-btn selected" id="poleFrameVelBtn">Velocity</button>
+                                <button class="edge-btn"          id="poleFrameWorldBtn">World</button>
+                            </div>
+                        </div>
+                        <p class="tr-hint" style="margin-top:4px;">
+                            For 3+ poles: <strong>Velocity</strong> aligns lobes to each particle's heading,
+                            so which lobe is positive changes the effect's angle relative to motion.
+                            <strong>World</strong> fixes lobes to a global axis, so flipping which lobe is positive
+                            only rotates the pattern (behaves the same). Dipoles stay velocity-aligned either way.
+                        </p>
                         <div class="btn-row" style="margin-top:6px;">
                             <button id="randomizePolesBtn">Randomize poles</button>
                         </div>

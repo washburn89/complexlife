@@ -196,6 +196,7 @@ export class ParticleSimulation {
     private transformRules: TransformRule[] = [];
     private poleConfigs = new Uint32Array(MAX_TYPES);
     private poleBuffer: GPUBuffer | null = null;
+    private poleWorldFrame = false;  // false = lobes anchored to velocity; true = anchored to world +x axis (3+ poles)
 
     private isInitialized  = false;
     private isPaused       = false;
@@ -352,10 +353,11 @@ export class ParticleSimulation {
     }
 
     // params: two vec4f (32 bytes).
-    // [0] speed, worldW, worldH, packed(simMode|edgeMode|numTypes as float)
+    // [0] speed, worldW, worldH, packed(simMode|edgeMode|numTypes|poleWorldFrame as float)
     // [1] friction, maxTransformRate, 0, 0
     private paramsArray(): Float32Array<ArrayBuffer> {
-        const packed = (this.numTypes << 16) | (this.edgeMode << 8) | this.simMode;
+        const packed = (this.poleWorldFrame ? (1 << 24) : 0)
+                     | (this.numTypes << 16) | (this.edgeMode << 8) | this.simMode;
         return new Float32Array([
             this.params.simulationSpeed,
             this.params.worldWidth,
@@ -915,25 +917,35 @@ export class ParticleSimulation {
             // Polar field mask. ux,uy = unit vector from emitter to receiver.
             // poleData bits 0-3 = poleCount, bits 4+ = sign bits for each lobe.
             // Returns a multiplier in [-1, 1]: positive amplifies, negative reverses force.
-            fn poleMask(ux: f32, uy: f32, emitVel: vec2f, poleData: u32) -> f32 {
+            fn poleMask(ux: f32, uy: f32, emitVel: vec2f, poleData: u32, worldFrame: u32) -> f32 {
                 let poleCount = poleData & 0xFu;
                 if (poleCount == 0u) { return 1.0; }
                 let vm = length(emitVel);
-                if (vm < 0.01) { return 1.0; }  // stationary emitter: monopole fallback
-                let ivx = emitVel.x / vm;
-                let ivy = emitVel.y / vm;
+
+                // Dipole is always velocity-aligned: +1 in front of emitter, -1 behind.
                 if (poleCount == 2u) {
-                    // Dipole: +1 in front of emitter, -1 behind.
-                    return ivx * ux + ivy * uy;
+                    if (vm < 0.01) { return 1.0; }  // stationary: monopole fallback
+                    return (emitVel.x / vm) * ux + (emitVel.y / vm) * uy;
                 }
+
                 // N poles (3-6): equally spaced lobes, each independently signed.
+                // Base axis is the velocity direction, or the fixed world +x axis when
+                // worldFrame is set (so which lobe is positive only globally rotates the
+                // pattern instead of changing its angle relative to motion).
+                var bx: f32; var by: f32;
+                if (worldFrame == 1u) {
+                    bx = 1.0; by = 0.0;
+                } else {
+                    if (vm < 0.01) { return 1.0; }  // stationary: monopole fallback
+                    bx = emitVel.x / vm; by = emitVel.y / vm;
+                }
                 let signBits = poleData >> 4u;
                 var rawMask: f32 = 0.0;
                 let angStep = 6.28318530718 / f32(poleCount);
                 let cosA = cos(angStep);
                 let sinA = sin(angStep);
-                var pvx = ivx;
-                var pvy = ivy;
+                var pvx = bx;
+                var pvy = by;
                 for (var k: u32 = 0u; k < poleCount; k++) {
                     let d    = pvx * ux + pvy * uy;
                     let lobe = select(0.0, d * d, d > 0.0);  // max(0, cos)^2
@@ -988,7 +1000,8 @@ export class ParticleSimulation {
                 let packed   = u32(params.packed);
                 let simMode  = packed & 0xFFu;
                 let edgeMode = (packed >> 8u) & 0xFFu;
-                let numTypes = packed >> 16u;
+                let numTypes = (packed >> 16u) & 0xFFu;
+                let poleWorldFrame = (packed >> 24u) & 1u;
 
                 var p      = particles[idx];
                 if (p.typeId < 0.0) { return; }  // dead particle (mode 2 merge victim)
@@ -1049,7 +1062,7 @@ export class ParticleSimulation {
                             }
 
                             let poleData = u32(poleConfigs[otherType]);
-                            let mask     = poleMask(-dx / dist, -dy / dist, other.vel, poleData);
+                            let mask     = poleMask(-dx / dist, -dy / dist, other.vel, poleData, poleWorldFrame);
                             let contrib  = mag * 0.1 * mask;
                             accel += vec2f(dx, dy) / dist * contrib;
                             typeForce[otherType] += outerMag * 0.1 * mask;
@@ -2298,6 +2311,15 @@ export class ParticleSimulation {
         }));
     }
 
+    getPoleFrame(): boolean { return this.poleWorldFrame; }
+    setPoleFrame(world: boolean): void {
+        this.poleWorldFrame = world;
+        // Push immediately so the change applies even while paused.
+        if (this.isInitialized && this.queue && this.paramsBuffer) {
+            this.queue.writeBuffer(this.paramsBuffer, 0, this.paramsArray());
+        }
+    }
+
     setPoleConfig(typeId: number, poleCount: number, signBits: number): void {
         if (typeId < 0 || typeId >= MAX_TYPES) return;
         this.poleConfigs[typeId] = (poleCount & 0xF) | ((signBits & 0x3F) << 4);
@@ -2346,6 +2368,7 @@ export class ParticleSimulation {
             worldHeight:      cs.h,
             simMode:          this.simMode,
             edgeMode:         this.edgeMode,
+            poleWorldFrame:   this.poleWorldFrame,
             backgroundColor:  this.backgroundColor,
             colorSaturation:  this.colorSaturation,
             particleGlow:     this.particleGlow,
@@ -2369,6 +2392,7 @@ export class ParticleSimulation {
         if (state.simulationSpeed != null) this.params.simulationSpeed = Number(state.simulationSpeed);
         if (state.simMode  != null) this.simMode  = Number(state.simMode)  as 0 | 1 | 2;
         if (state.edgeMode != null) this.edgeMode = Number(state.edgeMode) as 0 | 1;
+        if (state.poleWorldFrame != null) this.poleWorldFrame = Boolean(state.poleWorldFrame);
 
         if (state.backgroundColor) {
             const bg = state.backgroundColor;
