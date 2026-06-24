@@ -86,6 +86,7 @@ export class ParticleSimulation {
     private context: GPUCanvasContext | null = null;
 
     private particleBuffer:   GPUBuffer | null = null;
+    private particlesSortedBuffer: GPUBuffer | null = null;  // cell-sorted copy for coherent neighbor reads
     private paramsBuffer:     GPUBuffer | null = null;
     private forcesBuffer:     GPUBuffer | null = null;
     private viewBuffer:       GPUBuffer | null = null;
@@ -102,9 +103,13 @@ export class ParticleSimulation {
     private countParticlesPipeline:  GPUComputePipeline   | null = null;
     private prefixSumPipeline:       GPUComputePipeline   | null = null;
     private scatterPipeline:         GPUComputePipeline   | null = null;
+    private reorderPipeline:         GPUComputePipeline   | null = null;
     private renderPipeline:          GPURenderPipeline    | null = null;
     private renderPipelineAdd:       GPURenderPipeline    | null = null;
     private computeBindGroup:        GPUBindGroup         | null = null;
+    private forceBindGroup:          GPUBindGroup         | null = null;  // like computeBindGroup but binding 8 = sortedParticles
+    private reorderBGL:              GPUBindGroupLayout   | null = null;
+    private reorderBindGroup:        GPUBindGroup         | null = null;
     private renderBindGroup:         GPUBindGroup         | null = null;
 
     private params: SimulationParams;
@@ -391,6 +396,8 @@ export class ParticleSimulation {
         // Pre-allocate at max capacity so the paint/spawn tool can append without reallocation
         this.particleBuffer = this.device!.createBuffer({ label: 'particles', size: MAX_PARTICLE_CAPACITY * 6 * 4, usage: S });
         this.queue!.writeBuffer(this.particleBuffer, 0, this.generateParticleData());
+        // Cell-sorted copy of the particles, rebuilt each frame by the reorder pass.
+        this.particlesSortedBuffer = this.device!.createBuffer({ label: 'particlesSorted', size: MAX_PARTICLE_CAPACITY * 6 * 4, usage: GPUBufferUsage.STORAGE });
         this.paramsBuffer    = this.makeBuffer('params',    this.paramsArray(),           U);
         this.forcesBuffer    = this.makeBuffer('forces',    this.generateForcesData(),    S);
         this.transformBuffer = this.makeBuffer('transform', this.generateTransformData(), S);
@@ -474,6 +481,17 @@ export class ParticleSimulation {
         this.prefixSumPipeline      = mkCompute(this.getPrefixSumShaderCode());
         this.scatterPipeline        = mkCompute(this.getScatterShaderCode());
         this.computePipeline        = mkCompute(this.getComputeShaderCode());
+
+        // Reorder pass uses its own 3-buffer layout (particles, gridList, sorted out).
+        this.reorderBGL = this.device.createBindGroupLayout({ entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // particles
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // gridList
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // sortedParticles
+        ]});
+        this.reorderPipeline = this.device.createComputePipeline({
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.reorderBGL] }),
+            compute: { module: this.device.createShaderModule({ code: this.getReorderShaderCode() }), entryPoint: 'main' },
+        });
 
         const renderLayout = this.device.createBindGroupLayout({ entries: [
             { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
@@ -581,7 +599,7 @@ export class ParticleSimulation {
 
     private rebuildBindGroups(): void {
         if (!this.device || !this.computeBindGroupLayout ||
-            !this.particleBuffer || !this.paramsBuffer || !this.forcesBuffer ||
+            !this.particleBuffer || !this.particlesSortedBuffer || !this.paramsBuffer || !this.forcesBuffer ||
             !this.transformBuffer || !this.viewBuffer || !this.poleBuffer ||
             !this.gridCellCountBuffer || !this.gridCellStartBuffer ||
             !this.gridListBuffer || !this.gridParamsBuffer || !this.typeMassBuffer ||
@@ -602,6 +620,33 @@ export class ParticleSimulation {
                 { binding: 9, resource: { buffer: this.typeMassBuffer       } },
             ],
         });
+        // Identical to computeBindGroup except binding 8 is the sorted particle copy
+        // (the force pass reads neighbours from it; it no longer needs gridList).
+        this.forceBindGroup = this.device.createBindGroup({
+            layout: this.computeBindGroupLayout,
+            entries: [
+                { binding: 0, resource: { buffer: this.particleBuffer        } },
+                { binding: 1, resource: { buffer: this.paramsBuffer          } },
+                { binding: 2, resource: { buffer: this.forcesBuffer          } },
+                { binding: 3, resource: { buffer: this.transformBuffer       } },
+                { binding: 4, resource: { buffer: this.poleBuffer            } },
+                { binding: 5, resource: { buffer: this.gridParamsBuffer      } },
+                { binding: 6, resource: { buffer: this.gridCellCountBuffer   } },
+                { binding: 7, resource: { buffer: this.gridCellStartBuffer   } },
+                { binding: 8, resource: { buffer: this.particlesSortedBuffer } },
+                { binding: 9, resource: { buffer: this.typeMassBuffer        } },
+            ],
+        });
+        if (this.reorderBGL) {
+            this.reorderBindGroup = this.device.createBindGroup({
+                layout: this.reorderBGL,
+                entries: [
+                    { binding: 0, resource: { buffer: this.particleBuffer        } },
+                    { binding: 1, resource: { buffer: this.gridListBuffer        } },
+                    { binding: 2, resource: { buffer: this.particlesSortedBuffer } },
+                ],
+            });
+        }
         this.renderBindGroup = this.device.createBindGroup({
             layout: this.renderPipeline.getBindGroupLayout(0),
             entries: [
@@ -820,6 +865,23 @@ export class ParticleSimulation {
         `;
     }
 
+    // Gather pass: copy each particle into its cell-sorted slot so the force pass
+    // reads neighbours from contiguous memory instead of gathering through gridList.
+    private getReorderShaderCode(): string {
+        return /* wgsl */`
+            struct Particle { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
+            @group(0) @binding(0) var<storage, read>       particles:       array<Particle>;
+            @group(0) @binding(1) var<storage, read>       gridList:        array<u32>;
+            @group(0) @binding(2) var<storage, read_write> sortedParticles: array<Particle>;
+            @compute @workgroup_size(256)
+            fn main(@builtin(global_invocation_id) id: vec3u) {
+                let k = id.x;
+                if (k >= arrayLength(&gridList)) { return; }
+                sortedParticles[k] = particles[gridList[k]];
+            }
+        `;
+    }
+
     private getComputeShaderCode(): string {
         return /* wgsl */`
             struct Particle    { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
@@ -842,7 +904,10 @@ export class ParticleSimulation {
             @group(0) @binding(5) var<storage, read>       gridParams:     GridParams;
             @group(0) @binding(6) var<storage, read_write> cellCount:      array<u32>;
             @group(0) @binding(7) var<storage, read_write> cellStart:      array<u32>;
-            @group(0) @binding(8) var<storage, read_write> gridList:       array<u32>;
+            // binding 8 holds the cell-sorted particle copy (see reorder pass), so
+            // neighbours within a cell are contiguous in memory. Declared read_write
+            // to match the shared layout's 'storage' binding type; only read here.
+            @group(0) @binding(8) var<storage, read_write> sortedParticles: array<Particle>;
             @group(0) @binding(9) var<uniform>             typeMasses:     TypeMasses;
 
             fn getMass(t: u32) -> u32 { return typeMasses.m[t >> 2u][t & 3u]; }
@@ -951,9 +1016,8 @@ export class ParticleSimulation {
                         let start = cellStart[cell];
                         let end   = start + cellCount[cell];
                         for (var k = start; k < end; k++) {
-                            let i = gridList[k];
-                            if (i == idx) { continue; }
-                            let other = particles[i];
+                            let other = sortedParticles[k];
+                            // self is skipped by the dist < 0.1 guard below (identical position)
                             if (other.typeId < 0.0) { continue; }  // skip dead particles
                             let otherType = u32(other.typeId);
 
@@ -1615,9 +1679,16 @@ export class ParticleSimulation {
             scatterCp.dispatchWorkgroups(Math.ceil(N / 256));
             scatterCp.end();
 
+            // Reorder particles into cell-sorted order for coherent neighbour reads.
+            const reorderCp = enc.beginComputePass();
+            reorderCp.setPipeline(this.reorderPipeline!);
+            reorderCp.setBindGroup(0, this.reorderBindGroup!);
+            reorderCp.dispatchWorkgroups(Math.ceil(N / 256));
+            reorderCp.end();
+
             const forceCp = enc.beginComputePass();
             forceCp.setPipeline(this.computePipeline!);
-            forceCp.setBindGroup(0, this.computeBindGroup!);
+            forceCp.setBindGroup(0, this.forceBindGroup!);
             forceCp.dispatchWorkgroups(Math.ceil(N / 256));
             forceCp.end();
 
