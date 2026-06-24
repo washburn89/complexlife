@@ -2125,6 +2125,92 @@ export class ParticleSimulation {
     setView(cx: number, cy: number, zoom: number): void { this.view = { cx, cy, zoom }; }
     getView(): ViewState { return { ...this.view }; }
 
+    // ── Photo capture ──────────────────────────────────────────────────────────
+
+    // Render the current frame into an offscreen texture at full canvas resolution
+    // and read the pixels back as tightly-packed, top-to-bottom RGBA (alpha forced
+    // opaque to match the on-screen 'opaque' canvas). Returns null if not ready.
+    async captureRGBA(): Promise<{ data: Uint8ClampedArray; width: number; height: number } | null> {
+        if (!this.isInitialized || !this.device || !this.queue || !this.viewBuffer ||
+            !this.renderBindGroup || !this.renderPipeline || !this.renderPipelineAdd || !this.quadVertexBuffer) {
+            return null;
+        }
+        const w = this.canvas.width;
+        const h = this.canvas.height;
+        if (w <= 0 || h <= 0) return null;
+        const fmt = navigator.gpu.getPreferredCanvasFormat();
+
+        // Make sure the view uniform reflects current state (also valid while paused).
+        this.queue.writeBuffer(this.viewBuffer, 0, new Float32Array([
+            this.view.cx, this.view.cy, this.view.zoom,
+            this.colorSaturation, this.particleGlow, this.particleAlpha,
+            w, h, this.additiveStrength, this.shapeMode, this.simulationTime, 0,
+        ]) as Float32Array<ArrayBuffer>);
+
+        const tex = this.device.createTexture({
+            size: [w, h], format: fmt,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+        });
+        const bytesPerRow = Math.ceil((w * 4) / 256) * 256;
+        const readBuf = this.device.createBuffer({
+            size: bytesPerRow * h,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+
+        const bg  = this.backgroundColor;
+        const enc = this.device.createCommandEncoder();
+        const rp  = enc.beginRenderPass({
+            colorAttachments: [{
+                view: tex.createView(),
+                clearValue: { r: bg.r, g: bg.g, b: bg.b, a: 1 },
+                loadOp: 'clear', storeOp: 'store',
+            }],
+        });
+        rp.setPipeline(this.blendMode === 1 ? this.renderPipelineAdd! : this.renderPipeline!);
+        rp.setBindGroup(0, this.renderBindGroup!);
+        rp.setVertexBuffer(0, this.quadVertexBuffer!);
+        rp.draw(6, this.params.particleCount);
+        rp.end();
+        enc.copyTextureToBuffer(
+            { texture: tex },
+            { buffer: readBuf, bytesPerRow, rowsPerImage: h },
+            { width: w, height: h, depthOrArrayLayers: 1 },
+        );
+        this.queue.submit([enc.finish()]);
+
+        try {
+            await readBuf.mapAsync(GPUMapMode.READ);
+        } catch (e) {
+            readBuf.destroy(); tex.destroy();
+            return null;
+        }
+        const src  = new Uint8Array(readBuf.getMappedRange());
+        const out  = new Uint8ClampedArray(w * h * 4);
+        const swap = fmt === 'bgra8unorm';
+        const tightRow = bytesPerRow === w * 4;
+        for (let y = 0; y < h; y++) {
+            const rowOff = y * bytesPerRow;
+            const dstOff = y * w * 4;
+            if (!swap && tightRow) {
+                out.set(src.subarray(rowOff, rowOff + w * 4), dstOff);
+            } else {
+                for (let x = 0; x < w; x++) {
+                    const s = rowOff + x * 4;
+                    const d = dstOff + x * 4;
+                    out[d]     = swap ? src[s + 2] : src[s];
+                    out[d + 1] = src[s + 1];
+                    out[d + 2] = swap ? src[s]     : src[s + 2];
+                    out[d + 3] = src[s + 3];
+                }
+            }
+            for (let x = 0; x < w; x++) out[dstOff + x * 4 + 3] = 255;  // force opaque
+        }
+        readBuf.unmap();
+        readBuf.destroy();
+        tex.destroy();
+        return { data: out, width: w, height: h };
+    }
+
     startTracking(comX: number, comY: number, radius: number): void {
         this.isTracking       = true;
         this.trackComX        = comX;

@@ -60,6 +60,9 @@
         }
         button:hover { background: #0af; color: #000; }
         button.active { background: #0af; color: #000; }
+        /* Grayed-out look that still receives hover (so its title tooltip shows) */
+        button.disabled-look { opacity: 0.4; cursor: not-allowed; border-color: #444; color: #667; }
+        button.disabled-look:hover { background: #1a2a3a; color: #667; }
 
         /* ── Tabs ────────────────────────────────────────────────────────────── */
         #tab-bar { display: flex; border-bottom: 1px solid #333; flex-shrink: 0; }
@@ -433,6 +436,7 @@
             <button class="tab-btn active" data-tab="strength">Strength</button>
             <button class="tab-btn"        data-tab="radius">Radius</button>
             <button class="tab-btn"        data-tab="mode">Mode</button>
+            <button class="tab-btn"        data-tab="photo">Photo</button>
             <button class="tab-btn"        data-tab="settings">Settings</button>
         </div>
 
@@ -510,33 +514,19 @@
                 </div>
             </div>
 
-            <!-- Settings tab -->
-            <div id="pane-settings" class="tab-pane">
+            <!-- Photo / Visuals tab -->
+            <div id="pane-photo" class="tab-pane">
                 <div class="settings-section">
-                    <h4>Simulation Area</h4>
-                    <div class="settings-row">
-                        <label>World size</label>
-                        <input type="number" id="worldW" min="200" max="20000" step="100" value="4800">
-                        <span class="sep">×</span>
-                        <input type="number" id="worldH" min="200" max="20000" step="100" value="2700">
+                    <h4>Photo Export</h4>
+                    <div class="btn-row">
+                        <button id="exportFullBtn">&#11015; Full Canvas PNG</button>
                     </div>
-                    <div class="settings-row">
-                        <label></label>
-                        <button id="applyWorldSize" style="flex:none;padding:4px 12px;">Apply &amp; Reset</button>
+                    <div class="btn-row" style="margin-top:6px">
+                        <button id="exportSelBtn">&#9645; Select &amp; Export PNG</button>
                     </div>
-                    <p class="hint">World size sets the physics space; rendering resolution stays fixed at the canvas pixel size. Large worlds require zooming in to see particles. Scroll to zoom, middle-drag to pan, double-click to reset view.</p>
-                </div>
-
-                <div class="settings-section">
-                    <h4>Edge Behavior</h4>
-                    <div class="edge-toggle-row">
-                        <button class="edge-btn selected" id="edgeLoopBtn">Loop</button>
-                        <button class="edge-btn"          id="edgeOpenBtn">Open</button>
-                    </div>
-                    <p class="hint">
-                        <strong style="color:#888">Loop</strong> — edges wrap toroidally.<br>
-                        <strong style="color:#888">Open</strong> — particles spawn in the configured area
-                        but the physics world is 5× larger with solid walls.
+                    <p class="hint" style="margin-top:6px">
+                        <strong style="color:#888">Full Canvas</strong> saves the entire canvas as a lossless PNG (closed/Loop edge mode only).<br>
+                        <strong style="color:#888">Select &amp; Export</strong> — drag a rectangle on the canvas; release to save just that region. The box shows its output pixel size.
                     </p>
                 </div>
 
@@ -583,6 +573,37 @@
                     <p class="hint" style="margin-top:4px">
                         Glow 0 = hard solid circles. Glow 1 = wide soft orbs that bloom where they overlap.<br>
                         Add. Strength scales per-particle light in additive mode — lower = less bloom.
+                    </p>
+                </div>
+            </div>
+
+            <!-- Settings tab -->
+            <div id="pane-settings" class="tab-pane">
+                <div class="settings-section">
+                    <h4>Simulation Area</h4>
+                    <div class="settings-row">
+                        <label>World size</label>
+                        <input type="number" id="worldW" min="200" max="20000" step="100" value="4800">
+                        <span class="sep">×</span>
+                        <input type="number" id="worldH" min="200" max="20000" step="100" value="2700">
+                    </div>
+                    <div class="settings-row">
+                        <label></label>
+                        <button id="applyWorldSize" style="flex:none;padding:4px 12px;">Apply &amp; Reset</button>
+                    </div>
+                    <p class="hint">World size sets the physics space; rendering resolution stays fixed at the canvas pixel size. Large worlds require zooming in to see particles. Scroll to zoom, middle-drag to pan, double-click to reset view.</p>
+                </div>
+
+                <div class="settings-section">
+                    <h4>Edge Behavior</h4>
+                    <div class="edge-toggle-row">
+                        <button class="edge-btn selected" id="edgeLoopBtn">Loop</button>
+                        <button class="edge-btn"          id="edgeOpenBtn">Open</button>
+                    </div>
+                    <p class="hint">
+                        <strong style="color:#888">Loop</strong> — edges wrap toroidally.<br>
+                        <strong style="color:#888">Open</strong> — particles spawn in the configured area
+                        but the physics world is 5× larger with solid walls.
                     </p>
                 </div>
 

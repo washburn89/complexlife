@@ -91,6 +91,11 @@ class ParticleLifeApp {
     private cursorMouseButtons    = 0;   // bitmask: bit 0 = left, bit 2 = right
     private cursorPanelCollapsed  = false;
 
+    // ── Photo export selection ────────────────────────────────────────────────
+    private photoSelMode     = false;   // armed: dragging a region to export
+    private photoSelDragging = false;
+    private photoSelBox: { sx0: number; sy0: number; sx1: number; sy1: number } | null = null;
+
     constructor() {
         this.canvas = document.getElementById('sim-canvas') as HTMLCanvasElement;
         this.overlayCanvas = document.getElementById('overlay') as HTMLCanvasElement;
@@ -318,6 +323,13 @@ class ParticleLifeApp {
             this.sim?.setMaxTransformRate(v);
         });
 
+        // Photo export (PNG)
+        document.getElementById('exportFullBtn')!.addEventListener('click', () => {
+            if (this.sim?.getEdgeMode() === 1) return;  // disabled in open mode
+            this.exportFullCanvas();
+        });
+        document.getElementById('exportSelBtn')!.addEventListener('click', () => this.togglePhotoSelect());
+
         // Export / Import
         document.getElementById('exportBtn')!.addEventListener('click', () => this.exportConfig());
         document.getElementById('importBtn')!.addEventListener('click', () => {
@@ -333,6 +345,7 @@ class ParticleLifeApp {
             if (e.key === 'Escape') {
                 this.closeForceEditor(); this.closeTransformEditor();
                 if (this.trackMode === 'selecting') { this.trackMode = 'idle'; this.syncTrackButton(); }
+                if (this.photoSelMode) this.exitPhotoSelect();
             }
             if (e.key === ' ' && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
                 e.preventDefault();
@@ -359,6 +372,7 @@ class ParticleLifeApp {
         });
         document.getElementById('btmTrackBtn')!.addEventListener('click', () => this.handleTrackButton());
         document.getElementById('btmInspectBtn')!.addEventListener('click', () => {
+            if (this.photoSelMode) this.exitPhotoSelect();
             this.inspectMode = !this.inspectMode;
             if (!this.inspectMode) this.stopInspect();
             this.syncInspectButton();
@@ -395,6 +409,7 @@ class ParticleLifeApp {
         document.getElementById('edgeLoopBtn')!.classList.toggle('selected', mode === 0);
         document.getElementById('edgeOpenBtn')!.classList.toggle('selected', mode === 1);
         this.updateZoomDisplay();
+        this.syncExportButtons();
     }
 
     private setBlendMode(mode: 0 | 1): void {
@@ -423,6 +438,7 @@ class ParticleLifeApp {
     }
 
     private handleTrackButton(): void {
+        if (this.photoSelMode) this.exitPhotoSelect();
         if (this.trackMode === 'tracking') {
             this.sim?.stopTracking();
             this.trackMode = 'idle';
@@ -577,6 +593,33 @@ class ParticleLifeApp {
             }
             ctx.restore();
         }
+
+        // Photo export selection rectangle + output pixel dimensions
+        if (this.photoSelMode && this.photoSelBox) {
+            const b  = this.photoSelBox;
+            const x  = Math.min(b.sx0, b.sx1), y = Math.min(b.sy0, b.sy1);
+            const bw = Math.abs(b.sx1 - b.sx0), bh = Math.abs(b.sy1 - b.sy0);
+            ctx.save();
+            ctx.strokeStyle = '#ff3df0';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([6, 4]);
+            ctx.strokeRect(x, y, bw, bh);
+            ctx.setLineDash([]);
+
+            const dim   = this.clientBoxToCanvasRect(b);
+            const label = `${dim.w} × ${dim.h} px`;
+            ctx.font = '12px monospace';
+            const tw = ctx.measureText(label).width;
+            // Place label just outside the rectangle (above-left; below if no room above)
+            const lx = x;
+            let   ly = y - 7;
+            if (ly < 14) ly = y + bh + 16;
+            ctx.fillStyle = 'rgba(0,0,0,0.65)';
+            ctx.fillRect(lx - 3, ly - 12, tw + 6, 16);
+            ctx.fillStyle = '#ff3df0';
+            ctx.fillText(label, lx, ly);
+            ctx.restore();
+        }
     }
 
     private updateDiagPanel(data: DiagnosticData | null): void {
@@ -680,6 +723,13 @@ class ParticleLifeApp {
                 this.canvas.style.cursor = 'grabbing';
                 return;
             }
+            // Photo export selection overrides everything else
+            if (e.button === 0 && this.photoSelMode) {
+                e.preventDefault();
+                this.photoSelDragging = true;
+                this.photoSelBox = { sx0: e.clientX, sy0: e.clientY, sx1: e.clientX, sy1: e.clientY };
+                return;
+            }
             // Track / Inspect override cursor tools — check first
             if (e.button === 0 && this.trackMode === 'selecting') {
                 e.preventDefault();
@@ -730,11 +780,23 @@ class ParticleLifeApp {
                 this.selBox.sx1 = e.clientX;
                 this.selBox.sy1 = e.clientY;
             }
+            if (this.photoSelDragging && this.photoSelBox) {
+                this.photoSelBox.sx1 = e.clientX;
+                this.photoSelBox.sy1 = e.clientY;
+            }
         });
 
         window.addEventListener('mouseup', (e) => {
             if (e.button === 1 || (e.button === 0 && this.activeCursorTool === 'grab')) {
                 panning = false;
+            }
+            if (e.button === 0 && this.photoSelDragging) {
+                this.photoSelDragging = false;
+                const box = this.photoSelBox;
+                if (box && this.sim) {
+                    const r = this.clientBoxToCanvasRect(box);
+                    if (r.w >= 1 && r.h >= 1) this.exportSelection(box);
+                }
             }
             if (e.button === 0 && this.selBoxActive && this.trackMode === 'selecting') {
                 this.selBoxActive = false;
@@ -838,6 +900,7 @@ class ParticleLifeApp {
     }
 
     private setActiveCursorTool(tool: 'grab' | 'force' | 'paint' | 'erase'): void {
+        if (this.photoSelMode) this.exitPhotoSelect();
         this.activeCursorTool = (this.activeCursorTool === tool) ? 'none' : tool;
         document.getElementById('ctool-grab')!.classList.toggle('active',  this.activeCursorTool === 'grab');
         document.getElementById('ctool-force')!.classList.toggle('active', this.activeCursorTool === 'force');
@@ -872,6 +935,7 @@ class ParticleLifeApp {
     }
 
     private syncCanvasCursor(): void {
+        if (this.photoSelMode) { this.canvas.style.cursor = 'crosshair'; return; }
         // Inspect/track override: clear inline style so CSS body-class cursor takes effect
         if (this.inspectMode || this.trackMode !== 'idle') {
             this.canvas.style.cursor = '';
@@ -884,6 +948,116 @@ class ParticleLifeApp {
         } else {
             this.canvas.style.cursor = '';
         }
+    }
+
+    // ── Photo export ───────────────────────────────────────────────────────────
+
+    private togglePhotoSelect(): void {
+        if (this.photoSelMode) { this.exitPhotoSelect(); return; }
+        // Turn off any conflicting interaction modes
+        if (this.activeCursorTool !== 'none') this.setActiveCursorTool(this.activeCursorTool);  // toggles off
+        if (this.trackMode === 'selecting') {
+            this.trackMode = 'idle';
+            document.body.classList.remove('track-selecting');
+            this.syncTrackButton();
+        }
+        if (this.inspectMode) this.stopInspect();
+        this.photoSelMode = true;
+        this.photoSelBox  = null;
+        this.syncPhotoSelButton();
+        this.syncCanvasCursor();
+    }
+
+    private exitPhotoSelect(): void {
+        this.photoSelMode     = false;
+        this.photoSelDragging = false;
+        this.photoSelBox      = null;
+        this.syncPhotoSelButton();
+        this.syncCanvasCursor();
+    }
+
+    private syncPhotoSelButton(): void {
+        const btn = document.getElementById('exportSelBtn');
+        if (!btn) return;
+        btn.classList.toggle('active', this.photoSelMode);
+        btn.innerHTML = this.photoSelMode
+            ? '&#9645; Drag a box · Esc to cancel'
+            : '&#9645; Select &amp; Export PNG';
+    }
+
+    // Grey out full-canvas export in open edge mode (its framing isn't a complete image)
+    private syncExportButtons(): void {
+        const btn = document.getElementById('exportFullBtn') as HTMLButtonElement | null;
+        if (!btn) return;
+        const open = this.sim?.getEdgeMode() === 1;
+        btn.classList.toggle('disabled-look', open);
+        btn.title = open
+            ? 'Full-canvas export is only available in closed (Loop) edge mode — use Select & Export instead.'
+            : 'Export the entire canvas as a lossless PNG';
+    }
+
+    // Map a client-space drag box to integer canvas-pixel coordinates (the export resolution)
+    private clientBoxToCanvasRect(box: { sx0: number; sy0: number; sx1: number; sy1: number }):
+            { x: number; y: number; w: number; h: number } {
+        const rect = this.canvas.getBoundingClientRect();
+        const cw = this.canvas.width, ch = this.canvas.height;
+        const toX = (cx: number) => Math.round((cx - rect.left) / rect.width  * cw);
+        const toY = (cy: number) => Math.round((cy - rect.top)  / rect.height * ch);
+        const x0 = Math.max(0, Math.min(cw, toX(Math.min(box.sx0, box.sx1))));
+        const y0 = Math.max(0, Math.min(ch, toY(Math.min(box.sy0, box.sy1))));
+        const x1 = Math.max(0, Math.min(cw, toX(Math.max(box.sx0, box.sx1))));
+        const y1 = Math.max(0, Math.min(ch, toY(Math.max(box.sy0, box.sy1))));
+        return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    }
+
+    private async exportFullCanvas(): Promise<void> {
+        if (!this.sim) return;
+        const cap = await this.sim.captureRGBA();
+        if (!cap) return;
+        const blob = await this.rgbaToPngBlob(cap.data, cap.width, cap.height);
+        if (blob) this.downloadBlob(blob, this.exportFilename(`${cap.width}x${cap.height}`));
+    }
+
+    private async exportSelection(box: { sx0: number; sy0: number; sx1: number; sy1: number }): Promise<void> {
+        if (!this.sim) return;
+        const r = this.clientBoxToCanvasRect(box);
+        if (r.w < 1 || r.h < 1) return;
+        const cap = await this.sim.captureRGBA();
+        if (!cap) return;
+        // Crop the requested region out of the full-resolution capture
+        const cropped = new Uint8ClampedArray(r.w * r.h * 4);
+        for (let row = 0; row < r.h; row++) {
+            const srcStart = ((r.y + row) * cap.width + r.x) * 4;
+            cropped.set(cap.data.subarray(srcStart, srcStart + r.w * 4), row * r.w * 4);
+        }
+        const blob = await this.rgbaToPngBlob(cropped, r.w, r.h);
+        if (blob) this.downloadBlob(blob, this.exportFilename(`${r.w}x${r.h}`));
+    }
+
+    private rgbaToPngBlob(data: Uint8ClampedArray, w: number, h: number): Promise<Blob | null> {
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        const ctx = c.getContext('2d');
+        if (!ctx) return Promise.resolve(null);
+        ctx.putImageData(new ImageData(data as Uint8ClampedArray<ArrayBuffer>, w, h), 0, 0);
+        return new Promise(resolve => c.toBlob(b => resolve(b), 'image/png'));
+    }
+
+    private downloadBlob(blob: Blob, name: string): void {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    private exportFilename(tag: string): string {
+        const d = new Date();
+        const p = (n: number) => String(n).padStart(2, '0');
+        const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+        return `particle-life-${stamp}-${tag}.png`;
     }
 
     // ── Force matrices ────────────────────────────────────────────────────────
@@ -1480,6 +1654,7 @@ class ParticleLifeApp {
         this.buildTransformMatrix();
         this.buildPolePanel();
         this.refreshPaintTypePicker();
+        this.syncExportButtons();
 
         this.startLoop();
     }
