@@ -190,8 +190,8 @@
         }
 
         /* ── Mode / behavior ───────────────────────────────────────────────── */
-        .mode-toggle-row { display: flex; gap: 7px; margin-bottom: 12px; }
-        .mode-btn { flex: 1; padding: 7px 4px; font-size: 11px; }
+        .mode-toggle-row { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
+        .mode-btn { flex: 1 1 auto; min-width: 54px; padding: 7px 4px; font-size: 11px; }
 
         #transform-panel, #mode2-panel, #mode3-panel { display: none; }
         #transform-panel.visible, #mode2-panel.visible, #mode3-panel.visible { display: block; }
@@ -463,6 +463,7 @@
                     <button class="mode-btn"          id="mode1-btn">Transform</button>
                     <button class="mode-btn"          id="mode2-btn">Mass</button>
                     <button class="mode-btn"          id="mode3-btn">Patchy</button>
+                    <button class="mode-btn"          id="mode4-btn">Patchy+T</button>
                 </div>
 
                 <div id="mode3-panel">
@@ -509,8 +510,8 @@
                         </div>
                         <div class="settings-row">
                             <label>Spin Damping</label>
-                            <input type="range" id="patchAngFricSlider" min="0.5" max="0.99" step="0.01" value="0.8">
-                            <span class="val" id="patchAngFricValue">0.80</span>
+                            <input type="range" id="patchAngFricSlider" min="0" max="1" step="0.01" value="0.2">
+                            <span class="val" id="patchAngFricValue">0.20</span>
                         </div>
                         <p class="hint">
                             Patch Width: higher = narrower, more selective patches (sharper geometry).
@@ -537,9 +538,14 @@
                     <p class="tr-hint">
                         Each tick a particle accumulates force from each trigger type. If it exceeds the
                         threshold the particle probabilistically transforms — the further past the threshold,
-                        the higher the chance (up to 50%/tick at 3× threshold). First match wins.
+                        the higher the chance (up to Max Transform per tick at 3× threshold). First match wins.
                     </p>
-                    <div class="btn-row" style="margin-bottom:8px;">
+                    <div class="settings-row">
+                        <label>Max Transform</label>
+                        <input type="range" id="maxTransformSlider" min="0.01" max="1.0" step="0.01" value="0.5">
+                        <span class="val" id="maxTransformValue">0.50</span>
+                    </div>
+                    <div class="btn-row" style="margin:8px 0;">
                         <button id="randomizeTransformBtn">Randomize rules</button>
                     </div>
                     <p class="matrix-label">Row = source type · Col = trigger type</p>
@@ -572,23 +578,6 @@
                     </div>
                 </div>
 
-                <div class="settings-section" style="margin-top:16px;">
-                    <h4>Physics</h4>
-                    <div class="settings-row">
-                        <label>Friction</label>
-                        <input type="range" id="frictionSlider" min="0" max="0.99" step="0.01" value="0.85">
-                        <span class="val" id="frictionValue">0.85</span>
-                    </div>
-                    <div class="settings-row">
-                        <label>Max Transform</label>
-                        <input type="range" id="maxTransformSlider" min="0.01" max="1.0" step="0.01" value="0.5">
-                        <span class="val" id="maxTransformValue">0.50</span>
-                    </div>
-                    <p class="hint">
-                        Friction: velocity multiplier per tick (lower = more drag).
-                        Max Transform: peak chance per tick to change type at threshold.
-                    </p>
-                </div>
             </div>
 
             <!-- ── Look (photo + visuals) ──────────────────────────────── -->
@@ -656,6 +645,16 @@
 
             <!-- ── World ───────────────────────────────────────────────── -->
             <div id="pane-world" class="tab-pane">
+                <div class="settings-section">
+                    <h4>Physics</h4>
+                    <div class="settings-row">
+                        <label>Friction</label>
+                        <input type="range" id="frictionSlider" min="0" max="1" step="0.01" value="0.15">
+                        <span class="val" id="frictionValue">0.15</span>
+                    </div>
+                    <p class="hint">Friction: how quickly particles lose speed each tick. Higher = more drag (0 = frictionless, 1 = stops almost immediately).</p>
+                </div>
+
                 <div class="settings-section">
                     <h4>Simulation Area</h4>
                     <div class="settings-row">

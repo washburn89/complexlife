@@ -471,7 +471,9 @@ export class ParticleSimulation {
         this.gridCellCountBuffer = this.device!.createBuffer({ label: 'gridCellCount', size: MAX_CELLS * 4, usage: GS });
         this.gridCellStartBuffer = this.device!.createBuffer({ label: 'gridCellStart', size: MAX_CELLS * 4, usage: GS });
         this.gridListBuffer      = this.device!.createBuffer({ label: 'gridList',      size: MAX_PARTICLE_CAPACITY * 4, usage: GS });
-        this.gridParamsBuffer    = this.device!.createBuffer({ label: 'gridParams',    size: 16, usage: GS });
+        // gridParams is read as storage by the classic passes and as a uniform by
+        // the Mode 3/4 kernel, so it carries both usage flags.
+        this.gridParamsBuffer    = this.device!.createBuffer({ label: 'gridParams',    size: 16, usage: GS | GPUBufferUsage.UNIFORM });
 
         // Entity tracking buffers
         this.trackingParamBuffer   = this.device!.createBuffer({ label: 'trackParam',   size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -663,16 +665,17 @@ export class ParticleSimulation {
         // orientation buffers without pushing the shared compute layout past the
         // 8-storage-buffer limit. Reuses the grid + sorted-particle buffers.
         this.mode3BGL = this.device.createBindGroupLayout({ entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // particles (rw)
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // sortedParticles
-            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // orientation (rw)
-            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // sortedOrientation
-            { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // forces
-            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // gridParams
-            { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellCount
-            { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellStart
-            { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // params
-            { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // patchConfig
+            { binding: 0,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // particles (rw)
+            { binding: 1,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // sortedParticles
+            { binding: 2,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // orientation (rw)
+            { binding: 3,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // sortedOrientation
+            { binding: 4,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // forces
+            { binding: 5,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // gridParams (uniform here)
+            { binding: 6,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellCount
+            { binding: 7,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellStart
+            { binding: 8,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // params
+            { binding: 9,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // patchConfig
+            { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // transformRules (mode 4)
         ]});
         this.mode3Pipeline = this.device.createComputePipeline({
             layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.mode3BGL] }),
@@ -826,16 +829,17 @@ export class ParticleSimulation {
             this.mode3BindGroup = this.device.createBindGroup({
                 layout: this.mode3BGL,
                 entries: [
-                    { binding: 0, resource: { buffer: this.particleBuffer          } },
-                    { binding: 1, resource: { buffer: this.particlesSortedBuffer   } },
-                    { binding: 2, resource: { buffer: this.orientationBuffer       } },
-                    { binding: 3, resource: { buffer: this.sortedOrientationBuffer } },
-                    { binding: 4, resource: { buffer: this.forcesBuffer            } },
-                    { binding: 5, resource: { buffer: this.gridParamsBuffer        } },
-                    { binding: 6, resource: { buffer: this.gridCellCountBuffer     } },
-                    { binding: 7, resource: { buffer: this.gridCellStartBuffer     } },
-                    { binding: 8, resource: { buffer: this.paramsBuffer            } },
-                    { binding: 9, resource: { buffer: this.patchConfigBuffer       } },
+                    { binding: 0,  resource: { buffer: this.particleBuffer          } },
+                    { binding: 1,  resource: { buffer: this.particlesSortedBuffer   } },
+                    { binding: 2,  resource: { buffer: this.orientationBuffer       } },
+                    { binding: 3,  resource: { buffer: this.sortedOrientationBuffer } },
+                    { binding: 4,  resource: { buffer: this.forcesBuffer            } },
+                    { binding: 5,  resource: { buffer: this.gridParamsBuffer        } },
+                    { binding: 6,  resource: { buffer: this.gridCellCountBuffer     } },
+                    { binding: 7,  resource: { buffer: this.gridCellStartBuffer     } },
+                    { binding: 8,  resource: { buffer: this.paramsBuffer            } },
+                    { binding: 9,  resource: { buffer: this.patchConfigBuffer       } },
+                    { binding: 10, resource: { buffer: this.transformBuffer         } },
                 ],
             });
         }
@@ -1299,7 +1303,8 @@ export class ParticleSimulation {
                     o.spin = 0.0; o.patchN = 0.0;
                     return o;
                 }
-                let simMode3 = (u32(params.packed) & 0xFFu) == 3u;
+                let pm = u32(params.packed) & 0xFFu;
+                let simMode3 = pm == 3u || pm == 4u;  // patchy modes draw orientation
                 let worldW = params.worldW;
                 let worldH = params.worldH;
                 let zoom   = view.zoom;
@@ -1776,18 +1781,23 @@ export class ParticleSimulation {
         `;
     }
 
-    // Mode 3: patchy particles. On top of the usual isotropic type-pair force this
+    // Mode 3/4: patchy particles. On top of the usual isotropic type-pair force this
     // adds directional "patch" bonds. Each type has a valence (patchCount) of evenly
     // spaced patches fixed to its orientation. Two particles bond when a patch on
     // each points at the other; the bond is a radial spring toward bondDist plus a
     // torque that rotates each particle so its patch locks onto the bond axis. The
     // result is angle-selective coordination — chains, rings and lattices instead of
     // amorphous blobs. Orientation lives in its own buffer (θ, ω); the Particle
-    // struct is untouched.
+    // struct is untouched. In Mode 4 the same kernel also applies Mode-1-style type
+    // transforms, so bonded structures can react and change type.
     private getMode3ShaderCode(): string {
         return /* wgsl */`
             struct Particle   { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
             struct ForceEntry { strength: f32, radius: f32, minRadius: f32 }
+            struct TransformRule {
+                upperEnabled: f32, upperThreshold: f32, upperTarget: f32,
+                lowerEnabled: f32, lowerThreshold: f32, lowerTarget: f32,
+            }
             struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
             struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
                                 friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
@@ -1797,20 +1807,42 @@ export class ParticleSimulation {
                 patchCount: array<vec4u, 5>,
             }
 
-            @group(0) @binding(0) var<storage, read_write> particles:         array<Particle>;
-            @group(0) @binding(1) var<storage, read>       sortedParticles:   array<Particle>;
-            @group(0) @binding(2) var<storage, read_write> orientation:        array<vec2f>;
-            @group(0) @binding(3) var<storage, read>       sortedOrientation:  array<vec2f>;
-            @group(0) @binding(4) var<storage, read>       forces:            array<ForceEntry>;
-            @group(0) @binding(5) var<storage, read>       gridParams:        GridParams;
-            @group(0) @binding(6) var<storage, read>       cellCount:         array<u32>;
-            @group(0) @binding(7) var<storage, read>       cellStart:         array<u32>;
-            @group(0) @binding(8) var<uniform>             params:            SimParams;
-            @group(0) @binding(9) var<uniform>             cfg:               PatchConfig;
+            @group(0) @binding(0)  var<storage, read_write> particles:         array<Particle>;
+            @group(0) @binding(1)  var<storage, read>       sortedParticles:   array<Particle>;
+            @group(0) @binding(2)  var<storage, read_write> orientation:        array<vec2f>;
+            @group(0) @binding(3)  var<storage, read>       sortedOrientation:  array<vec2f>;
+            @group(0) @binding(4)  var<storage, read>       forces:            array<ForceEntry>;
+            @group(0) @binding(5)  var<uniform>             gridParams:        GridParams;
+            @group(0) @binding(6)  var<storage, read>       cellCount:         array<u32>;
+            @group(0) @binding(7)  var<storage, read>       cellStart:         array<u32>;
+            @group(0) @binding(8)  var<uniform>             params:            SimParams;
+            @group(0) @binding(9)  var<uniform>             cfg:               PatchConfig;
+            @group(0) @binding(10) var<storage, read>       transformRules:    array<TransformRule>;
 
             fn patchN(t: u32) -> u32 { return cfg.patchCount[t >> 2u][t & 3u]; }
 
             const TAU = 6.28318530718;
+
+            fn uhash(v: u32) -> u32 {
+                var x = v ^ (v >> 16u); x *= 0x45d9f3bu; x ^= x >> 16u; return x;
+            }
+            fn rand01(seed: u32) -> f32 { return f32(uhash(seed)) / 4294967295.0; }
+
+            fn transformProb(force: f32, threshold: f32, enabled: f32, isUpper: f32) -> f32 {
+                if (enabled > 1.5) {
+                    if (isUpper > 0.5) { return select(0.0, params.maxRate, force >= threshold); }
+                    else               { return select(0.0, params.maxRate, force <= threshold); }
+                } else {
+                    if (abs(threshold) < 0.001) {
+                        if (isUpper > 0.5) { return select(0.0, params.maxRate, force > 0.0); }
+                        else               { return select(0.0, params.maxRate, force < 0.0); }
+                    }
+                    let x = force / threshold;
+                    if (x <= 0.0) { return 0.0; }
+                    let t = min(x, 1.0);
+                    return t * t * params.maxRate;
+                }
+            }
 
             // Best alignment of any of n evenly-spaced patches (first at angle base)
             // with the target direction aim. Returns the largest cos(patch - aim) in
@@ -1836,7 +1868,9 @@ export class ParticleSimulation {
                 let width    = params.worldW;
                 let height   = params.worldH;
                 let packed   = u32(params.packed);
+                let simMode  = packed & 0xFFu;
                 let edgeMode = (packed >> 8u) & 0xFFu;
+                let numTypes = (packed >> 16u) & 0xFFu;
 
                 var p = particles[idx];
                 if (p.typeId < 0.0) { return; }
@@ -1848,6 +1882,7 @@ export class ParticleSimulation {
 
                 var accel  = vec2f(0.0);
                 var torque = 0.0;
+                var typeForce: array<f32, 20>;  // per-type accumulated force (Mode 4 transforms)
 
                 let gw   = i32(gridParams.gridW);
                 let gh   = i32(gridParams.gridH);
@@ -1891,9 +1926,15 @@ export class ParticleSimulation {
                             if (dist >= f.minRadius && dist <= f.radius && range > 0.0) {
                                 let norm = (dist - f.minRadius) / range;
                                 var mag: f32;
-                                if (norm < 0.3) { mag = (norm / 0.3 - 1.0); }
-                                else            { mag = f.strength * (1.0 - abs(1.0 - norm) / 0.7); }
+                                var outerMag: f32 = 0.0;
+                                if (norm < 0.3) {
+                                    mag = (norm / 0.3 - 1.0);
+                                } else {
+                                    mag = f.strength * (1.0 - abs(1.0 - norm) / 0.7);
+                                    outerMag = mag;
+                                }
                                 accel += dir * mag * 0.1;
+                                typeForce[otherType] += outerMag * 0.1;
                             }
 
                             // Directional patch bond.
@@ -1940,7 +1981,36 @@ export class ParticleSimulation {
                 var theta = myTheta + myOmega * speed;
                 theta = theta - TAU * round(theta / TAU);
 
-                p._pad = 0.0;
+                // Mode 4: Mode-1-style type transforms driven by accumulated force.
+                if (simMode == 4u) {
+                    let baseSeed = uhash(idx) ^ uhash(u32(abs(p.pos.x) * 157.0 + 1.0))
+                                              ^ uhash(u32(abs(p.pos.y) * 239.0 + 1.0));
+                    var maxProb: f32 = 0.0;
+                    var newType: i32 = -1;
+                    for (var t: u32 = 0u; t < numTypes; t++) {
+                        let rule = transformRules[myType * 20u + t];
+                        if (rule.upperEnabled > 0.5) {
+                            let prob = transformProb(typeForce[t], rule.upperThreshold, rule.upperEnabled, 1.0);
+                            maxProb = max(maxProb, prob);
+                            if (newType < 0 && prob > 0.0 && rand01(baseSeed ^ uhash(t * 3u + 0u)) < prob) {
+                                newType = i32(rule.upperTarget);
+                            }
+                        }
+                        if (rule.lowerEnabled > 0.5) {
+                            let prob = transformProb(typeForce[t], rule.lowerThreshold, rule.lowerEnabled, 0.0);
+                            maxProb = max(maxProb, prob);
+                            if (newType < 0 && prob > 0.0 && rand01(baseSeed ^ uhash(t * 3u + 1u)) < prob) {
+                                newType = i32(rule.lowerTarget);
+                            }
+                        }
+                    }
+                    if (newType >= 0) { p.typeId = f32(newType); }
+                    let prevProb = clamp(p._pad, 0.0, 0.5);
+                    p._pad = mix(prevProb, maxProb, 0.06);
+                } else {
+                    p._pad = 0.0;
+                }
+
                 particles[idx]   = p;
                 orientation[idx] = vec2f(theta, myOmega);
             }
@@ -2018,10 +2088,10 @@ export class ParticleSimulation {
             reorderCp.end();
 
             const forceCp = enc.beginComputePass();
-            if (this.simMode === 3 && this.mode3Pipeline && this.mode3BindGroup) {
-                // Mode 3: patchy physics replaces the classic force pass. It reads the
+            if ((this.simMode === 3 || this.simMode === 4) && this.mode3Pipeline && this.mode3BindGroup) {
+                // Mode 3/4: patchy physics replaces the classic force pass. It reads the
                 // same cell-sorted neighbours plus their orientation and writes back
-                // position, velocity and orientation in one kernel.
+                // position, velocity and orientation in one kernel (Mode 4 also transforms).
                 forceCp.setPipeline(this.mode3Pipeline);
                 forceCp.setBindGroup(0, this.mode3BindGroup);
             } else {
@@ -2379,7 +2449,7 @@ export class ParticleSimulation {
         this.simulationTime = 0;
     }
 
-    setSimMode(mode: 0 | 1 | 2 | 3): void { this.simMode = mode; }
+    setSimMode(mode: 0 | 1 | 2 | 3 | 4): void { this.simMode = mode; }
     getEdgeMode():    number    { return this.edgeMode; }
     getSimMode():     number    { return this.simMode; }
 
@@ -2410,7 +2480,7 @@ export class ParticleSimulation {
         if (p.bondRange    != null) this.patchBondRange    = Math.max(5,   Math.min(200, p.bondRange));
         if (p.bondDist     != null) this.patchBondDist     = Math.max(2,   Math.min(150, p.bondDist));
         if (p.angStiffness != null) this.patchAngStiffness = Math.max(0,   Math.min(2,   p.angStiffness));
-        if (p.angFriction  != null) this.patchAngFriction  = Math.max(0.5, Math.min(0.99, p.angFriction));
+        if (p.angFriction  != null) this.patchAngFriction  = Math.max(0,   Math.min(1,   p.angFriction));
         if (p.patchWidth   != null) this.patchWidth        = Math.max(1,   Math.min(20,  p.patchWidth));
         this.patchDirty = true;
     }
@@ -2760,7 +2830,7 @@ export class ParticleSimulation {
         this.numTypes = n;
 
         if (state.simulationSpeed != null) this.params.simulationSpeed = Number(state.simulationSpeed);
-        if (state.simMode  != null) this.simMode  = Number(state.simMode)  as 0 | 1 | 2 | 3;
+        if (state.simMode  != null) this.simMode  = Number(state.simMode)  as 0 | 1 | 2 | 3 | 4;
         if (state.edgeMode != null) this.edgeMode = Number(state.edgeMode) as 0 | 1;
         if (state.poleWorldFrame != null) this.poleWorldFrame = Boolean(state.poleWorldFrame);
 

@@ -212,6 +212,7 @@ class ParticleLifeApp {
         document.getElementById('mode1-btn')!.addEventListener('click', () => this.setSimMode(1));
         document.getElementById('mode2-btn')!.addEventListener('click', () => this.setSimMode(2));
         document.getElementById('mode3-btn')!.addEventListener('click', () => this.setSimMode(3));
+        document.getElementById('mode4-btn')!.addEventListener('click', () => this.setSimMode(4));
 
         // Per-matrix randomize buttons
         document.getElementById('randomizeStrengthBtn')!.addEventListener('click', () => {
@@ -258,7 +259,15 @@ class ParticleLifeApp {
         patchSlider('patchDistSlider',     'patchDistValue',     'bondDist',     v => String(Math.round(v)));
         patchSlider('patchWidthSlider',    'patchWidthValue',    'patchWidth',   v => String(v));
         patchSlider('patchAngSlider',      'patchAngValue',      'angStiffness', v => v.toFixed(2));
-        patchSlider('patchAngFricSlider',  'patchAngFricValue',  'angFriction',  v => v.toFixed(2));
+        // Spin damping reads 0 = none, 1 = full; internally angFriction is the
+        // per-tick angular-velocity multiplier, i.e. the inverse of the slider.
+        const spinDampEl  = document.getElementById('patchAngFricSlider') as HTMLInputElement;
+        const spinDampOut = document.getElementById('patchAngFricValue')!;
+        spinDampEl.addEventListener('input', () => {
+            const v = Number(spinDampEl.value);
+            spinDampOut.textContent = v.toFixed(2);
+            this.sim?.setPatchParams({ angFriction: 1 - v });
+        });
 
         // Randomize transform rules
         document.getElementById('randomizeTransformBtn')!.addEventListener('click', () => {
@@ -341,12 +350,14 @@ class ParticleLifeApp {
             this.sim?.setAdditiveStrength(v);
         });
 
-        // Friction
+        // Friction. The slider reads as drag intuition (0 = frictionless,
+        // 1 = stops fast); internally friction is a per-tick velocity multiplier,
+        // so the stored value is the inverse of the slider.
         const frictionSlider = document.getElementById('frictionSlider') as HTMLInputElement;
         frictionSlider.addEventListener('input', () => {
             const v = parseFloat(frictionSlider.value);
             document.getElementById('frictionValue')!.textContent = v.toFixed(2);
-            this.sim?.setFriction(v);
+            this.sim?.setFriction(1 - v);
         });
 
         // Max transform rate
@@ -418,18 +429,21 @@ class ParticleLifeApp {
         btn.classList.toggle('active', paused);
     }
 
-    private setSimMode(mode: 0 | 1 | 2 | 3): void {
+    private setSimMode(mode: 0 | 1 | 2 | 3 | 4): void {
         this.sim?.setSimMode(mode);
-        document.getElementById('mode0-btn')!.classList.toggle('selected', mode === 0);
-        document.getElementById('mode1-btn')!.classList.toggle('selected', mode === 1);
-        document.getElementById('mode2-btn')!.classList.toggle('selected', mode === 2);
-        document.getElementById('mode3-btn')!.classList.toggle('selected', mode === 3);
-        document.getElementById('transform-panel')!.classList.toggle('visible', mode === 1 || mode === 2);
+        for (let m = 0; m <= 4; m++) {
+            document.getElementById(`mode${m}-btn`)!.classList.toggle('selected', mode === m);
+        }
+        // Transform rules apply in modes 1 (Transform), 2 (Mass) and 4 (Patchy+T).
+        const hasTransform = mode === 1 || mode === 2 || mode === 4;
+        // Patch controls apply in modes 3 (Patchy) and 4 (Patchy+T).
+        const hasPatch = mode === 3 || mode === 4;
+        document.getElementById('transform-panel')!.classList.toggle('visible', hasTransform);
         document.getElementById('mode2-panel')!.classList.toggle('visible', mode === 2);
-        document.getElementById('mode3-panel')!.classList.toggle('visible', mode === 3);
+        document.getElementById('mode3-panel')!.classList.toggle('visible', hasPatch);
         if (mode === 2) this.refreshMassTable();
-        if (mode === 3) {
-            // First time in patchy mode with no valences set: seed some so the
+        if (hasPatch) {
+            // First time in a patchy mode with no valences set: seed some so the
             // directional behaviour is visible immediately.
             if (this.sim && this.sim.getPatchCount().every(v => v === 0)) {
                 this.sim.randomizePatches();
@@ -1651,7 +1665,7 @@ class ParticleLifeApp {
         document.getElementById('speedValue')!.textContent = `${this.sim.getParams().simulationSpeed.toFixed(1)}×`;
         document.getElementById('particleCountDisplay')!.textContent = String(this.sim.getParams().particleCount);
 
-        const simMode  = this.sim.getSimMode()  as 0 | 1 | 2 | 3;
+        const simMode  = this.sim.getSimMode()  as 0 | 1 | 2 | 3 | 4;
         const edgeMode = this.sim.getEdgeMode() as 0 | 1;
         this.setSimMode(simMode);
         document.getElementById('edgeLoopBtn')!.classList.toggle('selected', edgeMode === 0);
@@ -1680,9 +1694,10 @@ class ParticleLifeApp {
         this.setBlendMode(this.sim.getBlendMode() as 0 | 1);
         this.setShapeMode(this.sim.getShapeMode() as 0 | 1);
 
-        const friction = this.sim.getFriction();
-        (document.getElementById('frictionSlider') as HTMLInputElement).value = String(friction);
-        document.getElementById('frictionValue')!.textContent = friction.toFixed(2);
+        // Slider shows drag = 1 - stored multiplier (see input handler).
+        const drag = 1 - this.sim.getFriction();
+        (document.getElementById('frictionSlider') as HTMLInputElement).value = String(drag);
+        document.getElementById('frictionValue')!.textContent = drag.toFixed(2);
 
         const maxTransform = this.sim.getMaxTransformRate();
         (document.getElementById('maxTransformSlider') as HTMLInputElement).value = String(maxTransform);
@@ -1698,7 +1713,8 @@ class ParticleLifeApp {
         setSlider('patchDistSlider',     'patchDistValue',     pp.bondDist,     String(Math.round(pp.bondDist)));
         setSlider('patchWidthSlider',    'patchWidthValue',    pp.patchWidth,   String(pp.patchWidth));
         setSlider('patchAngSlider',      'patchAngValue',      pp.angStiffness, pp.angStiffness.toFixed(2));
-        setSlider('patchAngFricSlider',  'patchAngFricValue',  pp.angFriction,  pp.angFriction.toFixed(2));
+        const spinDamp = 1 - pp.angFriction;  // slider = 1 - stored multiplier
+        setSlider('patchAngFricSlider',  'patchAngFricValue',  spinDamp, spinDamp.toFixed(2));
         this.refreshPatchTable();
 
         this.refreshForceMatrices();
