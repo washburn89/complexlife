@@ -89,7 +89,6 @@ class ParticleLifeApp {
     private cursorMouseX          = -9999;
     private cursorMouseY          = -9999;
     private cursorMouseButtons    = 0;   // bitmask: bit 0 = left, bit 2 = right
-    private cursorPanelCollapsed  = false;
 
     // ── Photo export selection ────────────────────────────────────────────────
     private photoSelMode     = false;   // armed: dragging a region to export
@@ -365,12 +364,7 @@ class ParticleLifeApp {
             btn.innerHTML  = this.panelCollapsed ? '&#9654;' : '&#9664;';
         });
 
-        // Bottom bar
-        document.getElementById('btmPauseBtn')!.addEventListener('click', () => {
-            if (!this.sim) return;
-            this.sim.togglePause();
-            this.syncPauseButton();
-        });
+        // Bottom dock
         document.getElementById('btmTrackBtn')!.addEventListener('click', () => this.handleTrackButton());
         document.getElementById('btmInspectBtn')!.addEventListener('click', () => {
             if (this.photoSelMode) this.exitPhotoSelect();
@@ -386,12 +380,8 @@ class ParticleLifeApp {
     private syncPauseButton(): void {
         const paused = this.sim?.isPaused_() ?? false;
         const btn = document.getElementById('pauseBtn')!;
-        btn.textContent = paused ? 'Resume' : 'Pause';
+        btn.innerHTML = paused ? '&#9654; Resume' : '&#9646;&#9646; Pause';
         btn.classList.toggle('active', paused);
-        const btm = document.getElementById('btmPauseBtn')!;
-        btm.textContent = paused ? '&#9654; Resume' : '&#9646;&#9646; Pause';
-        btm.innerHTML   = paused ? '&#9654; Resume' : '&#9646;&#9646; Pause';
-        btm.classList.toggle('active', paused);
     }
 
     private setSimMode(mode: 0 | 1 | 2): void {
@@ -883,13 +873,8 @@ class ParticleLifeApp {
             paintRateVal.textContent = String(this.paintRate);
         });
 
-        document.getElementById('cursorCollapseBtn')!.addEventListener('click', () => {
-            this.cursorPanelCollapsed = !this.cursorPanelCollapsed;
-            document.getElementById('cursor-panel')!.classList.toggle('collapsed', this.cursorPanelCollapsed);
-            document.body.classList.toggle('cursor-panel-collapsed', this.cursorPanelCollapsed);
-            const btn = document.getElementById('cursorCollapseBtn')!;
-            btn.innerHTML = this.cursorPanelCollapsed ? '&#9664;' : '&#9654;';
-        });
+        // Reposition the contextual tool popover above its dock button on resize
+        window.addEventListener('resize', () => this.updateToolPopover());
 
         window.addEventListener('mousemove', (e) => {
             this.cursorMouseX = e.clientX;
@@ -916,7 +901,27 @@ class ParticleLifeApp {
         const showRate = this.activeCursorTool === 'paint' || this.activeCursorTool === 'erase';
         document.getElementById('paint-rate-section')!.style.display = showRate ? '' : 'none';
         if (this.activeCursorTool === 'paint') this.refreshPaintTypePicker();
+        this.updateToolPopover();
         this.syncCanvasCursor();
+    }
+
+    // Show the contextual tool settings popover above the active tool's dock button.
+    // Only the brush-using tools (force/paint/erase) have settings; grab has none.
+    private updateToolPopover(): void {
+        const pop = document.getElementById('tool-popover');
+        if (!pop) return;
+        const tool = this.activeCursorTool;
+        const show = tool === 'force' || tool === 'paint' || tool === 'erase';
+        pop.classList.toggle('visible', show);
+        if (!show) return;
+        const anchor = document.getElementById(`ctool-${tool}`);
+        if (!anchor) return;
+        const a = anchor.getBoundingClientRect();
+        const popW = pop.offsetWidth || 196;
+        let left = a.left + a.width / 2 - popW / 2;
+        left = Math.max(8, Math.min(window.innerWidth - popW - 8, left));
+        pop.style.left   = `${left}px`;
+        pop.style.bottom = `${window.innerHeight - a.top + 8}px`;
     }
 
     private refreshPaintTypePicker(): void {
