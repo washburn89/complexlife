@@ -476,6 +476,9 @@
                         2×mass-2 or 4×mass-1; to form a higher-mass type it consumes same-type
                         neighbors within range.
                     </p>
+                    <div class="btn-row" style="margin-bottom:8px;">
+                        <button id="randomizeMassBtn">Randomize Masses</button>
+                    </div>
                     <p class="matrix-label">Mass per type</p>
                     <table class="mass-table" id="mass-table"></table>
                 </div>
@@ -693,6 +696,8 @@
         <div class="cpanel-header">Cursor Tools</div>
         <button class="ctool-btn" id="ctool-grab">&#9995; Grab</button>
         <button class="ctool-btn" id="ctool-force">&#9889; Force</button>
+        <button class="ctool-btn" id="ctool-paint">&#9998; Paint</button>
+        <button class="ctool-btn" id="ctool-erase">&#9003; Erase</button>
         <div class="cpanel-section">
             <div class="cpanel-label">Brush Size</div>
             <input type="range" class="cpanel-slider" id="brushSizeSlider" min="20" max="800" step="10" value="150">
@@ -702,7 +707,20 @@
             <div class="cpanel-label">Strength</div>
             <input type="range" class="cpanel-slider" id="forceStrSlider" min="0.1" max="10" step="0.1" value="2">
             <span class="cpanel-val" id="forceStrVal">2.0</span>
-            <div class="cpanel-hint">Left click: push out<br>Right click: pull in</div>
+            <div class="cpanel-hint">Left: push out · Right: pull in</div>
+        </div>
+        <div class="cpanel-section" id="paint-section" style="display:none">
+            <div class="cpanel-label">Type</div>
+            <div id="paint-type-picker" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px"></div>
+            <div class="cpanel-hint" style="margin-top:6px">Left: spawn · Right: destroy type</div>
+        </div>
+        <div class="cpanel-section" id="erase-section" style="display:none">
+            <div class="cpanel-hint">Left: erase at rate · Right: erase all in brush</div>
+        </div>
+        <div class="cpanel-section" id="paint-rate-section" style="display:none">
+            <div class="cpanel-label">Rate</div>
+            <input type="range" class="cpanel-slider" id="paintRateSlider" min="1" max="100" step="1" value="10">
+            <span class="cpanel-val" id="paintRateVal">10</span>
         </div>
     </div>
     <button id="cursorCollapseBtn" title="Toggle cursor tools">&#9654;</button>

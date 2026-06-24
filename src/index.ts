@@ -81,9 +81,11 @@ class ParticleLifeApp {
     private inspectMode = false;
 
     // ── Cursor tools ──────────────────────────────────────────────────────────
-    private activeCursorTool:     'none' | 'grab' | 'force' = 'none';
+    private activeCursorTool:     'none' | 'grab' | 'force' | 'paint' | 'erase' = 'none';
     private brushWorldRadius      = 150;
     private forceStrength         = 2.0;
+    private paintTypeId           = 0;
+    private paintRate             = 10;   // particles/frame for paint; /1000 = kill prob for erase
     private cursorMouseX          = -9999;
     private cursorMouseY          = -9999;
     private cursorMouseButtons    = 0;   // bitmask: bit 0 = left, bit 2 = right
@@ -176,6 +178,7 @@ class ParticleLifeApp {
                 this.refreshForceMatrices();
                 this.refreshTransformMatrix();
                 this.refreshMassTable();
+                this.refreshPaintTypePicker();
             }
         };
         typeEl.addEventListener('change', applyTypes);
@@ -220,6 +223,12 @@ class ParticleLifeApp {
         document.getElementById('zeroMinRadiusBtn')!.addEventListener('click', () => {
             this.sim?.zeroMinRadii();
             this.refreshForceMatrices();
+        });
+
+        // Randomize masses (mode 2)
+        document.getElementById('randomizeMassBtn')!.addEventListener('click', () => {
+            this.sim?.randomizeMasses();
+            this.refreshMassTable();
         });
 
         // Randomize transform rules
@@ -461,8 +470,18 @@ class ParticleLifeApp {
             const view   = this.sim.getView();
             const sr = this.brushWorldRadius * view.zoom * rect.width / params.worldWidth;
             const pressing = this.cursorMouseButtons !== 0;
+            const tool = this.activeCursorTool;
+            const idleColor  = tool === 'paint' ? 'rgba(0,255,100,0.4)'  : tool === 'erase' ? 'rgba(255,80,80,0.4)'  : 'rgba(255,255,255,0.4)';
+            const pressColor = tool === 'paint' ? 'rgba(0,255,100,0.75)' : tool === 'erase' ? 'rgba(255,80,80,0.75)' : 'rgba(0,170,255,0.7)';
             ctx.save();
-            ctx.strokeStyle = pressing ? 'rgba(0,170,255,0.7)' : 'rgba(255,255,255,0.4)';
+            // Filled red overlay when right-click erasing (instant-all mode)
+            if (tool === 'erase' && (this.cursorMouseButtons & 4)) {
+                ctx.fillStyle = 'rgba(255,60,60,0.15)';
+                ctx.beginPath();
+                ctx.arc(this.cursorMouseX, this.cursorMouseY, Math.max(2, sr), 0, Math.PI * 2);
+                ctx.fill();
+            }
+            ctx.strokeStyle = pressing ? pressColor : idleColor;
             ctx.lineWidth = 1.5;
             ctx.setLineDash([4, 4]);
             ctx.beginPath();
@@ -683,7 +702,7 @@ class ParticleLifeApp {
                 this.syncCanvasCursor();
                 return;
             }
-            if (this.activeCursorTool === 'force') {
+            if (this.activeCursorTool === 'force' || this.activeCursorTool === 'paint' || this.activeCursorTool === 'erase') {
                 e.preventDefault();
                 if (e.button === 0) this.cursorMouseButtons |= 1;
                 if (e.button === 2) this.cursorMouseButtons |= 4;
@@ -774,6 +793,8 @@ class ParticleLifeApp {
     private setupCursorPanel(): void {
         document.getElementById('ctool-grab')!.addEventListener('click',  () => this.setActiveCursorTool('grab'));
         document.getElementById('ctool-force')!.addEventListener('click', () => this.setActiveCursorTool('force'));
+        document.getElementById('ctool-paint')!.addEventListener('click', () => this.setActiveCursorTool('paint'));
+        document.getElementById('ctool-erase')!.addEventListener('click', () => this.setActiveCursorTool('erase'));
 
         const brushSlider = document.getElementById('brushSizeSlider') as HTMLInputElement;
         const brushVal    = document.getElementById('brushSizeVal')!;
@@ -787,6 +808,13 @@ class ParticleLifeApp {
         forceSlider.addEventListener('input', () => {
             this.forceStrength   = parseFloat(forceSlider.value);
             forceVal.textContent = this.forceStrength.toFixed(1);
+        });
+
+        const paintRateSlider = document.getElementById('paintRateSlider') as HTMLInputElement;
+        const paintRateVal    = document.getElementById('paintRateVal')!;
+        paintRateSlider.addEventListener('input', () => {
+            this.paintRate       = parseInt(paintRateSlider.value);
+            paintRateVal.textContent = String(this.paintRate);
         });
 
         document.getElementById('cursorCollapseBtn')!.addEventListener('click', () => {
@@ -809,12 +837,38 @@ class ParticleLifeApp {
         window.addEventListener('blur', () => { this.cursorMouseButtons = 0; });
     }
 
-    private setActiveCursorTool(tool: 'grab' | 'force'): void {
+    private setActiveCursorTool(tool: 'grab' | 'force' | 'paint' | 'erase'): void {
         this.activeCursorTool = (this.activeCursorTool === tool) ? 'none' : tool;
         document.getElementById('ctool-grab')!.classList.toggle('active',  this.activeCursorTool === 'grab');
         document.getElementById('ctool-force')!.classList.toggle('active', this.activeCursorTool === 'force');
-        document.getElementById('force-section')!.style.display = this.activeCursorTool === 'force' ? '' : 'none';
+        document.getElementById('ctool-paint')!.classList.toggle('active', this.activeCursorTool === 'paint');
+        document.getElementById('ctool-erase')!.classList.toggle('active', this.activeCursorTool === 'erase');
+        document.getElementById('force-section')!.style.display      = this.activeCursorTool === 'force' ? '' : 'none';
+        document.getElementById('paint-section')!.style.display      = this.activeCursorTool === 'paint' ? '' : 'none';
+        document.getElementById('erase-section')!.style.display      = this.activeCursorTool === 'erase' ? '' : 'none';
+        const showRate = this.activeCursorTool === 'paint' || this.activeCursorTool === 'erase';
+        document.getElementById('paint-rate-section')!.style.display = showRate ? '' : 'none';
+        if (this.activeCursorTool === 'paint') this.refreshPaintTypePicker();
         this.syncCanvasCursor();
+    }
+
+    private refreshPaintTypePicker(): void {
+        const container = document.getElementById('paint-type-picker');
+        if (!container || !this.sim) return;
+        container.innerHTML = '';
+        const n = this.sim.getNumTypes();
+        for (let t = 0; t < n; t++) {
+            const btn = document.createElement('button');
+            btn.style.cssText = `width:16px;height:16px;border-radius:50%;background:${TYPE_HEX[t]};` +
+                `border:2px solid ${t === this.paintTypeId ? '#fff' : 'transparent'};` +
+                `cursor:pointer;flex-shrink:0;padding:0;min-width:0;`;
+            btn.title = TYPE_LABELS[t];
+            btn.addEventListener('click', () => {
+                this.paintTypeId = t;
+                this.refreshPaintTypePicker();
+            });
+            container.appendChild(btn);
+        }
     }
 
     private syncCanvasCursor(): void {
@@ -825,7 +879,7 @@ class ParticleLifeApp {
         }
         if (this.activeCursorTool === 'grab') {
             this.canvas.style.cursor = (this.cursorMouseButtons & 1) ? 'grabbing' : 'grab';
-        } else if (this.activeCursorTool === 'force') {
+        } else if (this.activeCursorTool === 'force' || this.activeCursorTool === 'paint' || this.activeCursorTool === 'erase') {
             this.canvas.style.cursor = 'crosshair';
         } else {
             this.canvas.style.cursor = '';
@@ -1358,7 +1412,10 @@ class ParticleLifeApp {
                 this.lowFpsFrames = 0;
             }
         }
-        if (this.sim) document.getElementById('time')!.textContent = `${this.sim.getTime().toFixed(1)}s`;
+        if (this.sim) {
+            document.getElementById('time')!.textContent = `${this.sim.getTime().toFixed(1)}s`;
+            document.getElementById('particleCountDisplay')!.textContent = String(this.sim.getParams().particleCount);
+        }
     }
 
     private startLoop(): void {
@@ -1367,6 +1424,24 @@ class ParticleLifeApp {
                 const { wx, wy } = this.screenToWorld(this.cursorMouseX, this.cursorMouseY);
                 const dir = (this.cursorMouseButtons & 1) ? 1 : -1;
                 this.sim.applyCursorForce(wx, wy, this.brushWorldRadius, this.forceStrength * dir);
+            }
+            if (this.activeCursorTool === 'paint' && this.cursorMouseButtons !== 0 && this.sim) {
+                const { wx, wy } = this.screenToWorld(this.cursorMouseX, this.cursorMouseY);
+                if (this.cursorMouseButtons & 1) {
+                    const r = this.brushWorldRadius;
+                    const count = Math.max(1, Math.round(this.paintRate * r * r / 10000));
+                    this.sim.spawnParticlesInBrush(wx, wy, r, this.paintTypeId, count);
+                } else if (this.cursorMouseButtons & 4) {
+                    this.sim.eraseParticlesInBrush(wx, wy, this.brushWorldRadius, this.paintRate / 1000, this.paintTypeId);
+                }
+            }
+            if (this.activeCursorTool === 'erase' && this.cursorMouseButtons !== 0 && this.sim) {
+                const { wx, wy } = this.screenToWorld(this.cursorMouseX, this.cursorMouseY);
+                if (this.cursorMouseButtons & 1) {
+                    this.sim.eraseParticlesInBrush(wx, wy, this.brushWorldRadius, this.paintRate / 1000, -1);
+                } else if (this.cursorMouseButtons & 4) {
+                    this.sim.eraseParticlesInBrush(wx, wy, this.brushWorldRadius, 1.0, -1);
+                }
             }
             this.sim?.update();
             this.updateStats();
@@ -1404,6 +1479,7 @@ class ParticleLifeApp {
         this.buildMatrixTable('min-radius-table', 'minRadius');
         this.buildTransformMatrix();
         this.buildPolePanel();
+        this.refreshPaintTypePicker();
 
         this.startLoop();
     }

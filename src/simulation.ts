@@ -169,6 +169,12 @@ export class ParticleSimulation {
     private cursorPipeline:    GPUComputePipeline | null = null;
     private cursorBindGroup:   GPUBindGroup | null = null;
 
+    // ── Erase / spawn (paint tool) ─────────────────────────────────────────────
+    private eraseParamBuffer:  GPUBuffer | null = null;
+    private erasePipeline:     GPUComputePipeline | null = null;
+    private eraseBindGroup:    GPUBindGroup | null = null;
+    private eraseFrameCounter  = 0;
+
     // ── Mode 2 (mass) ─────────────────────────────────────────────────────────
     private typeMass: number[] = Array(MAX_TYPES).fill(1);
     private typeMassBuffer:       GPUBuffer | null = null;
@@ -375,7 +381,9 @@ export class ParticleSimulation {
         const S  = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
         const U  = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
 
-        this.particleBuffer  = this.makeBuffer('particles', this.generateParticleData(), S);
+        // Pre-allocate at max capacity so the paint/spawn tool can append without reallocation
+        this.particleBuffer = this.device!.createBuffer({ label: 'particles', size: MAX_PARTICLE_CAPACITY * 6 * 4, usage: S });
+        this.queue!.writeBuffer(this.particleBuffer, 0, this.generateParticleData());
         this.paramsBuffer    = this.makeBuffer('params',    this.paramsArray(),           U);
         this.forcesBuffer    = this.makeBuffer('forces',    this.generateForcesData(),    S);
         this.transformBuffer = this.makeBuffer('transform', this.generateTransformData(), S);
@@ -422,6 +430,8 @@ export class ParticleSimulation {
         this.m2FrameCounterBuffer = this.device!.createBuffer({ label: 'm2FrameCounter', size: 16, usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
         // Initialize type masses to 1
         this.queue!.writeBuffer(this.typeMassBuffer, 0, this.generateTypeMassData());
+
+        this.eraseParamBuffer = this.device!.createBuffer({ label: 'eraseParams', size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     }
 
     private async createPipelines(): Promise<void> {
@@ -536,6 +546,12 @@ export class ParticleSimulation {
             compute: { module: this.device.createShaderModule({ code: this.getCursorForceShaderCode() }), entryPoint: 'main' },
         });
 
+        // Erase/paint pipeline (reuses cursorBGL: binding 0=particles, binding 1=uniform)
+        this.erasePipeline = this.device.createComputePipeline({
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.cursorBGL!] }),
+            compute: { module: this.device.createShaderModule({ code: this.getEraseShaderCode() }), entryPoint: 'main' },
+        });
+
         // Mode 2 mass-conserving transform pipeline (separate BGL with 7 storage + 2 uniform)
         this.m2TransformBGL = this.device.createBindGroupLayout({ entries: [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // particles
@@ -633,6 +649,16 @@ export class ParticleSimulation {
                 entries: [
                     { binding: 0, resource: { buffer: this.particleBuffer   } },
                     { binding: 1, resource: { buffer: this.cursorParamBuffer } },
+                ],
+            });
+        }
+
+        if (this.cursorBGL && this.eraseParamBuffer) {
+            this.eraseBindGroup = this.device.createBindGroup({
+                layout: this.cursorBGL,
+                entries: [
+                    { binding: 0, resource: { buffer: this.particleBuffer!  } },
+                    { binding: 1, resource: { buffer: this.eraseParamBuffer } },
                 ],
             });
         }
@@ -929,12 +955,14 @@ export class ParticleSimulation {
                     }
                 }
 
+                // friction^speed: correct discrete-time exponential decay for variable dt
+                let fric = pow(params.friction, speed);
                 // Mode 2: mass-based inertia — higher mass = less acceleration
                 if (simMode == 2u) {
                     let myMass = f32(getMass(myType));
-                    p.vel = p.vel * params.friction + accel * speed / max(myMass, 1.0);
+                    p.vel = p.vel * fric + accel * speed / max(myMass, 1.0);
                 } else {
-                    p.vel = p.vel * params.friction + accel * speed;
+                    p.vel = p.vel * fric + accel * speed;
                 }
                 p.pos = p.pos + p.vel;
 
@@ -975,7 +1003,9 @@ export class ParticleSimulation {
                     if (simMode == 1u) {
                         // Mode 1: apply transform immediately
                         if (newType >= 0) { p.typeId = f32(newType); }
-                        p._pad = maxProb;  // drives instability pulse in render shader
+                        // Smooth stored prob toward current maxProb so whitening transitions gradually
+                        let prevProb = clamp(p._pad, 0.0, 0.5);
+                        p._pad = mix(prevProb, maxProb, 0.06);
                     } else {
                         // Mode 2: store desired target in _pad; second pass handles mass conservation
                         p._pad = select(-1.0, f32(newType), newType >= 0);
@@ -1041,19 +1071,17 @@ export class ParticleSimulation {
                 let ny = -(p.pos.y - view.cy) * 2.0 * zoom / worldH;
                 // World-space constant size: 20 world-units radius, scales with zoom so
                 // zooming in reveals larger particles. aspectX keeps quads square in pixels.
-                // Instability pulse: _pad stores max transform probability [0, 0.5].
-                // At max prob (50%/tick ≈ 10 Hz visual), particle oscillates ±10% in size.
-                let prob     = p._pad;
-                let normProb = clamp(prob * 2.0, 0.0, 1.0);          // 0→0, 0.5→1
-                let freq     = normProb * 62.83184;                   // up to 10 Hz × 2π
-                let phase    = f32(inst) * 2.39996 + view.simTime * freq;
-                let pulse    = 1.0 + normProb * 0.1 * sin(phase);
-                let quadScale = 20.0 * 2.0 * zoom / worldH * (1.0 + view.glow * 3.5) * pulse;
+                // Instability whitening: _pad stores smoothed max transform probability [0, 0.5].
+                // Particle tints toward white in its own hue; at max prob → 75% toward white.
+                let normProb  = clamp(p._pad * 2.0, 0.0, 1.0);  // 0→0, 0.5→1
+                let whiteness = normProb * 0.75;
+                let quadScale = 20.0 * 2.0 * zoom / worldH * (1.0 + view.glow * 3.5);
                 let aspectX   = view.canvasH / view.canvasW;
                 var o: VOut;
                 o.pos    = vec4f(nx + quad.x * quadScale * aspectX, ny + quad.y * quadScale, 0.0, 1.0);
                 o.uv     = quad;
-                o.color  = COLORS[min(u32(p.typeId), 19u)];
+                let ownColor = COLORS[min(u32(p.typeId), 19u)];
+                o.color  = mix(ownColor, vec4f(1.0, 1.0, 1.0, 1.0), whiteness);
                 o.glow   = view.glow;
                 o.typeId = p.typeId;
                 return o;
@@ -1301,6 +1329,35 @@ export class ParticleSimulation {
                 let falloff = 1.0 - dist / cp.radius;
                 p.vel += vec2f(dx / dist, dy / dist) * cp.strength * falloff;
                 particles[i] = p;
+            }
+        `;
+    }
+
+    private getEraseShaderCode(): string {
+        return /* wgsl */`
+            struct Particle    { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
+            struct EraseParams { x: f32, y: f32, radius: f32, killProb: f32,
+                                 typeFilter: i32, seed: u32, _p2: u32, _p3: u32 }
+
+            @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
+            @group(0) @binding(1) var<uniform> ep: EraseParams;
+
+            fn uhash(v: u32) -> u32 { var x = v ^ (v >> 16u); x *= 0x45d9f3bu; x ^= x >> 16u; return x; }
+
+            @compute @workgroup_size(256)
+            fn main(@builtin(global_invocation_id) id: vec3u) {
+                let i = id.x;
+                if (i >= arrayLength(&particles)) { return; }
+                var p = particles[i];
+                if (p.typeId < 0.0) { return; }
+                if (ep.typeFilter >= 0 && i32(p.typeId) != ep.typeFilter) { return; }
+                let dx = p.pos.x - ep.x;
+                let dy = p.pos.y - ep.y;
+                if (dx * dx + dy * dy > ep.radius * ep.radius) { return; }
+                if (ep.killProb >= 1.0 || f32(uhash(i ^ uhash(ep.seed))) / 4294967295.0 < ep.killProb) {
+                    p.typeId = -1.0;
+                    particles[i] = p;
+                }
             }
         `;
     }
@@ -1685,6 +1742,46 @@ export class ParticleSimulation {
         this.queue.submit([enc.finish()]);
     }
 
+    eraseParticlesInBrush(wx: number, wy: number, radius: number, killProb: number, typeFilter: number): void {
+        if (!this.isInitialized || !this.device || !this.queue ||
+            !this.erasePipeline || !this.eraseBindGroup || !this.eraseParamBuffer) return;
+        const ab  = new ArrayBuffer(32);
+        const f32 = new Float32Array(ab);
+        const i32 = new Int32Array(ab);
+        const u32 = new Uint32Array(ab);
+        f32[0] = wx; f32[1] = wy; f32[2] = radius; f32[3] = Math.min(1, Math.max(0, killProb));
+        i32[4] = typeFilter;
+        u32[5] = this.eraseFrameCounter++ >>> 0;
+        this.queue.writeBuffer(this.eraseParamBuffer, 0, ab);
+        const enc = this.device.createCommandEncoder();
+        const cp  = enc.beginComputePass();
+        cp.setPipeline(this.erasePipeline);
+        cp.setBindGroup(0, this.eraseBindGroup);
+        cp.dispatchWorkgroups(Math.ceil(this.params.particleCount / 256));
+        cp.end();
+        this.queue.submit([enc.finish()]);
+    }
+
+    spawnParticlesInBrush(wx: number, wy: number, radius: number, typeId: number, count: number): void {
+        if (!this.isInitialized || !this.queue || !this.particleBuffer || !this.paramsBuffer) return;
+        const N        = this.params.particleCount;
+        const spawnable = Math.min(count, MAX_PARTICLE_CAPACITY - N);
+        if (spawnable <= 0) return;
+        const ab   = new ArrayBuffer(spawnable * 6 * 4);
+        const data = new Float32Array(ab);
+        for (let i = 0; i < spawnable; i++) {
+            const r = radius * Math.sqrt(Math.random());
+            const a = Math.random() * 2 * Math.PI;
+            const b = i * 6;
+            data[b]     = wx + r * Math.cos(a);
+            data[b + 1] = wy + r * Math.sin(a);
+            data[b + 4] = typeId;
+        }
+        this.queue.writeBuffer(this.particleBuffer, N * 6 * 4, data);
+        this.params.particleCount = N + spawnable;
+        this.queue.writeBuffer(this.paramsBuffer, 0, this.paramsArray());
+    }
+
     selectParticleAt(worldX: number, worldY: number): void {
         if (!this.isInitialized || !this.device || !this.queue ||
             !this.particleBuffer || !this.snapStagingBuffer || this.snapReadPending) return;
@@ -1720,14 +1817,10 @@ export class ParticleSimulation {
     getSelectedParticleIndex(): number { return this.selectedParticleIdx; }
 
     setParticleCount(count: number): void {
-        if (!this.isInitialized || !this.device || !this.queue) return;
+        if (!this.isInitialized || !this.queue || !this.particleBuffer || !this.paramsBuffer) return;
         this.params.particleCount = count;
-        this.particleBuffer?.destroy();
-        this.particleBuffer = this.makeBuffer(
-            'particles', this.generateParticleData(),
-            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
-        );
-        this.rebuildBindGroups();
+        this.queue.writeBuffer(this.particleBuffer, 0, this.generateParticleData());
+        this.queue.writeBuffer(this.paramsBuffer, 0, this.paramsArray());
     }
 
     setNumTypes(n: number): void {
@@ -1838,6 +1931,46 @@ export class ParticleSimulation {
         }
     }
     getTypeMass(): number[] { return this.typeMass.slice(0, this.numTypes); }
+
+    randomizeMasses(): void {
+        const n = this.numTypes;
+        if (n <= 1) {
+            this.typeMass[0] = 1 + Math.floor(Math.random() * 8);
+            if (this.queue && this.typeMassBuffer)
+                this.queue.writeBuffer(this.typeMassBuffer, 0, this.generateTypeMassData());
+            return;
+        }
+
+        const compat = (a: number, b: number) => a % b === 0 || b % a === 0;
+
+        // All masses in [1,8] that divide or are divisible by m
+        const compatibleWith = (m: number): number[] => {
+            const out: number[] = [];
+            for (let c = 1; c <= 8; c++) if (compat(c, m)) out.push(c);
+            return out;
+        };
+
+        const masses = Array.from({ length: n }, () => 1 + Math.floor(Math.random() * 8));
+
+        // Up to 3 passes: fix any stranded type (no compatible partner in the set)
+        for (let pass = 0; pass < 3; pass++) {
+            for (let i = 0; i < n; i++) {
+                const hasPartner = masses.some((m, j) => j !== i && compat(masses[i], m));
+                if (!hasPartner) {
+                    // Pick a random OTHER type's current mass as the anchor,
+                    // then replace mass[i] with a random value compatible with that anchor.
+                    const others = masses.filter((_, j) => j !== i);
+                    const ref    = others[Math.floor(Math.random() * others.length)];
+                    const opts   = compatibleWith(ref);
+                    masses[i]    = opts[Math.floor(Math.random() * opts.length)];
+                }
+            }
+        }
+
+        for (let i = 0; i < n; i++) this.typeMass[i] = masses[i];
+        if (this.queue && this.typeMassBuffer)
+            this.queue.writeBuffer(this.typeMassBuffer, 0, this.generateTypeMassData());
+    }
     getNumTypes():    number    { return this.numTypes; }
     getDefaultView(): ViewState { return this.defaultView(); }
 
@@ -2090,12 +2223,7 @@ export class ParticleSimulation {
         }
 
         if (!this.isInitialized || !this.queue) return;
-        this.particleBuffer?.destroy();
-        this.particleBuffer = this.makeBuffer(
-            'particles', this.generateParticleData(),
-            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
-        );
-        this.rebuildBindGroups();
+        this.queue.writeBuffer(this.particleBuffer!,  0, this.generateParticleData());
         this.queue.writeBuffer(this.forcesBuffer!,    0, this.generateForcesData());
         this.queue.writeBuffer(this.transformBuffer!, 0, this.generateTransformData());
         this.queue.writeBuffer(this.poleBuffer!,      0, this.generatePoleData());
