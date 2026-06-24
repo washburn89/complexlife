@@ -211,6 +211,7 @@ class ParticleLifeApp {
         document.getElementById('mode0-btn')!.addEventListener('click', () => this.setSimMode(0));
         document.getElementById('mode1-btn')!.addEventListener('click', () => this.setSimMode(1));
         document.getElementById('mode2-btn')!.addEventListener('click', () => this.setSimMode(2));
+        document.getElementById('mode3-btn')!.addEventListener('click', () => this.setSimMode(3));
 
         // Per-matrix randomize buttons
         document.getElementById('randomizeStrengthBtn')!.addEventListener('click', () => {
@@ -235,6 +236,29 @@ class ParticleLifeApp {
             this.sim?.randomizeMasses();
             this.refreshMassTable();
         });
+
+        // Patchy mode (mode 3) controls
+        document.getElementById('randomizePatchesBtn')!.addEventListener('click', () => {
+            this.sim?.randomizePatches();
+            this.refreshPatchTable();
+        });
+        const patchSlider = (id: string, valId: string, key:
+            'bondStrength' | 'bondRange' | 'bondDist' | 'angStiffness' | 'angFriction' | 'patchWidth',
+            fmt: (v: number) => string) => {
+            const el  = document.getElementById(id) as HTMLInputElement;
+            const out = document.getElementById(valId)!;
+            el.addEventListener('input', () => {
+                const v = Number(el.value);
+                out.textContent = fmt(v);
+                this.sim?.setPatchParams({ [key]: v });
+            });
+        };
+        patchSlider('patchStrengthSlider', 'patchStrengthValue', 'bondStrength', v => v.toFixed(2));
+        patchSlider('patchRangeSlider',    'patchRangeValue',    'bondRange',    v => String(Math.round(v)));
+        patchSlider('patchDistSlider',     'patchDistValue',     'bondDist',     v => String(Math.round(v)));
+        patchSlider('patchWidthSlider',    'patchWidthValue',    'patchWidth',   v => String(v));
+        patchSlider('patchAngSlider',      'patchAngValue',      'angStiffness', v => v.toFixed(2));
+        patchSlider('patchAngFricSlider',  'patchAngFricValue',  'angFriction',  v => v.toFixed(2));
 
         // Randomize transform rules
         document.getElementById('randomizeTransformBtn')!.addEventListener('click', () => {
@@ -394,14 +418,24 @@ class ParticleLifeApp {
         btn.classList.toggle('active', paused);
     }
 
-    private setSimMode(mode: 0 | 1 | 2): void {
+    private setSimMode(mode: 0 | 1 | 2 | 3): void {
         this.sim?.setSimMode(mode);
         document.getElementById('mode0-btn')!.classList.toggle('selected', mode === 0);
         document.getElementById('mode1-btn')!.classList.toggle('selected', mode === 1);
         document.getElementById('mode2-btn')!.classList.toggle('selected', mode === 2);
+        document.getElementById('mode3-btn')!.classList.toggle('selected', mode === 3);
         document.getElementById('transform-panel')!.classList.toggle('visible', mode === 1 || mode === 2);
         document.getElementById('mode2-panel')!.classList.toggle('visible', mode === 2);
+        document.getElementById('mode3-panel')!.classList.toggle('visible', mode === 3);
         if (mode === 2) this.refreshMassTable();
+        if (mode === 3) {
+            // First time in patchy mode with no valences set: seed some so the
+            // directional behaviour is visible immediately.
+            if (this.sim && this.sim.getPatchCount().every(v => v === 0)) {
+                this.sim.randomizePatches();
+            }
+            this.refreshPatchTable();
+        }
     }
 
     private setEdgeMode(mode: 0 | 1): void {
@@ -1231,6 +1265,58 @@ class ParticleLifeApp {
         }
     }
 
+    private patchHint(v: number): string {
+        switch (v) {
+            case 0:  return 'isotropic';
+            case 2:  return 'chains';
+            case 3:  return 'sheets';
+            case 4:  return 'lattice';
+            case 5:  return 'cluster';
+            case 6:  return 'hex';
+            default: return '';
+        }
+    }
+
+    private refreshPatchTable(): void {
+        const tbl = document.getElementById('patch-table') as HTMLTableElement;
+        if (!tbl || !this.sim) return;
+        tbl.innerHTML = '';
+        const n       = this.sim.getNumTypes();
+        const patches = this.sim.getPatchCount();
+        for (let t = 0; t < n; t++) {
+            const row    = tbl.insertRow();
+            const swCell = row.insertCell();
+            const swatch = document.createElement('span');
+            swatch.className = 'mass-swatch';
+            swatch.style.background = TYPE_HEX[t];
+            swCell.appendChild(swatch);
+
+            const labelCell = row.insertCell();
+            labelCell.textContent = TYPE_LABELS[t];
+            labelCell.style.color = TYPE_HEX[t];
+
+            const inputCell = row.insertCell();
+            const inp = document.createElement('input');
+            inp.type  = 'number';
+            inp.min   = '0'; inp.max = '6'; inp.step = '1';
+            inp.value = String(patches[t] ?? 0);
+
+            const hintCell = row.insertCell();
+            hintCell.style.fontSize = '9px';
+            hintCell.style.color    = '#555';
+            hintCell.textContent    = this.patchHint(patches[t] ?? 0);
+
+            inp.addEventListener('change', () => {
+                let v = Math.max(0, Math.min(6, Math.round(Number(inp.value))));
+                if (v === 1) v = 2;  // single patch is degenerate
+                inp.value = String(v);
+                this.sim?.setPatchCount(t, v);
+                hintCell.textContent = this.patchHint(v);
+            });
+            inputCell.appendChild(inp);
+        }
+    }
+
     private buildPolePanel(): void {
         const list = document.getElementById('pole-list')!;
         list.innerHTML = '';
@@ -1565,7 +1651,7 @@ class ParticleLifeApp {
         document.getElementById('speedValue')!.textContent = `${this.sim.getParams().simulationSpeed.toFixed(1)}×`;
         document.getElementById('particleCountDisplay')!.textContent = String(this.sim.getParams().particleCount);
 
-        const simMode  = this.sim.getSimMode()  as 0 | 1 | 2;
+        const simMode  = this.sim.getSimMode()  as 0 | 1 | 2 | 3;
         const edgeMode = this.sim.getEdgeMode() as 0 | 1;
         this.setSimMode(simMode);
         document.getElementById('edgeLoopBtn')!.classList.toggle('selected', edgeMode === 0);
@@ -1601,6 +1687,19 @@ class ParticleLifeApp {
         const maxTransform = this.sim.getMaxTransformRate();
         (document.getElementById('maxTransformSlider') as HTMLInputElement).value = String(maxTransform);
         document.getElementById('maxTransformValue')!.textContent = maxTransform.toFixed(2);
+
+        const pp = this.sim.getPatchParams();
+        const setSlider = (id: string, valId: string, v: number, txt: string) => {
+            (document.getElementById(id) as HTMLInputElement).value = String(v);
+            document.getElementById(valId)!.textContent = txt;
+        };
+        setSlider('patchStrengthSlider', 'patchStrengthValue', pp.bondStrength, pp.bondStrength.toFixed(2));
+        setSlider('patchRangeSlider',    'patchRangeValue',    pp.bondRange,    String(Math.round(pp.bondRange)));
+        setSlider('patchDistSlider',     'patchDistValue',     pp.bondDist,     String(Math.round(pp.bondDist)));
+        setSlider('patchWidthSlider',    'patchWidthValue',    pp.patchWidth,   String(pp.patchWidth));
+        setSlider('patchAngSlider',      'patchAngValue',      pp.angStiffness, pp.angStiffness.toFixed(2));
+        setSlider('patchAngFricSlider',  'patchAngFricValue',  pp.angFriction,  pp.angFriction.toFixed(2));
+        this.refreshPatchTable();
 
         this.refreshForceMatrices();
         this.refreshTransformMatrix();  // also calls buildPolePanel()

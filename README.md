@@ -7,6 +7,7 @@ A GPU-accelerated particle life simulator built on raw WebGPU compute shaders. S
 - **GPU Acceleration**: Uses WebGPU compute shaders for massive particle counts
 - **Real-time Interaction**: Particles interact based on attractive/repulsive forces
 - **Multiple Particle Types**: Support for different particle types with distinct behaviors
+- **Patchy / Directional Bonding (Patchy mode)**: Per-particle orientation and per-type valence patches form angle-selective bonds — chains, sheets and lattices instead of amorphous blobs
 - **Interactive Controls**: Adjust simulation parameters in real-time
 - **Performance Monitoring**: Built-in FPS counter and timing stats
 

@@ -198,6 +198,26 @@ export class ParticleSimulation {
     private poleBuffer: GPUBuffer | null = null;
     private poleWorldFrame = false;  // false = lobes anchored to velocity; true = anchored to world +x axis (3+ poles)
 
+    // ── Mode 3 (patchy particles / directional bonding) ─────────────────────────
+    // Per-particle orientation lives in a separate buffer (θ, ω) so the Particle
+    // struct stays 6 floats and every other mode is untouched. Each type exposes a
+    // valence: 0 = isotropic, 2-6 = that many bond patches spaced evenly around the
+    // particle. Two particles bond when a patch on each points at the other, which
+    // applies a radial spring (toward bondDist) plus a torque that aligns the patch.
+    private patchCount: number[] = Array(MAX_TYPES).fill(0);
+    private patchBondStrength = 0.6;   // radial spring stiffness for a fully-aligned bond
+    private patchBondRange    = 60;    // max centre-to-centre distance a bond can act over
+    private patchBondDist     = 26;    // preferred centre-to-centre bond distance (r0)
+    private patchAngStiffness = 0.3;   // torque strength aligning a patch to the bond axis
+    private patchAngFriction  = 0.8;   // angular-velocity damping per tick (lower = more damped)
+    private patchWidth        = 6;     // angular selectivity (higher = narrower patches)
+    private orientationBuffer:       GPUBuffer | null = null;
+    private sortedOrientationBuffer: GPUBuffer | null = null;
+    private patchConfigBuffer:       GPUBuffer | null = null;
+    private mode3BGL:                GPUBindGroupLayout | null = null;
+    private mode3Pipeline:           GPUComputePipeline | null = null;
+    private mode3BindGroup:          GPUBindGroup       | null = null;
+
     private isInitialized  = false;
     private isPaused       = false;
     private simulationTime = 0;
@@ -206,6 +226,7 @@ export class ParticleSimulation {
     // CPU-side data actually changes, instead of every frame.
     private forcesDirty    = true;
     private transformDirty = true;
+    private patchDirty     = true;
 
     constructor(canvas: HTMLCanvasElement) {
         this.canvas       = canvas;
@@ -279,6 +300,36 @@ export class ParticleSimulation {
         const data = new Uint32Array(MAX_TYPES);
         for (let i = 0; i < MAX_TYPES; i++) data[i] = Math.max(1, Math.min(8, this.typeMass[i] ?? 1));
         return data as Uint32Array<ArrayBuffer>;
+    }
+
+    // Mode 3 orientation: 2 floats per particle — angle θ (random) and angular
+    // velocity ω (0). Initialised once at full capacity so reset/spawn paths that
+    // only rewrite positions inherit valid random orientations for free.
+    private generateOrientationData(): Float32Array<ArrayBuffer> {
+        const data = new Float32Array(MAX_PARTICLE_CAPACITY * 2);
+        for (let i = 0; i < MAX_PARTICLE_CAPACITY; i++) {
+            data[i * 2]     = Math.random() * Math.PI * 2;
+            data[i * 2 + 1] = 0;
+        }
+        return data as Float32Array<ArrayBuffer>;
+    }
+
+    // Mode 3 patch config uniform: 8 leading floats of global params followed by
+    // the 20 per-type valence counts packed 4-per-vec4u (matches WGSL layout).
+    private generatePatchConfigData(): ArrayBuffer {
+        const ab  = new ArrayBuffer(8 * 4 + MAX_TYPES * 4);  // 32 + 80 = 112 bytes
+        const f32 = new Float32Array(ab);
+        const u32 = new Uint32Array(ab);
+        f32[0] = this.patchBondStrength;
+        f32[1] = this.patchBondRange;
+        f32[2] = this.patchBondDist;
+        f32[3] = this.patchAngStiffness;
+        f32[4] = this.patchAngFriction;
+        f32[5] = this.patchWidth;
+        for (let i = 0; i < MAX_TYPES; i++) {
+            u32[8 + i] = Math.max(0, Math.min(6, Math.round(this.patchCount[i] ?? 0)));
+        }
+        return ab;
     }
 
     // ── WebGPU init ───────────────────────────────────────────────────────────
@@ -448,6 +499,13 @@ export class ParticleSimulation {
         this.queue!.writeBuffer(this.typeMassBuffer, 0, this.generateTypeMassData());
 
         this.eraseParamBuffer = this.device!.createBuffer({ label: 'eraseParams', size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+        // Mode 3 (patchy) buffers
+        this.orientationBuffer = this.device!.createBuffer({ label: 'orientation', size: MAX_PARTICLE_CAPACITY * 2 * 4, usage: S });
+        this.queue!.writeBuffer(this.orientationBuffer, 0, this.generateOrientationData());
+        this.sortedOrientationBuffer = this.device!.createBuffer({ label: 'orientationSorted', size: MAX_PARTICLE_CAPACITY * 2 * 4, usage: GPUBufferUsage.STORAGE });
+        this.patchConfigBuffer = this.device!.createBuffer({ label: 'patchConfig', size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.queue!.writeBuffer(this.patchConfigBuffer, 0, this.generatePatchConfigData());
     }
 
     private async createPipelines(): Promise<void> {
@@ -484,11 +542,14 @@ export class ParticleSimulation {
         this.scatterPipeline        = mkCompute(this.getScatterShaderCode());
         this.computePipeline        = mkCompute(this.getComputeShaderCode());
 
-        // Reorder pass uses its own 3-buffer layout (particles, gridList, sorted out).
+        // Reorder pass uses its own layout. It cell-sorts the particle copy and, in
+        // lockstep, the per-particle orientation so Mode 3 can read both coherently.
         this.reorderBGL = this.device.createBindGroupLayout({ entries: [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // particles
             { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // gridList
             { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // sortedParticles
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // orientation
+            { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // sortedOrientation
         ]});
         this.reorderPipeline = this.device.createComputePipeline({
             layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.reorderBGL] }),
@@ -499,6 +560,8 @@ export class ParticleSimulation {
             { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
             { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
             { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+            { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } }, // orientation (Mode 3)
+            { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },           // patchConfig (Mode 3)
         ]});
         const renderPipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [renderLayout] });
         const renderModule = this.device.createShaderModule({ code: this.getRenderShaderCode() });
@@ -596,6 +659,26 @@ export class ParticleSimulation {
             compute: { module: this.device.createShaderModule({ code: this.getMode2TransformShaderCode() }), entryPoint: 'main' },
         });
 
+        // Mode 3 (patchy) physics pipeline — its own layout so it can carry the two
+        // orientation buffers without pushing the shared compute layout past the
+        // 8-storage-buffer limit. Reuses the grid + sorted-particle buffers.
+        this.mode3BGL = this.device.createBindGroupLayout({ entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // particles (rw)
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // sortedParticles
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // orientation (rw)
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // sortedOrientation
+            { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // forces
+            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // gridParams
+            { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellCount
+            { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellStart
+            { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // params
+            { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // patchConfig
+        ]});
+        this.mode3Pipeline = this.device.createComputePipeline({
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.mode3BGL] }),
+            compute: { module: this.device.createShaderModule({ code: this.getMode3ShaderCode() }), entryPoint: 'main' },
+        });
+
         this.rebuildBindGroups();
     }
 
@@ -639,22 +722,26 @@ export class ParticleSimulation {
                 { binding: 9, resource: { buffer: this.typeMassBuffer        } },
             ],
         });
-        if (this.reorderBGL) {
+        if (this.reorderBGL && this.orientationBuffer && this.sortedOrientationBuffer) {
             this.reorderBindGroup = this.device.createBindGroup({
                 layout: this.reorderBGL,
                 entries: [
-                    { binding: 0, resource: { buffer: this.particleBuffer        } },
-                    { binding: 1, resource: { buffer: this.gridListBuffer        } },
-                    { binding: 2, resource: { buffer: this.particlesSortedBuffer } },
+                    { binding: 0, resource: { buffer: this.particleBuffer          } },
+                    { binding: 1, resource: { buffer: this.gridListBuffer          } },
+                    { binding: 2, resource: { buffer: this.particlesSortedBuffer   } },
+                    { binding: 3, resource: { buffer: this.orientationBuffer       } },
+                    { binding: 4, resource: { buffer: this.sortedOrientationBuffer } },
                 ],
             });
         }
         this.renderBindGroup = this.device.createBindGroup({
             layout: this.renderPipeline.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: { buffer: this.particleBuffer } },
-                { binding: 1, resource: { buffer: this.paramsBuffer   } },
-                { binding: 2, resource: { buffer: this.viewBuffer     } },
+                { binding: 0, resource: { buffer: this.particleBuffer    } },
+                { binding: 1, resource: { buffer: this.paramsBuffer      } },
+                { binding: 2, resource: { buffer: this.viewBuffer        } },
+                { binding: 3, resource: { buffer: this.orientationBuffer! } },
+                { binding: 4, resource: { buffer: this.patchConfigBuffer! } },
             ],
         });
 
@@ -731,6 +818,24 @@ export class ParticleSimulation {
                     { binding: 6, resource: { buffer: this.gridParamsBuffer!     } },
                     { binding: 7, resource: { buffer: this.typeMassBuffer        } },
                     { binding: 8, resource: { buffer: this.m2FrameCounterBuffer  } },
+                ],
+            });
+        }
+
+        if (this.mode3BGL && this.orientationBuffer && this.sortedOrientationBuffer && this.patchConfigBuffer) {
+            this.mode3BindGroup = this.device.createBindGroup({
+                layout: this.mode3BGL,
+                entries: [
+                    { binding: 0, resource: { buffer: this.particleBuffer          } },
+                    { binding: 1, resource: { buffer: this.particlesSortedBuffer   } },
+                    { binding: 2, resource: { buffer: this.orientationBuffer       } },
+                    { binding: 3, resource: { buffer: this.sortedOrientationBuffer } },
+                    { binding: 4, resource: { buffer: this.forcesBuffer            } },
+                    { binding: 5, resource: { buffer: this.gridParamsBuffer        } },
+                    { binding: 6, resource: { buffer: this.gridCellCountBuffer     } },
+                    { binding: 7, resource: { buffer: this.gridCellStartBuffer     } },
+                    { binding: 8, resource: { buffer: this.paramsBuffer            } },
+                    { binding: 9, resource: { buffer: this.patchConfigBuffer       } },
                 ],
             });
         }
@@ -872,14 +977,18 @@ export class ParticleSimulation {
     private getReorderShaderCode(): string {
         return /* wgsl */`
             struct Particle { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
-            @group(0) @binding(0) var<storage, read>       particles:       array<Particle>;
-            @group(0) @binding(1) var<storage, read>       gridList:        array<u32>;
-            @group(0) @binding(2) var<storage, read_write> sortedParticles: array<Particle>;
+            @group(0) @binding(0) var<storage, read>       particles:        array<Particle>;
+            @group(0) @binding(1) var<storage, read>       gridList:         array<u32>;
+            @group(0) @binding(2) var<storage, read_write> sortedParticles:  array<Particle>;
+            @group(0) @binding(3) var<storage, read>       orientation:       array<vec2f>;
+            @group(0) @binding(4) var<storage, read_write> sortedOrientation: array<vec2f>;
             @compute @workgroup_size(256)
             fn main(@builtin(global_invocation_id) id: vec3u) {
                 let k = id.x;
                 if (k >= arrayLength(&gridList)) { return; }
-                sortedParticles[k] = particles[gridList[k]];
+                let src = gridList[k];
+                sortedParticles[k]   = particles[src];
+                sortedOrientation[k] = orientation[src];
             }
         `;
     }
@@ -1143,6 +1252,8 @@ export class ParticleSimulation {
                 @location(1) color: vec4f,
                 @location(2) @interpolate(flat) glow:   f32,
                 @location(3) @interpolate(flat) typeId: f32,
+                @location(4) @interpolate(flat) spin:   f32,
+                @location(5) @interpolate(flat) patchN: f32,
             }
             // view: cx,cy,zoom, sat,glow,alpha, canvasW,canvasH, additiveStr,shapeMode,simTime,_p3  (48 B)
             struct View { cx:f32, cy:f32, zoom:f32, sat:f32, glow:f32, alpha:f32,
@@ -1151,9 +1262,17 @@ export class ParticleSimulation {
             struct SimParams { speed: f32, worldW: f32, worldH: f32, packed: f32,
                               friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
 
+            struct PatchConfig {
+                bondStrength: f32, bondRange: f32, bondDist: f32, angStiffness: f32,
+                angFriction: f32, patchWidth: f32, _p0: f32, _p1: f32,
+                patchCount: array<vec4u, 5>,
+            }
+
             @group(0) @binding(0) var<storage, read> particles: array<Particle>;
             @group(0) @binding(1) var<uniform>       params:    SimParams;
             @group(0) @binding(2) var<uniform>       view:      View;
+            @group(0) @binding(3) var<storage, read> orientation: array<vec2f>;
+            @group(0) @binding(4) var<uniform>       patchCfg:  PatchConfig;
 
             const COLORS = array<vec4f, 20>(
                 vec4f(1.00,0.13,0.13,1.0), vec4f(0.00,0.93,0.00,1.0),
@@ -1177,8 +1296,10 @@ export class ParticleSimulation {
                     var o: VOut;
                     o.pos = vec4f(2.0, 2.0, 2.0, 1.0);
                     o.uv = vec2f(0.0); o.color = vec4f(0.0); o.glow = 0.0; o.typeId = 0.0;
+                    o.spin = 0.0; o.patchN = 0.0;
                     return o;
                 }
+                let simMode3 = (u32(params.packed) & 0xFFu) == 3u;
                 let worldW = params.worldW;
                 let worldH = params.worldH;
                 let zoom   = view.zoom;
@@ -1199,6 +1320,9 @@ export class ParticleSimulation {
                 o.color  = mix(ownColor, vec4f(1.0, 1.0, 1.0, 1.0), whiteness);
                 o.glow   = view.glow;
                 o.typeId = p.typeId;
+                let tt   = u32(p.typeId);
+                o.spin   = select(0.0, orientation[inst].x, simMode3);
+                o.patchN = select(0.0, f32(patchCfg.patchCount[tt >> 2u][tt & 3u]), simMode3);
                 return o;
             }
 
@@ -1242,7 +1366,14 @@ export class ParticleSimulation {
 
             @fragment
             fn fragmentMain(i: VOut) -> @location(0) vec4f {
-                let d = select(length(i.uv), shapeDist(i.uv, u32(i.typeId)), view.shapeMode > 0.5);
+                // Mode 3: spin the sampling frame by the particle's orientation so the
+                // procedural shape (and its patch nubs) visibly rotate with θ.
+                var uv = i.uv;
+                if (i.patchN > 0.5) {
+                    let c = cos(i.spin); let s = sin(i.spin);
+                    uv = vec2f(c * i.uv.x - s * i.uv.y, s * i.uv.x + c * i.uv.y);
+                }
+                let d = select(length(uv), shapeDist(uv, u32(i.typeId)), view.shapeMode > 0.5);
 
                 let solidBright = max(0.0, 1.0 - d * 0.3);
                 let solidAlpha  = select(0.0, solidBright, d < 1.0);
@@ -1250,11 +1381,23 @@ export class ParticleSimulation {
                 let k         = mix(12.0, 1.8, i.glow);
                 let glowAlpha = exp(-d * d * k);
 
-                let alpha = mix(solidAlpha, glowAlpha, i.glow) * view.alpha;
+                var alpha = mix(solidAlpha, glowAlpha, i.glow) * view.alpha;
+
+                // Patch nubs: bright lobes at each valence direction near the rim.
+                var patchBoost = 0.0;
+                if (i.patchN > 0.5) {
+                    let ang  = atan2(uv.y, uv.x);
+                    let step = 6.28318530718 / i.patchN;
+                    let pa   = round(ang / step) * step;
+                    let nub  = pow(max(cos(ang - pa), 0.0), 16.0);
+                    let ring = smoothstep(0.45, 0.85, d) * (1.0 - smoothstep(1.0, 1.25, d));
+                    patchBoost = nub * ring;
+                    alpha = max(alpha, patchBoost * 0.95 * view.alpha);
+                }
                 if (alpha < 0.004) { discard; }
 
                 let lum = dot(i.color.rgb, vec3f(0.299, 0.587, 0.114));
-                let col = mix(vec3f(lum), i.color.rgb, view.sat);
+                let col = mix(vec3f(lum), i.color.rgb, view.sat) + vec3f(patchBoost) * 0.7;
                 return vec4f(col * alpha * view.additiveStr, alpha);
             }
         `;
@@ -1633,6 +1776,177 @@ export class ParticleSimulation {
         `;
     }
 
+    // Mode 3: patchy particles. On top of the usual isotropic type-pair force this
+    // adds directional "patch" bonds. Each type has a valence (patchCount) of evenly
+    // spaced patches fixed to its orientation. Two particles bond when a patch on
+    // each points at the other; the bond is a radial spring toward bondDist plus a
+    // torque that rotates each particle so its patch locks onto the bond axis. The
+    // result is angle-selective coordination — chains, rings and lattices instead of
+    // amorphous blobs. Orientation lives in its own buffer (θ, ω); the Particle
+    // struct is untouched.
+    private getMode3ShaderCode(): string {
+        return /* wgsl */`
+            struct Particle   { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
+            struct ForceEntry { strength: f32, radius: f32, minRadius: f32 }
+            struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
+            struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
+                                friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+            struct PatchConfig {
+                bondStrength: f32, bondRange: f32, bondDist: f32, angStiffness: f32,
+                angFriction: f32, patchWidth: f32, _p0: f32, _p1: f32,
+                patchCount: array<vec4u, 5>,
+            }
+
+            @group(0) @binding(0) var<storage, read_write> particles:         array<Particle>;
+            @group(0) @binding(1) var<storage, read>       sortedParticles:   array<Particle>;
+            @group(0) @binding(2) var<storage, read_write> orientation:        array<vec2f>;
+            @group(0) @binding(3) var<storage, read>       sortedOrientation:  array<vec2f>;
+            @group(0) @binding(4) var<storage, read>       forces:            array<ForceEntry>;
+            @group(0) @binding(5) var<storage, read>       gridParams:        GridParams;
+            @group(0) @binding(6) var<storage, read>       cellCount:         array<u32>;
+            @group(0) @binding(7) var<storage, read>       cellStart:         array<u32>;
+            @group(0) @binding(8) var<uniform>             params:            SimParams;
+            @group(0) @binding(9) var<uniform>             cfg:               PatchConfig;
+
+            fn patchN(t: u32) -> u32 { return cfg.patchCount[t >> 2u][t & 3u]; }
+
+            const TAU = 6.28318530718;
+
+            // Best alignment of any of n evenly-spaced patches (first at angle base)
+            // with the target direction aim. Returns the largest cos(patch - aim) in
+            // .x and the angle of that best patch in .y.
+            fn bestPatch(base: f32, n: u32, aim: f32) -> vec2f {
+                let step = TAU / f32(n);
+                var bestAl  = -2.0;
+                var bestAng = base;
+                for (var i: u32 = 0u; i < n; i++) {
+                    let ang = base + f32(i) * step;
+                    let al  = cos(ang - aim);
+                    if (al > bestAl) { bestAl = al; bestAng = ang; }
+                }
+                return vec2f(bestAl, bestAng);
+            }
+
+            @compute @workgroup_size(256)
+            fn main(@builtin(global_invocation_id) id: vec3u) {
+                let idx = id.x;
+                if (idx >= arrayLength(&particles)) { return; }
+
+                let speed    = params.speed;
+                let width    = params.worldW;
+                let height   = params.worldH;
+                let packed   = u32(params.packed);
+                let edgeMode = (packed >> 8u) & 0xFFu;
+
+                var p = particles[idx];
+                if (p.typeId < 0.0) { return; }
+                let myType   = u32(p.typeId);
+                let myPatch  = patchN(myType);
+                let ori      = orientation[idx];
+                let myTheta  = ori.x;
+                var myOmega  = ori.y;
+
+                var accel  = vec2f(0.0);
+                var torque = 0.0;
+
+                let gw   = i32(gridParams.gridW);
+                let gh   = i32(gridParams.gridH);
+                let cs   = gridParams.cellSize;
+                let myGx = clamp(i32(p.pos.x / cs), 0, gw - 1);
+                let myGy = clamp(i32(p.pos.y / cs), 0, gh - 1);
+
+                for (var goy = -1; goy <= 1; goy++) {
+                    for (var gox = -1; gox <= 1; gox++) {
+                        var ngx = myGx + gox;
+                        var ngy = myGy + goy;
+                        if (edgeMode == 0u) {
+                            ngx = ((ngx % gw) + gw) % gw;
+                            ngy = ((ngy % gh) + gh) % gh;
+                        } else {
+                            if (ngx < 0 || ngx >= gw || ngy < 0 || ngy >= gh) { continue; }
+                        }
+                        let cell  = u32(ngy) * gridParams.gridW + u32(ngx);
+                        let start = cellStart[cell];
+                        let end   = start + cellCount[cell];
+                        for (var k = start; k < end; k++) {
+                            let other = sortedParticles[k];
+                            if (other.typeId < 0.0) { continue; }
+                            let otherType = u32(other.typeId);
+
+                            var dx = other.pos.x - p.pos.x;
+                            var dy = other.pos.y - p.pos.y;
+                            if (edgeMode == 0u) {
+                                if (dx >  width  * 0.5) { dx -= width;  }
+                                if (dx < -width  * 0.5) { dx += width;  }
+                                if (dy >  height * 0.5) { dy -= height; }
+                                if (dy < -height * 0.5) { dy += height; }
+                            }
+                            let dist = sqrt(dx * dx + dy * dy);
+                            if (dist < 0.1) { continue; }
+                            let dir = vec2f(dx, dy) / dist;
+
+                            // Isotropic background force (same curve as the classic mode).
+                            let f     = forces[myType * 20u + otherType];
+                            let range = f.radius - f.minRadius;
+                            if (dist >= f.minRadius && dist <= f.radius && range > 0.0) {
+                                let norm = (dist - f.minRadius) / range;
+                                var mag: f32;
+                                if (norm < 0.3) { mag = (norm / 0.3 - 1.0); }
+                                else            { mag = f.strength * (1.0 - abs(1.0 - norm) / 0.7); }
+                                accel += dir * mag * 0.1;
+                            }
+
+                            // Directional patch bond.
+                            let otherPatch = patchN(otherType);
+                            if (myPatch > 0u && otherPatch > 0u && dist <= cfg.bondRange) {
+                                let axis      = atan2(dy, dx);          // me -> other
+                                let mine      = bestPatch(myTheta, myPatch, axis);
+                                let oTheta    = sortedOrientation[k].x;
+                                let theirs    = bestPatch(oTheta, otherPatch, axis + 3.14159265359);
+                                let mAl       = max(mine.x,   0.0);
+                                let oAl       = max(theirs.x, 0.0);
+                                let bond      = pow(mAl, cfg.patchWidth) * pow(oAl, cfg.patchWidth);
+                                if (bond > 0.0001) {
+                                    // Radial spring toward bondDist (normalised by range).
+                                    let disp = (dist - cfg.bondDist) / cfg.bondRange;
+                                    accel  += dir * cfg.bondStrength * bond * disp;
+                                    // Torque: rotate my best patch onto the bond axis.
+                                    torque += cfg.angStiffness * bond * sin(axis - mine.y);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let fric = pow(params.friction, speed);
+                p.vel = p.vel * fric + accel * speed;
+                p.pos = p.pos + p.vel;
+
+                if (edgeMode == 0u) {
+                    if (p.pos.x < 0.0)    { p.pos.x += width;  }
+                    if (p.pos.x > width)  { p.pos.x -= width;  }
+                    if (p.pos.y < 0.0)    { p.pos.y += height; }
+                    if (p.pos.y > height) { p.pos.y -= height; }
+                } else {
+                    if (p.pos.x < 0.0)    { p.pos.x = 0.0;    p.vel.x =  abs(p.vel.x) * 0.5; }
+                    if (p.pos.x > width)  { p.pos.x = width;  p.vel.x = -abs(p.vel.x) * 0.5; }
+                    if (p.pos.y < 0.0)    { p.pos.y = 0.0;    p.vel.y =  abs(p.vel.y) * 0.5; }
+                    if (p.pos.y > height) { p.pos.y = height; p.vel.y = -abs(p.vel.y) * 0.5; }
+                }
+
+                // Integrate orientation; keep θ wrapped to avoid float drift.
+                let angFric = pow(cfg.angFriction, speed);
+                myOmega = myOmega * angFric + torque * speed;
+                var theta = myTheta + myOmega * speed;
+                theta = theta - TAU * round(theta / TAU);
+
+                p._pad = 0.0;
+                particles[idx]   = p;
+                orientation[idx] = vec2f(theta, myOmega);
+            }
+        `;
+    }
+
     // ── Public API ────────────────────────────────────────────────────────────
 
     update(): void {
@@ -1657,6 +1971,10 @@ export class ParticleSimulation {
         if (this.transformDirty) {
             this.queue.writeBuffer(this.transformBuffer!, 0, this.generateTransformData());
             this.transformDirty = false;
+        }
+        if (this.patchDirty) {
+            this.queue.writeBuffer(this.patchConfigBuffer!, 0, this.generatePatchConfigData());
+            this.patchDirty = false;
         }
 
         if (!this.isPaused) {
@@ -1700,8 +2018,16 @@ export class ParticleSimulation {
             reorderCp.end();
 
             const forceCp = enc.beginComputePass();
-            forceCp.setPipeline(this.computePipeline!);
-            forceCp.setBindGroup(0, this.forceBindGroup!);
+            if (this.simMode === 3 && this.mode3Pipeline && this.mode3BindGroup) {
+                // Mode 3: patchy physics replaces the classic force pass. It reads the
+                // same cell-sorted neighbours plus their orientation and writes back
+                // position, velocity and orientation in one kernel.
+                forceCp.setPipeline(this.mode3Pipeline);
+                forceCp.setBindGroup(0, this.mode3BindGroup);
+            } else {
+                forceCp.setPipeline(this.computePipeline!);
+                forceCp.setBindGroup(0, this.forceBindGroup!);
+            }
             forceCp.dispatchWorkgroups(Math.ceil(N / 256));
             forceCp.end();
 
@@ -2051,9 +2377,48 @@ export class ParticleSimulation {
         this.simulationTime = 0;
     }
 
-    setSimMode(mode: 0 | 1 | 2): void { this.simMode = mode; }
+    setSimMode(mode: 0 | 1 | 2 | 3): void { this.simMode = mode; }
     getEdgeMode():    number    { return this.edgeMode; }
     getSimMode():     number    { return this.simMode; }
+
+    // ── Mode 3 (patchy) controls ────────────────────────────────────────────────
+    setPatchCount(typeIdx: number, count: number): void {
+        if (typeIdx < 0 || typeIdx >= MAX_TYPES) return;
+        const c = Math.max(0, Math.min(6, Math.round(count)));
+        this.patchCount[typeIdx] = c === 1 ? 2 : c;  // a single patch is degenerate; bump to 2
+        this.patchDirty = true;
+    }
+    getPatchCount(): number[] { return this.patchCount.slice(0, this.numTypes); }
+
+    randomizePatches(): void {
+        // Bias toward small chemistry-like valences: mostly 2 (chains) and 3-4
+        // (sheets/lattices), with the occasional isotropic 0.
+        const choices = [0, 2, 2, 3, 3, 4, 4, 6];
+        for (let t = 0; t < this.numTypes; t++) {
+            this.patchCount[t] = choices[Math.floor(Math.random() * choices.length)];
+        }
+        this.patchDirty = true;
+    }
+
+    setPatchParams(p: Partial<{
+        bondStrength: number; bondRange: number; bondDist: number;
+        angStiffness: number; angFriction: number; patchWidth: number;
+    }>): void {
+        if (p.bondStrength != null) this.patchBondStrength = Math.max(0,   Math.min(2,   p.bondStrength));
+        if (p.bondRange    != null) this.patchBondRange    = Math.max(5,   Math.min(200, p.bondRange));
+        if (p.bondDist     != null) this.patchBondDist     = Math.max(2,   Math.min(150, p.bondDist));
+        if (p.angStiffness != null) this.patchAngStiffness = Math.max(0,   Math.min(2,   p.angStiffness));
+        if (p.angFriction  != null) this.patchAngFriction  = Math.max(0.5, Math.min(0.99, p.angFriction));
+        if (p.patchWidth   != null) this.patchWidth        = Math.max(1,   Math.min(20,  p.patchWidth));
+        this.patchDirty = true;
+    }
+    getPatchParams() {
+        return {
+            bondStrength: this.patchBondStrength, bondRange: this.patchBondRange,
+            bondDist:     this.patchBondDist,     angStiffness: this.patchAngStiffness,
+            angFriction:  this.patchAngFriction,  patchWidth: this.patchWidth,
+        };
+    }
 
     setTypeMass(typeIdx: number, mass: number): void {
         if (typeIdx < 0 || typeIdx >= MAX_TYPES) return;
@@ -2359,6 +2724,7 @@ export class ParticleSimulation {
             signBits:  this.poleConfigs[t] >> 4,
         }));
         const masses = Array.from({ length: n }, (_, t) => this.typeMass[t] ?? 1);
+        const patches = Array.from({ length: n }, (_, t) => this.patchCount[t] ?? 0);
         return {
             version:          3,
             numTypes:         n,
@@ -2382,6 +2748,8 @@ export class ParticleSimulation {
             transformRules:   tr,
             poleConfigs:      poles,
             typeMass:         masses,
+            patchCount:       patches,
+            patchParams:      this.getPatchParams(),
         };
     }
 
@@ -2390,7 +2758,7 @@ export class ParticleSimulation {
         this.numTypes = n;
 
         if (state.simulationSpeed != null) this.params.simulationSpeed = Number(state.simulationSpeed);
-        if (state.simMode  != null) this.simMode  = Number(state.simMode)  as 0 | 1 | 2;
+        if (state.simMode  != null) this.simMode  = Number(state.simMode)  as 0 | 1 | 2 | 3;
         if (state.edgeMode != null) this.edgeMode = Number(state.edgeMode) as 0 | 1;
         if (state.poleWorldFrame != null) this.poleWorldFrame = Boolean(state.poleWorldFrame);
 
@@ -2455,6 +2823,14 @@ export class ParticleSimulation {
                 if (pc) this.poleConfigs[t] = (Number(pc.poleCount) & 0xF) | ((Number(pc.signBits) & 0x3F) << 4);
             }
         }
+        if (Array.isArray(state.patchCount)) {
+            for (let t = 0; t < n; t++) {
+                const c = state.patchCount[t];
+                if (c != null) this.patchCount[t] = Math.max(0, Math.min(6, Math.round(Number(c))));
+            }
+        }
+        if (state.patchParams) this.setPatchParams(state.patchParams);
+        this.patchDirty = true;
 
         if (!this.isInitialized || !this.queue) return;
         this.queue.writeBuffer(this.particleBuffer!,  0, this.generateParticleData());
