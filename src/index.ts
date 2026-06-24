@@ -94,6 +94,7 @@ class ParticleLifeApp {
     // ── Photo export selection ────────────────────────────────────────────────
     private photoSelMode     = false;   // armed: dragging a region to export
     private photoSelDragging = false;
+    private photoSelDidPause  = false;  // true if entering select mode paused the sim (so release can resume)
     private photoSelBox: { sx0: number; sy0: number; sx1: number; sy1: number } | null = null;
 
     constructor() {
@@ -797,6 +798,9 @@ class ParticleLifeApp {
                     const r = this.clientBoxToCanvasRect(box);
                     if (r.w >= 1 && r.h >= 1) this.exportSelection(box);
                 }
+                // Releasing the selection square resumes the sim (unless it was
+                // already paused before entering select mode).
+                this.resumeAfterPhotoPause();
             }
             if (e.button === 0 && this.selBoxActive && this.trackMode === 'selecting') {
                 this.selBoxActive = false;
@@ -964,6 +968,14 @@ class ParticleLifeApp {
         if (this.inspectMode) this.stopInspect();
         this.photoSelMode = true;
         this.photoSelBox  = null;
+        // Freeze the frame so the user can compose a selection; remember if it was
+        // already paused so we don't resume something they paused themselves.
+        this.photoSelDidPause = false;
+        if (this.sim && !this.sim.isPaused_()) {
+            this.sim.togglePause();
+            this.photoSelDidPause = true;
+            this.syncPauseButton();
+        }
         this.syncPhotoSelButton();
         this.syncCanvasCursor();
     }
@@ -972,8 +984,18 @@ class ParticleLifeApp {
         this.photoSelMode     = false;
         this.photoSelDragging = false;
         this.photoSelBox      = null;
+        this.resumeAfterPhotoPause();
         this.syncPhotoSelButton();
         this.syncCanvasCursor();
+    }
+
+    // Resume the sim only if entering select mode is what paused it.
+    private resumeAfterPhotoPause(): void {
+        if (this.photoSelDidPause && this.sim?.isPaused_()) {
+            this.sim.togglePause();
+            this.syncPauseButton();
+        }
+        this.photoSelDidPause = false;
     }
 
     private syncPhotoSelButton(): void {
