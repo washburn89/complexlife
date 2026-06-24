@@ -2050,8 +2050,10 @@ export class ParticleSimulation {
             this.simulationTime += 0.016;
         }
 
-        // Entity tracking passes (run every frame so CoM updates even while paused)
-        if (this.isTracking && this.trackingBindGroup && this.clearTrackPipeline && this.accumTrackPipeline) {
+        // Entity tracking passes. Skipped while paused so a paused frame is truly
+        // frozen — otherwise the camera keeps re-centring on the tracked entity
+        // (e.g. when composing a photo-export selection) and the scene looks live.
+        if (this.isTracking && !this.isPaused && this.trackingBindGroup && this.clearTrackPipeline && this.accumTrackPipeline) {
             this.queue.writeBuffer(this.trackingParamBuffer!, 0, new Float32Array([
                 this.trackComX, this.trackComY, this.trackRadius, 1.0,
             ]));
@@ -2100,7 +2102,7 @@ export class ParticleSimulation {
         rp.draw(6, this.params.particleCount);
         rp.end();
 
-        const doReadback = this.isTracking && !this.trackReadPending;
+        const doReadback = this.isTracking && !this.trackReadPending && !this.isPaused;
         if (doReadback) {
             enc.copyBufferToBuffer(this.trackingStatsBuffer!, 0, this.trackingStagingBuffer!, 0, 16);
         }

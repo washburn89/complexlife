@@ -128,7 +128,7 @@
         .tab-btn:hover { color: var(--text-dim); background: transparent; }
         .tab-btn.active { color: var(--accent-bright); border-bottom-color: var(--accent); background: transparent; }
 
-        #tab-content { flex: 1; overflow-y: auto; overflow-x: auto; padding: 14px; }
+        #tab-content { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 14px; }
         .tab-pane { display: none; }
         .tab-pane.active { display: block; }
 
@@ -141,9 +141,13 @@
         .pane-head span { font-weight: 400; font-size: 9.5px; color: var(--text-faint); letter-spacing: 0; }
 
         /* ── Matrix tables ─────────────────────────────────────────────────── */
-        .matrix-wrap { overflow-x: auto; }
+        /* Wide matrices (up to 20 types) scroll horizontally inside the fixed-width
+           panel. max-width pins the wrap to the panel so the table can't push the
+           layout wider with no way to reach the right-hand columns; padding-bottom
+           leaves room for the horizontal scrollbar so it's always visible. */
+        .matrix-wrap { overflow-x: auto; overflow-y: hidden; max-width: 100%; padding-bottom: 4px; }
         .matrix-label { font-size: 10px; color: var(--text-faint); margin-bottom: 6px; }
-        table.matrix { border-collapse: collapse; font-size: 9px; }
+        table.matrix { border-collapse: collapse; font-size: 9px; width: max-content; }
         table.matrix th {
             padding: 2px 3px; text-align: center; font-weight: normal;
             color: var(--text-dim); white-space: nowrap;
