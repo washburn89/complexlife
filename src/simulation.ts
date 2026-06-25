@@ -2214,7 +2214,7 @@ export class ParticleSimulation {
                     for (var c: u32 = 0u; c < nClause; c++) {
                         let cOff   = myType * stride + 1u + c * 4u;
                         let chead  = dnf.d[cOff];
-                        let target = chead.x;
+                        let tgt    = chead.x;
                         let nLit   = chead.y;
                         var ok = nLit > 0u;             // empty clause never fires
                         for (var l: u32 = 0u; l < nLit; l++) {
@@ -2227,7 +2227,7 @@ export class ParticleSimulation {
                         if (ok) {
                             fired = 1.0;
                             if (newType < 0 && rand01(baseSeed ^ uhash(c * 7u + 13u)) < params.maxRate) {
-                                newType = i32(target);
+                                newType = i32(tgt);
                             }
                         }
                     }
