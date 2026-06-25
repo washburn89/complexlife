@@ -215,6 +215,10 @@ class ParticleLifeApp {
         document.getElementById('mode4-btn')!.addEventListener('click', () => this.setSimMode(4));
 
         // Per-matrix randomize buttons
+        document.getElementById('randomizeBondingBtn')!.addEventListener('click', () => {
+            this.sim?.randomizeBonding();
+            this.refreshForceMatrices();
+        });
         document.getElementById('randomizeStrengthBtn')!.addEventListener('click', () => {
             this.sim?.randomizeStrengths();
             this.refreshForceMatrices();

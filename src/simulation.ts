@@ -2684,6 +2684,12 @@ export class ParticleSimulation {
 
     randomizeForces(): void { this.initializeForceMatrix(); }
 
+    randomizeBonding(): void {
+        this.randomizeStrengths();
+        this.randomizeMaxRadii();
+        this.randomizeMinRadii();
+    }
+
     randomizeStrengths(): void {
         for (let from = 0; from < MAX_TYPES; from++)
             for (let to = 0; to < MAX_TYPES; to++) {
