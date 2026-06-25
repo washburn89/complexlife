@@ -323,6 +323,29 @@
             -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
         }
         #tool-popover.visible { display: flex; }
+
+        /* Split control: "Randomize" action + caret that opens the checklist */
+        .dock-split { display: inline-flex; align-items: stretch; gap: 0; }
+        .dock-split #randomizeNowBtn  { border-top-right-radius: 0; border-bottom-right-radius: 0; padding-right: 8px; }
+        .dock-split #randomizeMenuBtn { border-top-left-radius: 0; border-bottom-left-radius: 0; padding: 7px 7px; font-size: 9px; }
+        .dock-caret.active { background: var(--accent-tint); border-color: var(--accent-line); color: var(--accent-bright); }
+
+        #randomize-popover {
+            position: fixed; z-index: 130; display: none; flex-direction: column;
+            min-width: 168px; padding: 10px 12px; gap: 8px;
+            background: var(--panel-strong); border: 1px solid var(--border-hi);
+            border-radius: 11px; box-shadow: 0 8px 30px rgba(0,0,0,0.55);
+            -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+        }
+        #randomize-popover.visible { display: flex; }
+        #randomize-list { display: flex; flex-direction: column; gap: 2px; }
+        .rnd-row {
+            display: flex; align-items: center; gap: 8px; cursor: pointer;
+            font-size: 11px; color: var(--text-dim); padding: 4px 5px; border-radius: 6px;
+        }
+        .rnd-row:hover { background: var(--elev-hi); color: var(--text); }
+        .rnd-row input { accent-color: var(--accent); cursor: pointer; }
+
         .cpanel-section { display: flex; flex-direction: column; gap: 6px; }
         .cpanel-label { font-size: 9px; color: var(--text-faint); font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; }
         .cpanel-slider { width: 100%; accent-color: var(--accent); }
@@ -436,9 +459,6 @@
         <div id="tab-content">
             <!-- ── Forces ──────────────────────────────────────────────── -->
             <div id="pane-forces" class="tab-pane active">
-                <div class="btn-row" style="margin-bottom:12px">
-                    <button id="randomizeBondingBtn">Randomize all</button>
-                </div>
                 <div class="pane-head">Strength <span>row = from · col = to · click a cell</span></div>
                 <div class="btn-row" style="margin-bottom:8px">
                     <button id="randomizeStrengthBtn">Randomize strength</button>
@@ -480,6 +500,7 @@
                     </p>
                     <div class="btn-row" style="margin-bottom:8px;">
                         <button id="randomizePatchesBtn">Randomize valences</button>
+                        <button id="randomizeBondingBtn">Randomize bonding</button>
                     </div>
                     <p class="matrix-label">Valence (patches) per type</p>
                     <table class="mass-table" id="patch-table"></table>
@@ -772,6 +793,10 @@
     <div id="bottom-bar">
         <button id="pauseBtn"     class="dock-btn" title="Pause / Resume (Space)">&#9646;&#9646; Pause</button>
         <button id="resetBtn"     class="dock-btn" title="Reset particles to random positions"><span class="dock-ico">&#10227;</span> Reset</button>
+        <span class="dock-split">
+            <button id="randomizeNowBtn"  class="dock-btn" title="Randomize the selected settings"><span class="dock-ico">&#127922;</span> Randomize</button>
+            <button id="randomizeMenuBtn" class="dock-btn dock-caret" title="Choose what to randomize">&#9652;</button>
+        </span>
         <span class="dock-sep"></span>
         <button id="ctool-grab"   class="dock-btn" title="Grab — drag to pan the view"><span class="dock-ico">&#9995;</span> Grab</button>
         <button id="ctool-force"  class="dock-btn" title="Force — push (left) / pull (right) particles"><span class="dock-ico">&#9889;</span> Force</button>
@@ -808,6 +833,13 @@
             <input type="range" class="cpanel-slider" id="paintRateSlider" min="1" max="100" step="1" value="10">
             <span class="cpanel-val" id="paintRateVal">10</span>
         </div>
+    </div>
+
+    <!-- Master-randomize checklist (positioned above the dock button) -->
+    <div id="randomize-popover">
+        <div class="cpanel-label">Randomize which</div>
+        <div id="randomize-list"></div>
+        <div class="cpanel-hint">Only choices for the current behavior are shown.</div>
     </div>
 
     <!-- Particle inspector panel (right side) -->

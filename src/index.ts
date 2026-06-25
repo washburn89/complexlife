@@ -90,6 +90,28 @@ class ParticleLifeApp {
     private cursorMouseY          = -9999;
     private cursorMouseButtons    = 0;   // bitmask: bit 0 = left, bit 2 = right
 
+    // ── Master randomize ──────────────────────────────────────────────────────
+    // Which categories the master Randomize button affects. `modes: null` = always
+    // shown (forces); otherwise only when the current sim mode is in the list.
+    private readonly randomizeCats: {
+        key: string; label: string; modes: number[] | null;
+        run: () => void; refresh: 'forces' | 'transform' | 'poles' | 'masses' | 'valences' | 'bonding';
+    }[] = [
+        { key: 'strength',  label: 'Force strength', modes: null,      run: () => this.sim!.randomizeStrengths(),     refresh: 'forces' },
+        { key: 'maxRadius', label: 'Max radius',     modes: null,      run: () => this.sim!.randomizeMaxRadii(),      refresh: 'forces' },
+        { key: 'minRadius', label: 'Min radius',     modes: null,      run: () => this.sim!.randomizeMinRadii(),      refresh: 'forces' },
+        { key: 'transform', label: 'Transform rules', modes: [1, 2, 4], run: () => this.sim!.randomizeTransformRules(), refresh: 'transform' },
+        { key: 'poles',     label: 'Poles',          modes: [1, 2],    run: () => this.sim!.randomizePoles(),         refresh: 'poles' },
+        { key: 'masses',    label: 'Masses',         modes: [2],       run: () => this.sim!.randomizeMasses(),        refresh: 'masses' },
+        { key: 'valences',  label: 'Valences',       modes: [3, 4],    run: () => this.sim!.randomizePatches(),       refresh: 'valences' },
+        { key: 'bonding',   label: 'Bonding',        modes: [3, 4],    run: () => this.sim!.randomizePatchParams(),   refresh: 'bonding' },
+    ];
+    // Default selection — minRadius and poles off, as those are rarely wanted.
+    private randomizeSel: Record<string, boolean> = {
+        strength: true, maxRadius: true, minRadius: false,
+        transform: true, poles: false, masses: true, valences: true, bonding: true,
+    };
+
     // ── Photo export selection ────────────────────────────────────────────────
     private photoSelMode     = false;   // armed: dragging a region to export
     private photoSelDragging = false;
@@ -215,10 +237,6 @@ class ParticleLifeApp {
         document.getElementById('mode4-btn')!.addEventListener('click', () => this.setSimMode(4));
 
         // Per-matrix randomize buttons
-        document.getElementById('randomizeBondingBtn')!.addEventListener('click', () => {
-            this.sim?.randomizeBonding();
-            this.refreshForceMatrices();
-        });
         document.getElementById('randomizeStrengthBtn')!.addEventListener('click', () => {
             this.sim?.randomizeStrengths();
             this.refreshForceMatrices();
@@ -246,6 +264,25 @@ class ParticleLifeApp {
         document.getElementById('randomizePatchesBtn')!.addEventListener('click', () => {
             this.sim?.randomizePatches();
             this.refreshPatchTable();
+        });
+        document.getElementById('randomizeBondingBtn')!.addEventListener('click', () => {
+            this.sim?.randomizePatchParams();
+            this.syncPatchSliders();
+        });
+
+        // Master randomize: action button + caret that opens the checklist.
+        document.getElementById('randomizeNowBtn')!.addEventListener('click', () => this.runMasterRandomize());
+        document.getElementById('randomizeMenuBtn')!.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.toggleRandomizeMenu();
+        });
+        // Click anywhere else closes the menu.
+        document.addEventListener('click', (e) => {
+            const pop = document.getElementById('randomize-popover');
+            const caret = document.getElementById('randomizeMenuBtn');
+            if (!pop || !pop.classList.contains('visible')) return;
+            if (pop.contains(e.target as Node) || caret?.contains(e.target as Node)) return;
+            this.toggleRandomizeMenu(false);
         });
         const patchSlider = (id: string, valId: string, key:
             'bondStrength' | 'bondRange' | 'bondDist' | 'angStiffness' | 'angFriction' | 'patchWidth',
@@ -986,6 +1023,69 @@ class ParticleLifeApp {
         pop.style.bottom = `${window.innerHeight - a.top + 8}px`;
     }
 
+    // ── Master randomize ──────────────────────────────────────────────────────
+
+    private toggleRandomizeMenu(show?: boolean): void {
+        const pop = document.getElementById('randomize-popover');
+        const caret = document.getElementById('randomizeMenuBtn');
+        if (!pop) return;
+        const visible = show ?? !pop.classList.contains('visible');
+        if (visible) this.buildRandomizeMenu();
+        pop.classList.toggle('visible', visible);
+        caret?.classList.toggle('active', visible);
+        if (visible) {
+            const anchor = document.getElementById('randomizeNowBtn');
+            if (anchor) {
+                const a = anchor.getBoundingClientRect();
+                const popW = pop.offsetWidth || 180;
+                let left = a.left + a.width / 2 - popW / 2;
+                left = Math.max(8, Math.min(window.innerWidth - popW - 8, left));
+                pop.style.left   = `${left}px`;
+                pop.style.bottom = `${window.innerHeight - a.top + 8}px`;
+            }
+        }
+    }
+
+    // Rebuild the checklist showing only categories relevant to the current mode.
+    private buildRandomizeMenu(): void {
+        const list = document.getElementById('randomize-list');
+        if (!list) return;
+        list.innerHTML = '';
+        const mode = this.sim?.getSimMode() ?? 0;
+        for (const cat of this.randomizeCats) {
+            if (cat.modes !== null && !cat.modes.includes(mode)) continue;
+            const row = document.createElement('label');
+            row.className = 'rnd-row';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = this.randomizeSel[cat.key];
+            cb.addEventListener('change', () => { this.randomizeSel[cat.key] = cb.checked; });
+            row.appendChild(cb);
+            row.appendChild(document.createTextNode(cat.label));
+            list.appendChild(row);
+        }
+    }
+
+    // Run every selected category that applies to the current mode, then refresh
+    // the panels that changed.
+    private runMasterRandomize(): void {
+        if (!this.sim) return;
+        const mode = this.sim.getSimMode();
+        const refreshes = new Set<string>();
+        for (const cat of this.randomizeCats) {
+            if (cat.modes !== null && !cat.modes.includes(mode)) continue;
+            if (!this.randomizeSel[cat.key]) continue;
+            cat.run();
+            refreshes.add(cat.refresh);
+        }
+        if (refreshes.has('forces'))    this.refreshForceMatrices();
+        if (refreshes.has('transform')) this.refreshTransformMatrix();  // also rebuilds poles
+        if (refreshes.has('poles'))     this.buildPolePanel();
+        if (refreshes.has('masses'))    this.refreshMassTable();
+        if (refreshes.has('valences'))  this.refreshPatchTable();
+        if (refreshes.has('bonding'))   this.syncPatchSliders();
+    }
+
     private refreshPaintTypePicker(): void {
         const container = document.getElementById('paint-type-picker');
         if (!container || !this.sim) return;
@@ -1293,6 +1393,24 @@ class ParticleLifeApp {
             case 6:  return 'hex';
             default: return '';
         }
+    }
+
+    // Push the simulation's current bonding params back into the patchy sliders
+    // (after import or a Randomize-bonding action).
+    private syncPatchSliders(): void {
+        if (!this.sim) return;
+        const pp = this.sim.getPatchParams();
+        const setSlider = (id: string, valId: string, v: number, txt: string) => {
+            (document.getElementById(id) as HTMLInputElement).value = String(v);
+            document.getElementById(valId)!.textContent = txt;
+        };
+        setSlider('patchStrengthSlider', 'patchStrengthValue', pp.bondStrength, pp.bondStrength.toFixed(2));
+        setSlider('patchRangeSlider',    'patchRangeValue',    pp.bondRange,    String(Math.round(pp.bondRange)));
+        setSlider('patchDistSlider',     'patchDistValue',     pp.bondDist,     String(Math.round(pp.bondDist)));
+        setSlider('patchWidthSlider',    'patchWidthValue',    pp.patchWidth,   String(Math.round(pp.patchWidth)));
+        setSlider('patchAngSlider',      'patchAngValue',      pp.angStiffness, pp.angStiffness.toFixed(2));
+        const spinDamp = 1 - pp.angFriction;  // slider = 1 - stored multiplier
+        setSlider('patchAngFricSlider',  'patchAngFricValue',  spinDamp, spinDamp.toFixed(2));
     }
 
     private refreshPatchTable(): void {
@@ -1707,18 +1825,7 @@ class ParticleLifeApp {
         (document.getElementById('maxTransformSlider') as HTMLInputElement).value = String(maxTransform);
         document.getElementById('maxTransformValue')!.textContent = maxTransform.toFixed(2);
 
-        const pp = this.sim.getPatchParams();
-        const setSlider = (id: string, valId: string, v: number, txt: string) => {
-            (document.getElementById(id) as HTMLInputElement).value = String(v);
-            document.getElementById(valId)!.textContent = txt;
-        };
-        setSlider('patchStrengthSlider', 'patchStrengthValue', pp.bondStrength, pp.bondStrength.toFixed(2));
-        setSlider('patchRangeSlider',    'patchRangeValue',    pp.bondRange,    String(Math.round(pp.bondRange)));
-        setSlider('patchDistSlider',     'patchDistValue',     pp.bondDist,     String(Math.round(pp.bondDist)));
-        setSlider('patchWidthSlider',    'patchWidthValue',    pp.patchWidth,   String(pp.patchWidth));
-        setSlider('patchAngSlider',      'patchAngValue',      pp.angStiffness, pp.angStiffness.toFixed(2));
-        const spinDamp = 1 - pp.angFriction;  // slider = 1 - stored multiplier
-        setSlider('patchAngFricSlider',  'patchAngFricValue',  spinDamp, spinDamp.toFixed(2));
+        this.syncPatchSliders();
         this.refreshPatchTable();
 
         this.refreshForceMatrices();

@@ -2472,6 +2472,19 @@ export class ParticleSimulation {
         this.patchDirty = true;
     }
 
+    // Randomize the global bonding parameters (the patchy sliders), kept in ranges
+    // that reliably still bond: bondDist sits well inside bondRange.
+    randomizePatchParams(): void {
+        const rand = (a: number, b: number) => a + Math.random() * (b - a);
+        this.patchBondRange    = rand(40, 100);
+        this.patchBondDist     = this.patchBondRange * rand(0.3, 0.55);
+        this.patchBondStrength = rand(0.3, 1.2);
+        this.patchWidth        = rand(3, 12);
+        this.patchAngStiffness = rand(0.15, 0.6);
+        this.patchAngFriction  = rand(0.6, 0.95);  // multiplier; lower = more damping
+        this.patchDirty = true;
+    }
+
     setPatchParams(p: Partial<{
         bondStrength: number; bondRange: number; bondDist: number;
         angStiffness: number; angFriction: number; patchWidth: number;
@@ -2683,12 +2696,6 @@ export class ParticleSimulation {
     getTransformRules(): TransformRule[] { return this.transformRules; }
 
     randomizeForces(): void { this.initializeForceMatrix(); }
-
-    randomizeBonding(): void {
-        this.randomizeStrengths();
-        this.randomizeMaxRadii();
-        this.randomizeMinRadii();
-    }
 
     randomizeStrengths(): void {
         for (let from = 0; from < MAX_TYPES; from++)
