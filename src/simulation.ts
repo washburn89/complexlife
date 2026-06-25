@@ -251,6 +251,10 @@ export class ParticleSimulation {
     // composition-based type transforms (see DnfClause / DnfLiteral above).
     private dnfRules: DnfClause[][] = Array.from({ length: MAX_TYPES }, () => []);
     private dnfRulesBuffer: GPUBuffer | null = null;
+    // Mode 5 directional bonding: off by default — Mode 5 is DNF transforms on a
+    // plain isotropic-force substrate. Toggle on to bring patchy bonds back. Passed
+    // to the kernel via params._p2 so it gates all patch passes (and patch render).
+    private dnfBonding = false;
 
     private isInitialized  = false;
     private isPaused       = false;
@@ -490,7 +494,7 @@ export class ParticleSimulation {
 
     // params: two vec4f (32 bytes).
     // [0] speed, worldW, worldH, packed(simMode|edgeMode|numTypes|poleWorldFrame as float)
-    // [1] friction, maxTransformRate, 0, 0
+    // [1] friction, maxTransformRate, dnfBonding(0/1), 0
     private paramsArray(): Float32Array<ArrayBuffer> {
         const packed = (this.poleWorldFrame ? (1 << 24) : 0)
                      | (this.numTypes << 16) | (this.edgeMode << 8) | this.simMode;
@@ -501,7 +505,8 @@ export class ParticleSimulation {
             packed,
             this.friction,
             this.maxTransformRate,
-            0, 0,
+            this.dnfBonding ? 1 : 0,
+            0,
         ]) as Float32Array<ArrayBuffer>;
     }
 
@@ -1398,7 +1403,8 @@ export class ParticleSimulation {
                     return o;
                 }
                 let pm = u32(params.packed) & 0xFFu;
-                let simMode3 = pm == 3u || pm == 4u || pm == 5u;  // patchy modes draw orientation
+                // Patchy modes draw orientation/patches; Mode 5 only when bonding is on.
+                let simMode3 = pm == 3u || pm == 4u || (pm == 5u && params._p2 > 0.5);
                 let worldW = params.worldW;
                 let worldH = params.worldH;
                 let zoom   = view.zoom;
@@ -1984,7 +1990,10 @@ export class ParticleSimulation {
                 var p = particles[idx];
                 if (p.typeId < 0.0) { return; }
                 let myType   = u32(p.typeId);
-                let myPatch  = patchN(myType);
+                // Mode 5 runs on a plain force substrate unless directional bonding
+                // is toggled on (params._p2). For modes 3/4 patches are always active.
+                let patchesActive = simMode != 5u || params._p2 > 0.5;
+                let myPatch  = select(0u, patchN(myType), patchesActive);
                 let ori      = orientation[idx];
                 let myTheta  = ori.x;
                 var myOmega  = ori.y;
@@ -2107,8 +2116,9 @@ export class ParticleSimulation {
 
                             // Excluded volume: firm repulsion inside the core radius for
                             // every neighbour, so saturated structures stay open instead
-                            // of collapsing to close-packed balls.
-                            if (dist < core) {
+                            // of collapsing to close-packed balls. (Patch-specific, so
+                            // skipped in Mode 5 when directional bonding is off.)
+                            if (patchesActive && dist < core) {
                                 let q = 1.0 - dist / core;
                                 accel -= dir * cfg.coreStrength * q * q;
                             }
@@ -3021,6 +3031,15 @@ export class ParticleSimulation {
         this.dnfDirty = true;
     }
 
+    getDnfBonding(): boolean { return this.dnfBonding; }
+    setDnfBonding(on: boolean): void {
+        this.dnfBonding = on;
+        // Push immediately so the change applies even while paused.
+        if (this.isInitialized && this.queue && this.paramsBuffer) {
+            this.queue.writeBuffer(this.paramsBuffer, 0, this.paramsArray());
+        }
+    }
+
     // Generate plausible composition rules: each type gets 1-2 clauses, each a
     // conjunction of 1-2 neighbour-count literals, transforming to another type.
     // Biased toward "≥ a few of type X" triggers so structures convert as they grow.
@@ -3153,6 +3172,7 @@ export class ParticleSimulation {
             patchAffinity:    Array.from({ length: n }, (_, from) =>
                                   Array.from({ length: n }, (_, to) => this.patchAffinity[from * MAX_TYPES + to])),
             dnfRules:         this.getDnfRules(),
+            dnfBonding:       this.dnfBonding,
         };
     }
 
@@ -3257,6 +3277,7 @@ export class ParticleSimulation {
             }
         }
         this.dnfDirty = true;
+        if (state.dnfBonding != null) this.dnfBonding = Boolean(state.dnfBonding);
 
         if (!this.isInitialized || !this.queue) return;
         this.queue.writeBuffer(this.particleBuffer!,  0, this.generateParticleData());

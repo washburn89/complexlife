@@ -330,6 +330,8 @@ class ParticleLifeApp {
             this.sim?.clearDnfRules();
             this.refreshDnfPanel();
         });
+        document.getElementById('dnfBondOffBtn')!.addEventListener('click', () => this.setDnfBonding(false));
+        document.getElementById('dnfBondOnBtn')!.addEventListener('click', () => this.setDnfBonding(true));
         const dnfMaxSlider = document.getElementById('dnfMaxSlider') as HTMLInputElement;
         dnfMaxSlider.addEventListener('input', () => {
             const v = parseFloat(dnfMaxSlider.value);
@@ -501,16 +503,17 @@ class ParticleLifeApp {
         }
         // Transform rules apply in modes 1 (Transform), 2 (Mass) and 4 (Patchy+T).
         const hasTransform = mode === 1 || mode === 2 || mode === 4;
-        // Patch controls apply in modes 3 (Patchy), 4 (Patchy+T) and 5 (Patchy+DNF).
-        const hasPatch = mode === 3 || mode === 4 || mode === 5;
         // DNF rules apply only in mode 5.
         const hasDnf = mode === 5;
+        const dnfBond = this.sim?.getDnfBonding() ?? false;
+        // Patch controls: always in modes 3/4; in mode 5 only when bonding is on.
+        const showPatch = mode === 3 || mode === 4 || (mode === 5 && dnfBond);
         document.getElementById('transform-panel')!.classList.toggle('visible', hasTransform);
         document.getElementById('mode2-panel')!.classList.toggle('visible', mode === 2);
-        document.getElementById('mode3-panel')!.classList.toggle('visible', hasPatch);
+        document.getElementById('mode3-panel')!.classList.toggle('visible', showPatch);
         document.getElementById('dnf-panel')!.classList.toggle('visible', hasDnf);
         if (mode === 2) this.refreshMassTable();
-        if (hasPatch) {
+        if (mode === 3 || mode === 4) {
             // First time in a patchy mode with no valences set: seed some so the
             // directional behaviour is visible immediately.
             if (this.sim && this.sim.getPatchCount().every(v => v === 0)) {
@@ -523,8 +526,27 @@ class ParticleLifeApp {
             if (this.sim && this.sim.getDnfRules().every(c => c.length === 0)) {
                 this.sim.randomizeDnfRules();
             }
+            this.syncDnfBondingButtons();
+            if (showPatch) this.refreshPatchUI();
             this.refreshDnfPanel();
         }
+    }
+
+    // Reflect the Mode-5 directional-bonding toggle and show/hide the patch panel.
+    private syncDnfBondingButtons(): void {
+        const on = this.sim?.getDnfBonding() ?? false;
+        document.getElementById('dnfBondOnBtn')!.classList.toggle('selected', on);
+        document.getElementById('dnfBondOffBtn')!.classList.toggle('selected', !on);
+    }
+
+    private setDnfBonding(on: boolean): void {
+        if (!this.sim) return;
+        this.sim.setDnfBonding(on);
+        // Turning bonding on with no valences set: seed some so bonds are visible.
+        if (on && this.sim.getPatchCount().every(v => v === 0)) this.sim.randomizePatches();
+        document.getElementById('mode3-panel')!.classList.toggle('visible', on);
+        if (on) this.refreshPatchUI();
+        this.syncDnfBondingButtons();
     }
 
     private setEdgeMode(mode: 0 | 1): void {
