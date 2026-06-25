@@ -1,4 +1,4 @@
-import { ParticleSimulation, TransformRule, MAX_TYPES, TYPE_COLORS_HEX, DiagnosticData } from './simulation';
+import { ParticleSimulation, TransformRule, DnfClause, MAX_TYPES, MAX_DNF_CLAUSES, MAX_DNF_LITERALS, TYPE_COLORS_HEX, DiagnosticData } from './simulation';
 
 const TYPE_LABELS = [
     'R', 'G', 'B', 'Y', 'M', 'C', 'O', 'P', 'K', 'S',
@@ -95,7 +95,7 @@ class ParticleLifeApp {
     // shown (forces); otherwise only when the current sim mode is in the list.
     private readonly randomizeCats: {
         key: string; label: string; modes: number[] | null;
-        run: () => void; refresh: 'forces' | 'transform' | 'poles' | 'masses' | 'valences' | 'bonding';
+        run: () => void; refresh: 'forces' | 'transform' | 'poles' | 'masses' | 'valences' | 'bonding' | 'dnf';
     }[] = [
         { key: 'strength',  label: 'Force strength', modes: null,      run: () => this.sim!.randomizeStrengths(),     refresh: 'forces' },
         { key: 'maxRadius', label: 'Max radius',     modes: null,      run: () => this.sim!.randomizeMaxRadii(),      refresh: 'forces' },
@@ -103,14 +103,18 @@ class ParticleLifeApp {
         { key: 'transform', label: 'Transform rules', modes: [1, 2, 4], run: () => this.sim!.randomizeTransformRules(), refresh: 'transform' },
         { key: 'poles',     label: 'Poles',          modes: [1, 2],    run: () => this.sim!.randomizePoles(),         refresh: 'poles' },
         { key: 'masses',    label: 'Masses',         modes: [2],       run: () => this.sim!.randomizeMasses(),        refresh: 'masses' },
-        { key: 'valences',  label: 'Valences',       modes: [3, 4],    run: () => this.sim!.randomizePatches(),       refresh: 'valences' },
-        { key: 'bonding',   label: 'Bonding',        modes: [3, 4],    run: () => this.sim!.randomizePatchParams(),   refresh: 'bonding' },
+        { key: 'valences',  label: 'Valences',       modes: [3, 4, 5], run: () => this.sim!.randomizePatches(),       refresh: 'valences' },
+        { key: 'bonding',   label: 'Bonding',        modes: [3, 4, 5], run: () => this.sim!.randomizePatchParams(),   refresh: 'bonding' },
+        { key: 'dnf',       label: 'DNF rules',      modes: [5],       run: () => this.sim!.randomizeDnfRules(),      refresh: 'dnf' },
     ];
     // Default selection — minRadius and poles off, as those are rarely wanted.
     private randomizeSel: Record<string, boolean> = {
         strength: true, maxRadius: true, minRadius: false,
-        transform: true, poles: false, masses: true, valences: true, bonding: true,
+        transform: true, poles: false, masses: true, valences: true, bonding: true, dnf: true,
     };
+
+    // ── DNF editor (mode 5) ───────────────────────────────────────────────────
+    private dnfEditType: number | null = null;   // which source type's editor is open
 
     // ── Photo export selection ────────────────────────────────────────────────
     private photoSelMode     = false;   // armed: dragging a region to export
@@ -205,6 +209,7 @@ class ParticleLifeApp {
                 this.refreshForceMatrices();
                 this.refreshTransformMatrix();
                 this.refreshMassTable();
+                this.refreshDnfPanel();
                 this.refreshPaintTypePicker();
             }
         };
@@ -235,6 +240,7 @@ class ParticleLifeApp {
         document.getElementById('mode2-btn')!.addEventListener('click', () => this.setSimMode(2));
         document.getElementById('mode3-btn')!.addEventListener('click', () => this.setSimMode(3));
         document.getElementById('mode4-btn')!.addEventListener('click', () => this.setSimMode(4));
+        document.getElementById('mode5-btn')!.addEventListener('click', () => this.setSimMode(5));
 
         // Per-matrix randomize buttons
         document.getElementById('randomizeStrengthBtn')!.addEventListener('click', () => {
@@ -313,6 +319,25 @@ class ParticleLifeApp {
         document.getElementById('randomizeTransformBtn')!.addEventListener('click', () => {
             this.sim?.randomizeTransformRules();
             this.refreshTransformMatrix();
+        });
+
+        // DNF (mode 5 / Transform #2) controls
+        document.getElementById('randomizeDnfBtn')!.addEventListener('click', () => {
+            this.sim?.randomizeDnfRules();
+            this.refreshDnfPanel();
+        });
+        document.getElementById('clearDnfBtn')!.addEventListener('click', () => {
+            this.sim?.clearDnfRules();
+            this.refreshDnfPanel();
+        });
+        const dnfMaxSlider = document.getElementById('dnfMaxSlider') as HTMLInputElement;
+        dnfMaxSlider.addEventListener('input', () => {
+            const v = parseFloat(dnfMaxSlider.value);
+            document.getElementById('dnfMaxValue')!.textContent = v.toFixed(2);
+            this.sim?.setMaxTransformRate(v);
+            // Keep the Transform-mode slider in sync (same global rate).
+            const ot = document.getElementById('maxTransformSlider') as HTMLInputElement | null;
+            if (ot) { ot.value = String(v); document.getElementById('maxTransformValue')!.textContent = v.toFixed(2); }
         });
 
         // Randomize poles
@@ -469,18 +494,21 @@ class ParticleLifeApp {
         btn.classList.toggle('active', paused);
     }
 
-    private setSimMode(mode: 0 | 1 | 2 | 3 | 4): void {
+    private setSimMode(mode: 0 | 1 | 2 | 3 | 4 | 5): void {
         this.sim?.setSimMode(mode);
-        for (let m = 0; m <= 4; m++) {
+        for (let m = 0; m <= 5; m++) {
             document.getElementById(`mode${m}-btn`)!.classList.toggle('selected', mode === m);
         }
         // Transform rules apply in modes 1 (Transform), 2 (Mass) and 4 (Patchy+T).
         const hasTransform = mode === 1 || mode === 2 || mode === 4;
-        // Patch controls apply in modes 3 (Patchy) and 4 (Patchy+T).
-        const hasPatch = mode === 3 || mode === 4;
+        // Patch controls apply in modes 3 (Patchy), 4 (Patchy+T) and 5 (Patchy+DNF).
+        const hasPatch = mode === 3 || mode === 4 || mode === 5;
+        // DNF rules apply only in mode 5.
+        const hasDnf = mode === 5;
         document.getElementById('transform-panel')!.classList.toggle('visible', hasTransform);
         document.getElementById('mode2-panel')!.classList.toggle('visible', mode === 2);
         document.getElementById('mode3-panel')!.classList.toggle('visible', hasPatch);
+        document.getElementById('dnf-panel')!.classList.toggle('visible', hasDnf);
         if (mode === 2) this.refreshMassTable();
         if (hasPatch) {
             // First time in a patchy mode with no valences set: seed some so the
@@ -489,6 +517,13 @@ class ParticleLifeApp {
                 this.sim.randomizePatches();
             }
             this.refreshPatchUI();
+        }
+        if (hasDnf) {
+            // First entry with no rules: seed some so transforms are visible at once.
+            if (this.sim && this.sim.getDnfRules().every(c => c.length === 0)) {
+                this.sim.randomizeDnfRules();
+            }
+            this.refreshDnfPanel();
         }
     }
 
@@ -1083,6 +1118,7 @@ class ParticleLifeApp {
         if (refreshes.has('masses'))    this.refreshMassTable();
         if (refreshes.has('valences'))  this.refreshPatchTable();
         if (refreshes.has('bonding'))   this.refreshPatchUI();
+        if (refreshes.has('dnf'))       this.refreshDnfPanel();
     }
 
     private refreshPaintTypePicker(): void {
@@ -1517,6 +1553,150 @@ class ParticleLifeApp {
         }
     }
 
+    // ── DNF rules panel (mode 5 / Transform #2) ─────────────────────────────────
+    private refreshDnfPanel(): void {
+        if (!this.sim) return;
+        const rate = this.sim.getMaxTransformRate();
+        const slider = document.getElementById('dnfMaxSlider') as HTMLInputElement | null;
+        if (slider) { slider.value = String(rate); document.getElementById('dnfMaxValue')!.textContent = rate.toFixed(2); }
+        this.buildDnfList();
+    }
+
+    // Human-readable "≥2 R & ≤0 B → G  OR  ≥3 C → Y" for one source type's clauses.
+    private dnfSummary(clauses: DnfClause[]): string {
+        if (!clauses.length) return '<span class="empty">(no rules — never transforms)</span>';
+        return clauses.map(c => {
+            const conds = (c.literals ?? []).map(l =>
+                `${l.op === 1 ? '≤' : '≥'}${l.count} <span style="color:${TYPE_HEX[l.neighborType]}">${TYPE_LABELS[l.neighborType]}</span>`).join(' & ');
+            const body = conds || '<span class="empty">always</span>';
+            return `${body} → <span style="color:${TYPE_HEX[c.target]}">${TYPE_LABELS[c.target]}</span>`;
+        }).join('  <span style="color:#789">OR</span>  ');
+    }
+
+    private buildDnfList(): void {
+        const list = document.getElementById('dnf-list');
+        if (!list || !this.sim) return;
+        list.innerHTML = '';
+        const n = this.sim.getNumTypes();
+        const rules = this.sim.getDnfRules();
+
+        for (let t = 0; t < n; t++) {
+            const row = document.createElement('div');
+            row.className = 'dnf-row';
+            row.innerHTML =
+                `<span class="dnf-src" style="color:${TYPE_HEX[t]}">${TYPE_LABELS[t]}</span>` +
+                `<span class="dnf-summary">${this.dnfSummary(rules[t] ?? [])}</span>`;
+            row.addEventListener('click', () => {
+                this.dnfEditType = this.dnfEditType === t ? null : t;
+                this.buildDnfList();
+            });
+            list.appendChild(row);
+
+            if (this.dnfEditType === t) {
+                const editor = this.buildDnfEditor(t);
+                editor.addEventListener('click', (e) => e.stopPropagation());
+                list.appendChild(editor);
+            }
+        }
+    }
+
+    // Inline editor for one source type. Mutates a working copy and commits to the
+    // sim on every change; structural edits (add/remove) re-render the editor.
+    private buildDnfEditor(t: number): HTMLElement {
+        const n = this.sim!.getNumTypes();
+        const work: DnfClause[] = (this.sim!.getDnfRules()[t] ?? []).map(c => ({
+            target: c.target, literals: c.literals.map(l => ({ ...l })),
+        }));
+        const commit = () => this.sim!.setDnfClauses(t, work);
+
+        const wrap = document.createElement('div');
+        wrap.className = 'dnf-edit';
+
+        const typeSelect = (val: number, onset: (v: number) => void) => {
+            const sel = document.createElement('select');
+            for (let i = 0; i < n; i++) {
+                const o = document.createElement('option');
+                o.value = String(i); o.textContent = TYPE_LABELS[i];
+                if (i === val) o.selected = true;
+                sel.appendChild(o);
+            }
+            sel.addEventListener('change', () => onset(Number(sel.value)));
+            return sel;
+        };
+
+        const rebuild = () => { commit(); const fresh = this.buildDnfEditor(t); wrap.replaceWith(fresh); };
+
+        work.forEach((clause, ci) => {
+            if (ci > 0) { const or = document.createElement('div'); or.className = 'dnf-or'; or.textContent = 'OR'; wrap.appendChild(or); }
+            const cl = document.createElement('div');
+            cl.className = 'dnf-clause';
+
+            (clause.literals ?? []).forEach((lit, li) => {
+                const line = document.createElement('div');
+                line.className = 'dnf-line';
+                line.appendChild(document.createTextNode('count of'));
+                line.appendChild(typeSelect(lit.neighborType, v => { lit.neighborType = v; commit(); }));
+
+                const opSel = document.createElement('select');
+                [['≥', '0'], ['≤', '1']].forEach(([lbl, v]) => {
+                    const o = document.createElement('option');
+                    o.value = v; o.textContent = lbl;
+                    if (Number(v) === lit.op) o.selected = true;
+                    opSel.appendChild(o);
+                });
+                opSel.addEventListener('change', () => { lit.op = Number(opSel.value) as 0 | 1; commit(); });
+                line.appendChild(opSel);
+
+                const cnt = document.createElement('input');
+                cnt.type = 'number'; cnt.min = '0'; cnt.max = '99'; cnt.value = String(lit.count);
+                cnt.addEventListener('change', () => { lit.count = Math.max(0, Number(cnt.value) | 0); cnt.value = String(lit.count); commit(); });
+                line.appendChild(cnt);
+
+                const del = document.createElement('button');
+                del.textContent = '✕';
+                del.title = 'remove condition';
+                del.addEventListener('click', () => { clause.literals.splice(li, 1); rebuild(); });
+                line.appendChild(del);
+
+                cl.appendChild(line);
+            });
+
+            const ctrl = document.createElement('div');
+            ctrl.className = 'dnf-line';
+            if ((clause.literals ?? []).length < MAX_DNF_LITERALS) {
+                const add = document.createElement('button');
+                add.textContent = '+ condition';
+                add.addEventListener('click', () => {
+                    clause.literals.push({ neighborType: 0, op: 0, count: 1 });
+                    rebuild();
+                });
+                ctrl.appendChild(add);
+            }
+            ctrl.appendChild(document.createTextNode('→ become'));
+            ctrl.appendChild(typeSelect(clause.target, v => { clause.target = v; commit(); }));
+            const delC = document.createElement('button');
+            delC.textContent = '✕ clause';
+            delC.addEventListener('click', () => { work.splice(ci, 1); rebuild(); });
+            ctrl.appendChild(delC);
+            cl.appendChild(ctrl);
+
+            wrap.appendChild(cl);
+        });
+
+        if (work.length < MAX_DNF_CLAUSES) {
+            const addClause = document.createElement('button');
+            addClause.textContent = '+ clause (OR)';
+            addClause.style.alignSelf = 'flex-start';
+            addClause.addEventListener('click', () => {
+                work.push({ target: (t + 1) % Math.max(1, n), literals: [{ neighborType: 0, op: 0, count: 1 }] });
+                rebuild();
+            });
+            wrap.appendChild(addClause);
+        }
+
+        return wrap;
+    }
+
     private buildPolePanel(): void {
         const list = document.getElementById('pole-list')!;
         list.innerHTML = '';
@@ -1851,7 +2031,7 @@ class ParticleLifeApp {
         document.getElementById('speedValue')!.textContent = `${this.sim.getParams().simulationSpeed.toFixed(1)}×`;
         document.getElementById('particleCountDisplay')!.textContent = String(this.sim.getParams().particleCount);
 
-        const simMode  = this.sim.getSimMode()  as 0 | 1 | 2 | 3 | 4;
+        const simMode  = this.sim.getSimMode()  as 0 | 1 | 2 | 3 | 4 | 5;
         const edgeMode = this.sim.getEdgeMode() as 0 | 1;
         this.setSimMode(simMode);
         document.getElementById('edgeLoopBtn')!.classList.toggle('selected', edgeMode === 0);
@@ -1890,6 +2070,7 @@ class ParticleLifeApp {
         document.getElementById('maxTransformValue')!.textContent = maxTransform.toFixed(2);
 
         this.refreshPatchUI();
+        this.refreshDnfPanel();
 
         this.refreshForceMatrices();
         this.refreshTransformMatrix();  // also calls buildPolePanel()

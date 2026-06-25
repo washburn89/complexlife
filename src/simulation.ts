@@ -40,6 +40,17 @@ export interface TransformRule {
     lowerTarget:    number;
 }
 
+// Transform #2: per-type DNF (disjunctive-normal-form) rules. Each source type
+// owns a list of clauses that are OR'd together; a clause is a list of literals
+// that are AND'd. A literal tests how many neighbours of one type sit within bond
+// range against a threshold (≥ or ≤). If every literal of any clause holds, the
+// particle transforms to that clause's target type — probabilistically, gated by
+// Max Transform per tick. This drives open-ended "metabolism" behaviour where a
+// particle's fate depends on the composition of its local neighbourhood.
+export interface DnfLiteral { neighborType: number; op: 0 | 1; count: number; }  // op: 0 = '≥', 1 = '≤'
+export interface DnfClause  { target: number; literals: DnfLiteral[]; }           // up to MAX_DNF_LITERALS literals
+// dnfRules[sourceType] = list of clauses (up to MAX_DNF_CLAUSES)
+
 export interface DiagnosticData {
     index:          number;
     typeId:         number;
@@ -52,6 +63,14 @@ export interface DiagnosticData {
 }
 
 export const MAX_TYPES = 20;
+
+// Transform #2 (DNF) bounds. Per source type: MAX_DNF_CLAUSES clauses, each with
+// up to MAX_DNF_LITERALS literals. GPU layout (uniform, vec4u): per type a header
+// vec4u (numClauses) followed by MAX_DNF_CLAUSES blocks of [clause-header,
+// literal0..2]. That is 1 + 4*(1+3) = 17 vec4u = 68 u32 per type.
+export const MAX_DNF_CLAUSES  = 4;
+export const MAX_DNF_LITERALS = 3;
+const DNF_TYPE_STRIDE_U32 = (1 + MAX_DNF_CLAUSES * (1 + MAX_DNF_LITERALS)) * 4;  // 68
 
 const OPEN_MULT            = 8;
 const MAX_GRID_DIM         = 64;
@@ -226,6 +245,13 @@ export class ParticleSimulation {
     private mode3Pipeline:           GPUComputePipeline | null = null;
     private mode3BindGroup:          GPUBindGroup       | null = null;
 
+    // ── Mode 5 (patchy + DNF transforms / Transform #2) ─────────────────────────
+    // Reuses the entire Mode 3 patchy kernel; on top of the physics it counts each
+    // particle's neighbours by type and evaluates per-source-type DNF rules to drive
+    // composition-based type transforms (see DnfClause / DnfLiteral above).
+    private dnfRules: DnfClause[][] = Array.from({ length: MAX_TYPES }, () => []);
+    private dnfRulesBuffer: GPUBuffer | null = null;
+
     private isInitialized  = false;
     private isPaused       = false;
     private simulationTime = 0;
@@ -235,6 +261,7 @@ export class ParticleSimulation {
     private forcesDirty    = true;
     private transformDirty = true;
     private patchDirty     = true;
+    private dnfDirty       = true;
 
     constructor(canvas: HTMLCanvasElement) {
         this.canvas       = canvas;
@@ -357,6 +384,37 @@ export class ParticleSimulation {
             f32[420 + t] = this.patchTypeBondDist[t] ?? 26;
         }
         return ab;
+    }
+
+    // Mode 5 DNF rules uniform. Flat u32 array, DNF_TYPE_STRIDE_U32 (68) per source
+    // type. Per type: header vec4u (numClauses,..), then MAX_DNF_CLAUSES blocks of
+    // [clause header (target, numLiterals,..), 3 literal vec4u (neighborType, op,
+    // count,..)]. Decoded by the same indexing in the WGSL kernel.
+    private generateDnfData(): Uint32Array<ArrayBuffer> {
+        const data = new Uint32Array(MAX_TYPES * DNF_TYPE_STRIDE_U32);
+        const maxTarget = Math.max(0, this.numTypes - 1);  // never transform to an inactive type
+        for (let s = 0; s < MAX_TYPES; s++) {
+            const clauses = this.dnfRules[s] ?? [];
+            const base = s * DNF_TYPE_STRIDE_U32;
+            const nC = Math.min(clauses.length, MAX_DNF_CLAUSES);
+            data[base] = nC;
+            for (let c = 0; c < nC; c++) {
+                const cl   = clauses[c];
+                const cOff = base + 4 + c * 16;           // clause block = 4 vec4u = 16 u32
+                const lits = cl.literals ?? [];
+                const nL   = Math.min(lits.length, MAX_DNF_LITERALS);
+                data[cOff]     = Math.max(0, Math.min(maxTarget, cl.target | 0));
+                data[cOff + 1] = nL;
+                for (let l = 0; l < nL; l++) {
+                    const lit  = lits[l];
+                    const lOff = cOff + 4 + l * 4;         // literal vec4u
+                    data[lOff]     = Math.max(0, Math.min(MAX_TYPES - 1, lit.neighborType | 0));
+                    data[lOff + 1] = lit.op === 1 ? 1 : 0;
+                    data[lOff + 2] = Math.max(0, lit.count | 0);
+                }
+            }
+        }
+        return data as Uint32Array<ArrayBuffer>;
     }
 
     // ── WebGPU init ───────────────────────────────────────────────────────────
@@ -537,6 +595,9 @@ export class ParticleSimulation {
         this.queue!.writeBuffer(this.patchConfigBuffer, 0, this.generatePatchConfigData());
         this.patchTablesBuffer = this.device!.createBuffer({ label: 'patchTables', size: 1760, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.queue!.writeBuffer(this.patchTablesBuffer, 0, this.generatePatchTablesData());
+        // Mode 5 DNF rules (uniform). MAX_TYPES * 68 u32 = 5440 bytes.
+        this.dnfRulesBuffer = this.device!.createBuffer({ label: 'dnfRules', size: MAX_TYPES * DNF_TYPE_STRIDE_U32 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.queue!.writeBuffer(this.dnfRulesBuffer, 0, this.generateDnfData());
     }
 
     private async createPipelines(): Promise<void> {
@@ -706,6 +767,7 @@ export class ParticleSimulation {
             { binding: 9,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // patchConfig
             { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // transformRules (mode 4)
             { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // patchTables (affinity + per-type)
+            { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // dnfRules (mode 5)
         ]});
         this.mode3Pipeline = this.device.createComputePipeline({
             layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.mode3BGL] }),
@@ -855,7 +917,7 @@ export class ParticleSimulation {
             });
         }
 
-        if (this.mode3BGL && this.orientationBuffer && this.sortedOrientationBuffer && this.patchConfigBuffer && this.patchTablesBuffer) {
+        if (this.mode3BGL && this.orientationBuffer && this.sortedOrientationBuffer && this.patchConfigBuffer && this.patchTablesBuffer && this.dnfRulesBuffer) {
             this.mode3BindGroup = this.device.createBindGroup({
                 layout: this.mode3BGL,
                 entries: [
@@ -871,6 +933,7 @@ export class ParticleSimulation {
                     { binding: 9,  resource: { buffer: this.patchConfigBuffer       } },
                     { binding: 10, resource: { buffer: this.transformBuffer         } },
                     { binding: 11, resource: { buffer: this.patchTablesBuffer!      } },
+                    { binding: 12, resource: { buffer: this.dnfRulesBuffer!         } },
                 ],
             });
         }
@@ -1335,7 +1398,7 @@ export class ParticleSimulation {
                     return o;
                 }
                 let pm = u32(params.packed) & 0xFFu;
-                let simMode3 = pm == 3u || pm == 4u;  // patchy modes draw orientation
+                let simMode3 = pm == 3u || pm == 4u || pm == 5u;  // patchy modes draw orientation
                 let worldW = params.worldW;
                 let worldH = params.worldH;
                 let zoom   = view.zoom;
@@ -1842,6 +1905,10 @@ export class ParticleSimulation {
                 bondStr:  array<vec4f, 5>,    // per-type bond strength
                 bondDist: array<vec4f, 5>,    // per-type bond rest length
             }
+            // Mode 5 DNF rules. 17 vec4u per source type: [0] header (numClauses),
+            // then 4 clause blocks of [clause header (target, numLiterals), 3 literal
+            // vec4u (neighborType, op, count)]. 20 types * 17 = 340 vec4u.
+            struct DnfRules { d: array<vec4u, 340> }
 
             @group(0) @binding(0)  var<storage, read_write> particles:         array<Particle>;
             @group(0) @binding(1)  var<storage, read>       sortedParticles:   array<Particle>;
@@ -1855,6 +1922,7 @@ export class ParticleSimulation {
             @group(0) @binding(9)  var<uniform>             cfg:               PatchConfig;
             @group(0) @binding(10) var<storage, read>       transformRules:    array<TransformRule>;
             @group(0) @binding(11) var<uniform>             tab:               PatchTables;
+            @group(0) @binding(12) var<uniform>             dnf:               DnfRules;
 
             fn patchN(t: u32) -> u32 { return cfg.patchCount[t >> 2u][t & 3u]; }
             fn bondStrOf(t: u32)  -> f32 { return tab.bondStr[t >> 2u][t & 3u]; }
@@ -1924,6 +1992,7 @@ export class ParticleSimulation {
                 var accel  = vec2f(0.0);
                 var torque = 0.0;
                 var typeForce: array<f32, 20>;  // per-type accumulated force (Mode 4 transforms)
+                var typeCount: array<u32, 20>;  // per-type neighbour count in bond range (Mode 5 DNF)
                 var bestBond: array<f32, 6>;    // strongest bond demand seen on each patch
                 var bestIdx:  array<u32, 6>;    // which neighbour won that patch
 
@@ -2012,6 +2081,12 @@ export class ParticleSimulation {
                             let dist = sqrt(dx * dx + dy * dy);
                             if (dist < 0.1) { continue; }
                             let dir = vec2f(dx, dy) / dist;
+
+                            // Mode 5: tally neighbours by type within bond range — the
+                            // "sensed" neighbourhood the DNF rules below evaluate.
+                            if (simMode == 5u && dist <= cfg.bondRange) {
+                                typeCount[otherType] = typeCount[otherType] + 1u;
+                            }
 
                             // Isotropic background force. Inner repulsion stays at full
                             // strength (keeps a hard core); the outer attractive/repulsive
@@ -2116,6 +2191,39 @@ export class ParticleSimulation {
                     if (newType >= 0) { p.typeId = f32(newType); }
                     let prevProb = clamp(p._pad, 0.0, 0.5);
                     p._pad = mix(prevProb, maxProb, 0.06);
+                } else if (simMode == 5u) {
+                    // Mode 5 / Transform #2: per-source-type DNF rules over the
+                    // neighbourhood composition. Clauses are OR'd; a clause's literals
+                    // are AND'd. First satisfied clause that wins its dice roll fires.
+                    let baseSeed = uhash(idx) ^ uhash(u32(abs(p.pos.x) * 157.0 + 1.0))
+                                              ^ uhash(u32(abs(p.pos.y) * 239.0 + 1.0));
+                    let stride   = 17u;                 // vec4u per type
+                    let nClause  = dnf.d[myType * stride].x;
+                    var newType: i32 = -1;
+                    var fired: f32 = 0.0;
+                    for (var c: u32 = 0u; c < nClause; c++) {
+                        let cOff   = myType * stride + 1u + c * 4u;
+                        let chead  = dnf.d[cOff];
+                        let target = chead.x;
+                        let nLit   = chead.y;
+                        var ok = nLit > 0u;             // empty clause never fires
+                        for (var l: u32 = 0u; l < nLit; l++) {
+                            let lit = dnf.d[cOff + 1u + l];
+                            let cnt = typeCount[lit.x];
+                            // op 0 = "≥ count", op 1 = "≤ count"
+                            if (lit.y == 0u) { if (cnt < lit.z) { ok = false; } }
+                            else             { if (cnt > lit.z) { ok = false; } }
+                        }
+                        if (ok) {
+                            fired = 1.0;
+                            if (newType < 0 && rand01(baseSeed ^ uhash(c * 7u + 13u)) < params.maxRate) {
+                                newType = i32(target);
+                            }
+                        }
+                    }
+                    if (newType >= 0) { p.typeId = f32(newType); }
+                    let prevProb = clamp(p._pad, 0.0, 0.5);
+                    p._pad = mix(prevProb, fired * params.maxRate, 0.06);
                 } else {
                     p._pad = 0.0;
                 }
@@ -2155,6 +2263,10 @@ export class ParticleSimulation {
             this.queue.writeBuffer(this.patchConfigBuffer!, 0, this.generatePatchConfigData());
             this.queue.writeBuffer(this.patchTablesBuffer!, 0, this.generatePatchTablesData());
             this.patchDirty = false;
+        }
+        if (this.dnfDirty) {
+            this.queue.writeBuffer(this.dnfRulesBuffer!, 0, this.generateDnfData());
+            this.dnfDirty = false;
         }
 
         if (!this.isPaused) {
@@ -2198,7 +2310,7 @@ export class ParticleSimulation {
             reorderCp.end();
 
             const forceCp = enc.beginComputePass();
-            if ((this.simMode === 3 || this.simMode === 4) && this.mode3Pipeline && this.mode3BindGroup) {
+            if ((this.simMode === 3 || this.simMode === 4 || this.simMode === 5) && this.mode3Pipeline && this.mode3BindGroup) {
                 // Mode 3/4: patchy physics replaces the classic force pass. It reads the
                 // same cell-sorted neighbours plus their orientation and writes back
                 // position, velocity and orientation in one kernel (Mode 4 also transforms).
@@ -2531,6 +2643,7 @@ export class ParticleSimulation {
         // Force/transform matrices changed: defer upload to the next frame.
         this.forcesDirty    = true;
         this.transformDirty = true;
+        this.dnfDirty       = true;  // re-clamp DNF targets to the new active range
 
         if (!this.isInitialized || !this.queue || !this.paramsBuffer) return;
         this.queue.writeBuffer(this.paramsBuffer, 0, this.paramsArray());
@@ -2559,7 +2672,7 @@ export class ParticleSimulation {
         this.simulationTime = 0;
     }
 
-    setSimMode(mode: 0 | 1 | 2 | 3 | 4): void { this.simMode = mode; }
+    setSimMode(mode: 0 | 1 | 2 | 3 | 4 | 5): void { this.simMode = mode; }
     getEdgeMode():    number    { return this.edgeMode; }
     getSimMode():     number    { return this.simMode; }
 
@@ -2878,6 +2991,67 @@ export class ParticleSimulation {
 
     randomizeTransformRules(): void { this.initializeTransformRules(); }
 
+    // ── Mode 5 (DNF / Transform #2) controls ────────────────────────────────────
+    // Deep copy of the active-type clause lists for the UI to read/edit.
+    getDnfRules(): DnfClause[][] {
+        return Array.from({ length: this.numTypes }, (_, s) =>
+            (this.dnfRules[s] ?? []).map(c => ({
+                target: c.target,
+                literals: c.literals.map(l => ({ ...l })),
+            })));
+    }
+
+    setDnfClauses(sourceType: number, clauses: DnfClause[]): void {
+        if (sourceType < 0 || sourceType >= MAX_TYPES) return;
+        this.dnfRules[sourceType] = clauses
+            .slice(0, MAX_DNF_CLAUSES)
+            .map(c => ({
+                target: Math.max(0, Math.min(MAX_TYPES - 1, Math.round(c.target))),
+                literals: (c.literals ?? []).slice(0, MAX_DNF_LITERALS).map(l => ({
+                    neighborType: Math.max(0, Math.min(MAX_TYPES - 1, Math.round(l.neighborType))),
+                    op: (l.op === 1 ? 1 : 0) as 0 | 1,
+                    count: Math.max(0, Math.round(l.count)),
+                })),
+            }));
+        this.dnfDirty = true;
+    }
+
+    clearDnfRules(): void {
+        for (let s = 0; s < MAX_TYPES; s++) this.dnfRules[s] = [];
+        this.dnfDirty = true;
+    }
+
+    // Generate plausible composition rules: each type gets 1-2 clauses, each a
+    // conjunction of 1-2 neighbour-count literals, transforming to another type.
+    // Biased toward "≥ a few of type X" triggers so structures convert as they grow.
+    randomizeDnfRules(): void {
+        const n = this.numTypes;
+        const randType = (exclude = -1) => {
+            let t = Math.floor(Math.random() * n);
+            while (t === exclude && n > 1) t = Math.floor(Math.random() * n);
+            return t;
+        };
+        for (let s = 0; s < MAX_TYPES; s++) {
+            if (s >= n) { this.dnfRules[s] = []; continue; }
+            const nClauses = 1 + (Math.random() < 0.4 ? 1 : 0);
+            const clauses: DnfClause[] = [];
+            for (let c = 0; c < nClauses; c++) {
+                const nLit = 1 + (Math.random() < 0.5 ? 1 : 0);
+                const literals: DnfLiteral[] = [];
+                for (let l = 0; l < nLit; l++) {
+                    literals.push({
+                        neighborType: randType(),
+                        op: Math.random() < 0.75 ? 0 : 1,         // mostly "≥"
+                        count: 1 + Math.floor(Math.random() * 4), // 1..4
+                    });
+                }
+                clauses.push({ target: randType(s), literals });
+            }
+            this.dnfRules[s] = clauses;
+        }
+        this.dnfDirty = true;
+    }
+
     reset(): void {
         if (!this.isInitialized || !this.queue || !this.particleBuffer) return;
         this.view = this.defaultView();
@@ -2978,6 +3152,7 @@ export class ParticleSimulation {
             patchBondDist:    this.patchTypeBondDist.slice(0, n),
             patchAffinity:    Array.from({ length: n }, (_, from) =>
                                   Array.from({ length: n }, (_, to) => this.patchAffinity[from * MAX_TYPES + to])),
+            dnfRules:         this.getDnfRules(),
         };
     }
 
@@ -2986,7 +3161,7 @@ export class ParticleSimulation {
         this.numTypes = n;
 
         if (state.simulationSpeed != null) this.params.simulationSpeed = Number(state.simulationSpeed);
-        if (state.simMode  != null) this.simMode  = Number(state.simMode)  as 0 | 1 | 2 | 3 | 4;
+        if (state.simMode  != null) this.simMode  = Number(state.simMode)  as 0 | 1 | 2 | 3 | 4 | 5;
         if (state.edgeMode != null) this.edgeMode = Number(state.edgeMode) as 0 | 1;
         if (state.poleWorldFrame != null) this.poleWorldFrame = Boolean(state.poleWorldFrame);
 
@@ -3074,6 +3249,14 @@ export class ParticleSimulation {
                 }
         }
         this.patchDirty = true;
+        if (Array.isArray(state.dnfRules)) {
+            this.clearDnfRules();
+            for (let s = 0; s < n; s++) {
+                const cl = state.dnfRules[s];
+                if (Array.isArray(cl)) this.setDnfClauses(s, cl);
+            }
+        }
+        this.dnfDirty = true;
 
         if (!this.isInitialized || !this.queue) return;
         this.queue.writeBuffer(this.particleBuffer!,  0, this.generateParticleData());

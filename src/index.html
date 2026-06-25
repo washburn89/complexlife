@@ -193,8 +193,25 @@
         .mode-toggle-row { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
         .mode-btn { flex: 1 1 auto; min-width: 54px; padding: 7px 4px; font-size: 11px; }
 
-        #transform-panel, #mode2-panel, #mode3-panel { display: none; }
-        #transform-panel.visible, #mode2-panel.visible, #mode3-panel.visible { display: block; }
+        #transform-panel, #mode2-panel, #mode3-panel, #dnf-panel { display: none; }
+        #transform-panel.visible, #mode2-panel.visible, #mode3-panel.visible, #dnf-panel.visible { display: block; }
+        #dnf-list { display: flex; flex-direction: column; gap: 4px; }
+        .dnf-row { display: flex; align-items: flex-start; gap: 6px; padding: 5px 6px; border-radius: 4px;
+                   background: rgba(255,255,255,0.03); cursor: pointer; font-size: 11px; line-height: 1.5; }
+        .dnf-row:hover { background: rgba(255,255,255,0.06); }
+        .dnf-row .dnf-src { font-weight: bold; flex-shrink: 0; width: 16px; }
+        .dnf-row .dnf-summary { flex: 1; color: #bbb; }
+        .dnf-row .dnf-summary .empty { color: #666; font-style: italic; }
+        .dnf-edit { background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.08); border-radius: 4px;
+                    padding: 6px; margin-top: 2px; display: flex; flex-direction: column; gap: 6px; }
+        .dnf-clause { border-left: 2px solid rgba(120,170,255,0.5); padding: 4px 6px; display: flex;
+                      flex-direction: column; gap: 4px; background: rgba(255,255,255,0.02); }
+        .dnf-line { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 11px; }
+        .dnf-edit select, .dnf-edit input[type=number] { font-size: 11px; padding: 1px 2px; background: #1a1a1a;
+                      color: #ddd; border: 1px solid #333; border-radius: 3px; }
+        .dnf-edit input[type=number] { width: 42px; }
+        .dnf-edit button { font-size: 10px; padding: 2px 6px; }
+        .dnf-or { text-align: center; color: #789; font-size: 9px; letter-spacing: 1px; }
 
         .mass-table { width: 100%; border-collapse: collapse; margin-top: 6px; }
         .mass-table td { padding: 2px 4px; font-size: 10px; vertical-align: middle; }
@@ -487,6 +504,7 @@
                     <button class="mode-btn"          id="mode2-btn">Mass</button>
                     <button class="mode-btn"          id="mode3-btn">Patchy</button>
                     <button class="mode-btn"          id="mode4-btn">Patchy+T</button>
+                    <button class="mode-btn"          id="mode5-btn">Patchy+DNF</button>
                 </div>
 
                 <div id="mode3-panel">
@@ -543,6 +561,28 @@
                             low; for static crystals/sheets do the opposite.
                         </p>
                     </div>
+                </div>
+
+                <div id="dnf-panel">
+                    <p class="tr-hint">
+                        <strong>Transform #2 — DNF rules.</strong> Each particle counts its neighbours by type
+                        (within bond range) and checks its source-type's rules. A rule is a set of
+                        <em>clauses</em> OR'd together; a clause is a set of conditions AND'd together
+                        (e.g. <code>≥2 red &amp; ≤0 blue → green</code>). The first satisfied clause that wins
+                        its dice roll transforms the particle. This drives composition-based "metabolism":
+                        structures change type as their local mix changes. Patchy bonding (above) still applies.
+                    </p>
+                    <div class="settings-row">
+                        <label>Max Transform</label>
+                        <input type="range" id="dnfMaxSlider" min="0.01" max="1.0" step="0.01" value="0.5">
+                        <span class="val" id="dnfMaxValue">0.50</span>
+                    </div>
+                    <div class="btn-row" style="margin:8px 0;">
+                        <button id="randomizeDnfBtn">Randomize rules</button>
+                        <button id="clearDnfBtn">Clear all</button>
+                    </div>
+                    <p class="matrix-label">Rules per source type (click a row to edit)</p>
+                    <div id="dnf-list"></div>
                 </div>
 
                 <div id="mode2-panel">
