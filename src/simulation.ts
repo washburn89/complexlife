@@ -40,16 +40,87 @@ export interface TransformRule {
     lowerTarget:    number;
 }
 
-// Transform #2: per-type DNF (disjunctive-normal-form) rules. Each source type
-// owns a list of clauses that are OR'd together; a clause is a list of literals
-// that are AND'd. A literal tests how many neighbours of one type sit within bond
-// range against a threshold (≥ or ≤). If every literal of any clause holds, the
-// particle transforms to that clause's target type — probabilistically, gated by
-// Max Transform per tick. This drives open-ended "metabolism" behaviour where a
-// particle's fate depends on the composition of its local neighbourhood.
-export interface DnfLiteral { neighborType: number; op: 0 | 1; count: number; }  // op: 0 = '≥', 1 = '≤'
-export interface DnfClause  { target: number; literals: DnfLiteral[]; }           // up to MAX_DNF_LITERALS literals
-// dnfRules[sourceType] = list of clauses (up to MAX_DNF_CLAUSES)
+// Transform #2: per-type force-based boolean rules. Each source type owns a set
+// of conditions (C1, C2, …); a condition compares the accumulated force from one
+// trigger type against a threshold with an operator (>, >=, <, <=). On top of the
+// conditions sit transform rules: each rule is a target type plus a boolean
+// expression over the conditions (and / or / nand / nor / not / parentheses), e.g.
+// "(C1 and C2) or C3". The first rule whose expression is true transforms the
+// particle (probabilistically, gated by Max Transform per tick).
+export interface DnfCondition { trigger: number; op: 0 | 1 | 2 | 3; threshold: number; }  // op 0:> 1:>= 2:< 3:<=
+export interface DnfRule      { target: number; expr: string; rpn: number[]; }            // rpn = compiled tokens
+export interface DnfType      { conditions: DnfCondition[]; rules: DnfRule[]; }
+
+// Boolean-expression compiler for DNF rules. Parses an expression over condition
+// refs C1, C2, … combined with and/or/nand/nor/not and parentheses into
+// reverse-Polish tokens for the GPU stack machine. Token u32 layout:
+//   operand:  (0 << 16) | conditionIndex
+//   operator: (1 << 16) | opcode      (0=NOT, 1=AND, 2=OR, 3=NAND, 4=NOR)
+export const DNF_MAX_TOKENS = 24;
+export function compileBoolExpr(expr: string, numConditions: number): { rpn: number[]; error: string | null } {
+    const s = (expr ?? '').trim();
+    if (!s) return { rpn: [], error: null };  // empty = rule never fires
+    type Tk = { t: 'cond' | 'op' | 'lp' | 'rp'; v?: number };
+    const toks: Tk[] = [];
+    const re = /\s*(\(|\)|[Cc](\d+)|&&|\|\||nand|nor|and|or|not|[&|!~])\s*/y;
+    let i = 0;
+    while (i < s.length) {
+        re.lastIndex = i;
+        const m = re.exec(s);
+        if (!m || m.index !== i) return { rpn: [], error: `Unexpected "${s.slice(i, i + 8)}"` };
+        i = re.lastIndex;
+        const w = m[1].toLowerCase();
+        if (w === '(') toks.push({ t: 'lp' });
+        else if (w === ')') toks.push({ t: 'rp' });
+        else if (m[2] !== undefined) {
+            const idx = parseInt(m[2], 10) - 1;
+            if (idx < 0 || idx >= numConditions) return { rpn: [], error: `C${m[2]} is out of range` };
+            toks.push({ t: 'cond', v: idx });
+        }
+        else if (w === 'not' || w === '!' || w === '~') toks.push({ t: 'op', v: 0 });
+        else if (w === 'and' || w === '&' || w === '&&') toks.push({ t: 'op', v: 1 });
+        else if (w === 'or'  || w === '|' || w === '||') toks.push({ t: 'op', v: 2 });
+        else if (w === 'nand') toks.push({ t: 'op', v: 3 });
+        else if (w === 'nor')  toks.push({ t: 'op', v: 4 });
+    }
+    // Shunting-yard. Precedence: NOT 4 (unary, right-assoc), AND/NAND 3, OR/NOR 2.
+    const prec = (op: number) => op === 0 ? 4 : (op === 1 || op === 3 ? 3 : 2);
+    const out: number[] = [];
+    const ops: Tk[] = [];
+    const emit = (op: number) => out.push((1 << 16) | op);
+    for (const tk of toks) {
+        if (tk.t === 'cond') out.push((0 << 16) | tk.v!);
+        else if (tk.t === 'op') {
+            const p = prec(tk.v!);
+            while (ops.length) {
+                const top = ops[ops.length - 1];
+                if (top.t !== 'op') break;
+                const tp = prec(top.v!);
+                if (tk.v === 0 ? tp > p : tp >= p) emit((ops.pop() as Tk).v!);  // unary right-assoc
+                else break;
+            }
+            ops.push(tk);
+        }
+        else if (tk.t === 'lp') ops.push(tk);
+        else {  // rp
+            let found = false;
+            while (ops.length) { const top = ops.pop()!; if (top.t === 'lp') { found = true; break; } emit(top.v!); }
+            if (!found) return { rpn: [], error: 'Unbalanced )' };
+        }
+    }
+    while (ops.length) { const top = ops.pop()!; if (top.t === 'lp') return { rpn: [], error: 'Unbalanced (' }; emit(top.v!); }
+    if (out.length > DNF_MAX_TOKENS) return { rpn: [], error: 'Expression too long' };
+    // Stack-simulate to confirm it reduces to exactly one value.
+    let sp = 0;
+    for (const tok of out) {
+        const kind = tok >> 16, val = tok & 0xffff;
+        if (kind === 0) sp++;
+        else if (val === 0) { if (sp < 1) return { rpn: [], error: 'Malformed expression' }; }
+        else { if (sp < 2) return { rpn: [], error: 'Malformed expression' }; sp--; }
+    }
+    if (sp !== 1) return { rpn: [], error: 'Malformed expression' };
+    return { rpn: out, error: null };
+}
 
 export interface DiagnosticData {
     index:          number;
@@ -64,13 +135,15 @@ export interface DiagnosticData {
 
 export const MAX_TYPES = 20;
 
-// Transform #2 (DNF) bounds. Per source type: MAX_DNF_CLAUSES clauses, each with
-// up to MAX_DNF_LITERALS literals. GPU layout (uniform, vec4u): per type a header
-// vec4u (numClauses) followed by MAX_DNF_CLAUSES blocks of [clause-header,
-// literal0..2]. That is 1 + 4*(1+3) = 17 vec4u = 68 u32 per type.
-export const MAX_DNF_CLAUSES  = 4;
-export const MAX_DNF_LITERALS = 3;
-const DNF_TYPE_STRIDE_U32 = (1 + MAX_DNF_CLAUSES * (1 + MAX_DNF_LITERALS)) * 4;  // 68
+// Transform #2 (DNF) bounds. Per source type: up to MAX_DNF_CONDITIONS conditions
+// and MAX_DNF_RULES rules. GPU layout (uniform, u32 via vec4 packing) per type:
+//   [0]=numConditions [1]=numRules [2,3]=pad                            (4 u32)
+//   conditions: MAX_DNF_CONDITIONS × [trigger, op, threshold(f32 bits), pad]
+//   rules:      MAX_DNF_RULES × [target, numTokens, pad, pad, token0..23]
+// → 4 + 6*4 + 4*(4+24) = 4 + 24 + 112 = 140 u32 (35 vec4u) per type.
+export const MAX_DNF_CONDITIONS = 6;
+export const MAX_DNF_RULES      = 4;
+const DNF_TYPE_STRIDE_U32 = 4 + MAX_DNF_CONDITIONS * 4 + MAX_DNF_RULES * (4 + DNF_MAX_TOKENS);  // 140
 
 const OPEN_MULT            = 8;
 const MAX_GRID_DIM         = 64;
@@ -245,11 +318,10 @@ export class ParticleSimulation {
     private mode3Pipeline:           GPUComputePipeline | null = null;
     private mode3BindGroup:          GPUBindGroup       | null = null;
 
-    // ── Mode 5 (patchy + DNF transforms / Transform #2) ─────────────────────────
-    // Reuses the entire Mode 3 patchy kernel; on top of the physics it counts each
-    // particle's neighbours by type and evaluates per-source-type DNF rules to drive
-    // composition-based type transforms (see DnfClause / DnfLiteral above).
-    private dnfRules: DnfClause[][] = Array.from({ length: MAX_TYPES }, () => []);
+    // ── Mode 5 (DNF transforms / Transform #2) ──────────────────────────────────
+    // Reuses the Mode 3 patchy kernel for physics; on top, it evaluates per-source-
+    // type force-based conditions and boolean transform rules (see DnfType above).
+    private dnfTypes: DnfType[] = Array.from({ length: MAX_TYPES }, () => ({ conditions: [], rules: [] }));
     private dnfRulesBuffer: GPUBuffer | null = null;
     // Mode 5 directional bonding: off by default — Mode 5 is DNF transforms on a
     // plain isotropic-force substrate. Toggle on to bring patchy bonds back. Passed
@@ -390,35 +462,40 @@ export class ParticleSimulation {
         return ab;
     }
 
-    // Mode 5 DNF rules uniform. Flat u32 array, DNF_TYPE_STRIDE_U32 (68) per source
-    // type. Per type: header vec4u (numClauses,..), then MAX_DNF_CLAUSES blocks of
-    // [clause header (target, numLiterals,..), 3 literal vec4u (neighborType, op,
-    // count,..)]. Decoded by the same indexing in the WGSL kernel.
+    // Mode 5 DNF uniform. Flat u32 array, DNF_TYPE_STRIDE_U32 (140) per source type;
+    // see the constant's comment for the per-type layout. Decoded by matching u32
+    // offsets in the WGSL kernel (via the dnfU32 accessor).
     private generateDnfData(): Uint32Array<ArrayBuffer> {
-        const data = new Uint32Array(MAX_TYPES * DNF_TYPE_STRIDE_U32);
+        const ab  = new ArrayBuffer(MAX_TYPES * DNF_TYPE_STRIDE_U32 * 4);
+        const u32 = new Uint32Array(ab);
+        const f32 = new Float32Array(ab);
         const maxTarget = Math.max(0, this.numTypes - 1);  // never transform to an inactive type
         for (let s = 0; s < MAX_TYPES; s++) {
-            const clauses = this.dnfRules[s] ?? [];
+            const dt   = this.dnfTypes[s] ?? { conditions: [], rules: [] };
             const base = s * DNF_TYPE_STRIDE_U32;
-            const nC = Math.min(clauses.length, MAX_DNF_CLAUSES);
-            data[base] = nC;
+            const conds = dt.conditions ?? [];
+            const rules = dt.rules ?? [];
+            const nC = Math.min(conds.length, MAX_DNF_CONDITIONS);
+            const nR = Math.min(rules.length, MAX_DNF_RULES);
+            u32[base]     = nC;
+            u32[base + 1] = nR;
             for (let c = 0; c < nC; c++) {
-                const cl   = clauses[c];
-                const cOff = base + 4 + c * 16;           // clause block = 4 vec4u = 16 u32
-                const lits = cl.literals ?? [];
-                const nL   = Math.min(lits.length, MAX_DNF_LITERALS);
-                data[cOff]     = Math.max(0, Math.min(maxTarget, cl.target | 0));
-                data[cOff + 1] = nL;
-                for (let l = 0; l < nL; l++) {
-                    const lit  = lits[l];
-                    const lOff = cOff + 4 + l * 4;         // literal vec4u
-                    data[lOff]     = Math.max(0, Math.min(MAX_TYPES - 1, lit.neighborType | 0));
-                    data[lOff + 1] = lit.op === 1 ? 1 : 0;
-                    data[lOff + 2] = Math.max(0, lit.count | 0);
-                }
+                const cd  = conds[c];
+                const off = base + 4 + c * 4;
+                u32[off]     = Math.max(0, Math.min(MAX_TYPES - 1, cd.trigger | 0));
+                u32[off + 1] = Math.max(0, Math.min(3, cd.op | 0));
+                f32[off + 2] = cd.threshold ?? 0;
+            }
+            for (let r = 0; r < nR; r++) {
+                const ru   = rules[r];
+                const roff = base + 4 + MAX_DNF_CONDITIONS * 4 + r * (4 + DNF_MAX_TOKENS);
+                const rpn  = (ru.rpn ?? []).slice(0, DNF_MAX_TOKENS);
+                u32[roff]     = Math.max(0, Math.min(maxTarget, ru.target | 0));
+                u32[roff + 1] = rpn.length;
+                for (let t = 0; t < rpn.length; t++) u32[roff + 4 + t] = rpn[t] >>> 0;
             }
         }
-        return data as Uint32Array<ArrayBuffer>;
+        return u32 as Uint32Array<ArrayBuffer>;
     }
 
     // ── WebGPU init ───────────────────────────────────────────────────────────
@@ -1911,10 +1988,9 @@ export class ParticleSimulation {
                 bondStr:  array<vec4f, 5>,    // per-type bond strength
                 bondDist: array<vec4f, 5>,    // per-type bond rest length
             }
-            // Mode 5 DNF rules. 17 vec4u per source type: [0] header (numClauses),
-            // then 4 clause blocks of [clause header (target, numLiterals), 3 literal
-            // vec4u (neighborType, op, count)]. 20 types * 17 = 340 vec4u.
-            struct DnfRules { d: array<vec4u, 340> }
+            // Mode 5 DNF data. 35 vec4u (140 u32) per source type; decoded by u32
+            // offset via dnfU32(). 20 types * 35 = 700 vec4u.
+            struct DnfRules { d: array<vec4u, 700> }
 
             @group(0) @binding(0)  var<storage, read_write> particles:         array<Particle>;
             @group(0) @binding(1)  var<storage, read>       sortedParticles:   array<Particle>;
@@ -1934,6 +2010,7 @@ export class ParticleSimulation {
             fn bondStrOf(t: u32)  -> f32 { return tab.bondStr[t >> 2u][t & 3u]; }
             fn bondDistOf(t: u32) -> f32 { return tab.bondDist[t >> 2u][t & 3u]; }
             fn affinityOf(a: u32, b: u32) -> f32 { let i = a * 20u + b; return tab.affinity[i >> 2u][i & 3u]; }
+            fn dnfU32(i: u32) -> u32 { return dnf.d[i >> 2u][i & 3u]; }
 
             const TAU = 6.28318530718;
 
@@ -2000,8 +2077,7 @@ export class ParticleSimulation {
 
                 var accel  = vec2f(0.0);
                 var torque = 0.0;
-                var typeForce: array<f32, 20>;  // per-type accumulated force (Mode 4 transforms)
-                var typeCount: array<u32, 20>;  // per-type neighbour count in bond range (Mode 5 DNF)
+                var typeForce: array<f32, 20>;  // per-type accumulated force (Mode 4 & 5 transforms)
                 var bestBond: array<f32, 6>;    // strongest bond demand seen on each patch
                 var bestIdx:  array<u32, 6>;    // which neighbour won that patch
 
@@ -2090,12 +2166,6 @@ export class ParticleSimulation {
                             let dist = sqrt(dx * dx + dy * dy);
                             if (dist < 0.1) { continue; }
                             let dir = vec2f(dx, dy) / dist;
-
-                            // Mode 5: tally neighbours by type within bond range — the
-                            // "sensed" neighbourhood the DNF rules below evaluate.
-                            if (simMode == 5u && dist <= cfg.bondRange) {
-                                typeCount[otherType] = typeCount[otherType] + 1u;
-                            }
 
                             // Isotropic background force. Inner repulsion stays at full
                             // strength (keeps a hard core); the outer attractive/repulsive
@@ -2202,31 +2272,59 @@ export class ParticleSimulation {
                     let prevProb = clamp(p._pad, 0.0, 0.5);
                     p._pad = mix(prevProb, maxProb, 0.06);
                 } else if (simMode == 5u) {
-                    // Mode 5 / Transform #2: per-source-type DNF rules over the
-                    // neighbourhood composition. Clauses are OR'd; a clause's literals
-                    // are AND'd. First satisfied clause that wins its dice roll fires.
+                    // Mode 5 / Transform #2: force-based conditions combined by a
+                    // boolean expression per rule. Conditions compare accumulated
+                    // per-type force against a threshold; the first rule whose RPN
+                    // expression evaluates true wins its dice roll and transforms.
                     let baseSeed = uhash(idx) ^ uhash(u32(abs(p.pos.x) * 157.0 + 1.0))
                                               ^ uhash(u32(abs(p.pos.y) * 239.0 + 1.0));
-                    let stride   = 17u;                 // vec4u per type
-                    let nClause  = dnf.d[myType * stride].x;
+                    let base    = myType * ${DNF_TYPE_STRIDE_U32}u;
+                    let numCond = dnfU32(base);
+                    let numRule = dnfU32(base + 1u);
+                    var cond: array<bool, ${MAX_DNF_CONDITIONS}>;
+                    for (var ci: u32 = 0u; ci < numCond; ci++) {
+                        let co   = base + 4u + ci * 4u;
+                        let trig = dnfU32(co);
+                        let op   = dnfU32(co + 1u);
+                        let thr  = bitcast<f32>(dnfU32(co + 2u));
+                        let fv   = typeForce[trig];
+                        var r: bool;
+                        if      (op == 0u) { r = fv >  thr; }
+                        else if (op == 1u) { r = fv >= thr; }
+                        else if (op == 2u) { r = fv <  thr; }
+                        else               { r = fv <= thr; }
+                        cond[ci] = r;
+                    }
                     var newType: i32 = -1;
                     var fired: f32 = 0.0;
-                    for (var c: u32 = 0u; c < nClause; c++) {
-                        let cOff   = myType * stride + 1u + c * 4u;
-                        let chead  = dnf.d[cOff];
-                        let tgt    = chead.x;
-                        let nLit   = chead.y;
-                        var ok = nLit > 0u;             // empty clause never fires
-                        for (var l: u32 = 0u; l < nLit; l++) {
-                            let lit = dnf.d[cOff + 1u + l];
-                            let cnt = typeCount[lit.x];
-                            // op 0 = "≥ count", op 1 = "≤ count"
-                            if (lit.y == 0u) { if (cnt < lit.z) { ok = false; } }
-                            else             { if (cnt > lit.z) { ok = false; } }
+                    for (var ri: u32 = 0u; ri < numRule; ri++) {
+                        let roff = base + 4u + ${MAX_DNF_CONDITIONS * 4}u + ri * ${4 + DNF_MAX_TOKENS}u;
+                        let tgt  = dnfU32(roff);
+                        let nTok = dnfU32(roff + 1u);
+                        if (nTok == 0u) { continue; }
+                        var st: array<bool, 16>;
+                        var sp: u32 = 0u;
+                        for (var ti: u32 = 0u; ti < nTok; ti++) {
+                            let tok  = dnfU32(roff + 4u + ti);
+                            let kind = tok >> 16u;
+                            let val  = tok & 0xFFFFu;
+                            if (kind == 0u) {
+                                if (sp < 16u) { st[sp] = cond[min(val, ${MAX_DNF_CONDITIONS - 1}u)]; sp = sp + 1u; }
+                            } else if (val == 0u) {            // NOT
+                                if (sp >= 1u) { st[sp - 1u] = !st[sp - 1u]; }
+                            } else if (sp >= 2u) {             // AND/OR/NAND/NOR
+                                let b = st[sp - 1u];
+                                let a = st[sp - 2u];
+                                sp = sp - 1u;
+                                if      (val == 1u) { st[sp - 1u] = a && b; }
+                                else if (val == 2u) { st[sp - 1u] = a || b; }
+                                else if (val == 3u) { st[sp - 1u] = !(a && b); }
+                                else                { st[sp - 1u] = !(a || b); }
+                            }
                         }
-                        if (ok) {
+                        if (sp >= 1u && st[0]) {
                             fired = 1.0;
-                            if (newType < 0 && rand01(baseSeed ^ uhash(c * 7u + 13u)) < params.maxRate) {
+                            if (newType < 0 && rand01(baseSeed ^ uhash(ri * 7u + 13u)) < params.maxRate) {
                                 newType = i32(tgt);
                             }
                         }
@@ -3002,32 +3100,39 @@ export class ParticleSimulation {
     randomizeTransformRules(): void { this.initializeTransformRules(); }
 
     // ── Mode 5 (DNF / Transform #2) controls ────────────────────────────────────
-    // Deep copy of the active-type clause lists for the UI to read/edit.
-    getDnfRules(): DnfClause[][] {
-        return Array.from({ length: this.numTypes }, (_, s) =>
-            (this.dnfRules[s] ?? []).map(c => ({
-                target: c.target,
-                literals: c.literals.map(l => ({ ...l })),
-            })));
+    // Deep copy of the active-type rules for the UI to read/edit.
+    getDnfTypes(): DnfType[] {
+        return Array.from({ length: this.numTypes }, (_, s) => {
+            const dt = this.dnfTypes[s] ?? { conditions: [], rules: [] };
+            return {
+                conditions: dt.conditions.map(c => ({ ...c })),
+                rules:      dt.rules.map(r => ({ target: r.target, expr: r.expr, rpn: r.rpn.slice() })),
+            };
+        });
     }
 
-    setDnfClauses(sourceType: number, clauses: DnfClause[]): void {
+    setDnfType(sourceType: number, conditions: DnfCondition[], rules: DnfRule[]): void {
         if (sourceType < 0 || sourceType >= MAX_TYPES) return;
-        this.dnfRules[sourceType] = clauses
-            .slice(0, MAX_DNF_CLAUSES)
-            .map(c => ({
-                target: Math.max(0, Math.min(MAX_TYPES - 1, Math.round(c.target))),
-                literals: (c.literals ?? []).slice(0, MAX_DNF_LITERALS).map(l => ({
-                    neighborType: Math.max(0, Math.min(MAX_TYPES - 1, Math.round(l.neighborType))),
-                    op: (l.op === 1 ? 1 : 0) as 0 | 1,
-                    count: Math.max(0, Math.round(l.count)),
-                })),
-            }));
+        const conds = (conditions ?? []).slice(0, MAX_DNF_CONDITIONS).map(c => ({
+            trigger:   Math.max(0, Math.min(MAX_TYPES - 1, Math.round(c.trigger))),
+            op:        Math.max(0, Math.min(3, Math.round(c.op))) as 0 | 1 | 2 | 3,
+            threshold: Number(c.threshold) || 0,
+        }));
+        const ruleList = (rules ?? []).slice(0, MAX_DNF_RULES).map(r => {
+            // Recompile defensively so stored rpn always matches the expression text.
+            const { rpn } = compileBoolExpr(r.expr ?? '', conds.length);
+            return {
+                target: Math.max(0, Math.min(MAX_TYPES - 1, Math.round(r.target))),
+                expr:   r.expr ?? '',
+                rpn:    (r.rpn && r.rpn.length ? r.rpn : rpn).slice(0, DNF_MAX_TOKENS),
+            };
+        });
+        this.dnfTypes[sourceType] = { conditions: conds, rules: ruleList };
         this.dnfDirty = true;
     }
 
     clearDnfRules(): void {
-        for (let s = 0; s < MAX_TYPES; s++) this.dnfRules[s] = [];
+        for (let s = 0; s < MAX_TYPES; s++) this.dnfTypes[s] = { conditions: [], rules: [] };
         this.dnfDirty = true;
     }
 
@@ -3040,9 +3145,8 @@ export class ParticleSimulation {
         }
     }
 
-    // Generate plausible composition rules: each type gets 1-2 clauses, each a
-    // conjunction of 1-2 neighbour-count literals, transforming to another type.
-    // Biased toward "≥ a few of type X" triggers so structures convert as they grow.
+    // Generate plausible force-based rules: each type gets a couple of force
+    // conditions and one transform rule with a small random boolean expression.
     randomizeDnfRules(): void {
         const n = this.numTypes;
         const randType = (exclude = -1) => {
@@ -3050,23 +3154,23 @@ export class ParticleSimulation {
             while (t === exclude && n > 1) t = Math.floor(Math.random() * n);
             return t;
         };
+        const randThresh = () => Math.round((Math.random() * 1.4 - 0.4) * 100) / 100;  // ~ -0.4 .. 1.0
         for (let s = 0; s < MAX_TYPES; s++) {
-            if (s >= n) { this.dnfRules[s] = []; continue; }
-            const nClauses = 1 + (Math.random() < 0.4 ? 1 : 0);
-            const clauses: DnfClause[] = [];
-            for (let c = 0; c < nClauses; c++) {
-                const nLit = 1 + (Math.random() < 0.5 ? 1 : 0);
-                const literals: DnfLiteral[] = [];
-                for (let l = 0; l < nLit; l++) {
-                    literals.push({
-                        neighborType: randType(),
-                        op: Math.random() < 0.75 ? 0 : 1,         // mostly "≥"
-                        count: 1 + Math.floor(Math.random() * 4), // 1..4
-                    });
-                }
-                clauses.push({ target: randType(s), literals });
+            if (s >= n) { this.dnfTypes[s] = { conditions: [], rules: [] }; continue; }
+            const nCond = 1 + Math.floor(Math.random() * 2);  // 1 or 2
+            const conditions: DnfCondition[] = [];
+            for (let c = 0; c < nCond; c++) {
+                conditions.push({
+                    trigger: randType(),
+                    op: (Math.random() < 0.6 ? 0 : 2) as 0 | 2,  // mostly ">", sometimes "<"
+                    threshold: randThresh(),
+                });
             }
-            this.dnfRules[s] = clauses;
+            // Build a small expression over the available conditions.
+            let expr = 'C1';
+            if (nCond >= 2) expr = Math.random() < 0.5 ? 'C1 and C2' : 'C1 or C2';
+            const { rpn } = compileBoolExpr(expr, nCond);
+            this.dnfTypes[s] = { conditions, rules: [{ target: randType(s), expr, rpn }] };
         }
         this.dnfDirty = true;
     }
@@ -3171,7 +3275,7 @@ export class ParticleSimulation {
             patchBondDist:    this.patchTypeBondDist.slice(0, n),
             patchAffinity:    Array.from({ length: n }, (_, from) =>
                                   Array.from({ length: n }, (_, to) => this.patchAffinity[from * MAX_TYPES + to])),
-            dnfRules:         this.getDnfRules(),
+            dnfTypes:         this.getDnfTypes(),
             dnfBonding:       this.dnfBonding,
         };
     }
@@ -3269,11 +3373,13 @@ export class ParticleSimulation {
                 }
         }
         this.patchDirty = true;
-        if (Array.isArray(state.dnfRules)) {
+        if (Array.isArray(state.dnfTypes)) {
             this.clearDnfRules();
             for (let s = 0; s < n; s++) {
-                const cl = state.dnfRules[s];
-                if (Array.isArray(cl)) this.setDnfClauses(s, cl);
+                const dt = state.dnfTypes[s];
+                if (dt && Array.isArray(dt.conditions) && Array.isArray(dt.rules)) {
+                    this.setDnfType(s, dt.conditions, dt.rules);
+                }
             }
         }
         this.dnfDirty = true;

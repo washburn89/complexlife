@@ -1,10 +1,12 @@
-import { ParticleSimulation, TransformRule, DnfClause, MAX_TYPES, MAX_DNF_CLAUSES, MAX_DNF_LITERALS, TYPE_COLORS_HEX, DiagnosticData } from './simulation';
+import { ParticleSimulation, TransformRule, DnfCondition, DnfRule, MAX_TYPES, MAX_DNF_CONDITIONS, MAX_DNF_RULES, compileBoolExpr, TYPE_COLORS_HEX, DiagnosticData } from './simulation';
 
 const TYPE_LABELS = [
     'R', 'G', 'B', 'Y', 'M', 'C', 'O', 'P', 'K', 'S',
     'W', 'A', 'L', 'T', 'I', 'N', 'Q', 'H', 'F', 'Z',
 ];
 const TYPE_HEX = TYPE_COLORS_HEX;
+// DNF condition operators, indexed by op code (0:> 1:>= 2:< 3:<=).
+const DNF_OPSYM = ['>', '≥', '<', '≤'];
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
 
@@ -523,7 +525,7 @@ class ParticleLifeApp {
         }
         if (hasDnf) {
             // First entry with no rules: seed some so transforms are visible at once.
-            if (this.sim && this.sim.getDnfRules().every(c => c.length === 0)) {
+            if (this.sim && this.sim.getDnfTypes().every(dt => dt.conditions.length === 0 && dt.rules.length === 0)) {
                 this.sim.randomizeDnfRules();
             }
             this.syncDnfBondingButtons();
@@ -1584,15 +1586,15 @@ class ParticleLifeApp {
         this.buildDnfList();
     }
 
-    // Human-readable "≥2 R & ≤0 B → G  OR  ≥3 C → Y" for one source type's clauses.
-    private dnfSummary(clauses: DnfClause[]): string {
-        if (!clauses.length) return '<span class="empty">(no rules — never transforms)</span>';
-        return clauses.map(c => {
-            const conds = (c.literals ?? []).map(l =>
-                `${l.op === 1 ? '≤' : '≥'}${l.count} <span style="color:${TYPE_HEX[l.neighborType]}">${TYPE_LABELS[l.neighborType]}</span>`).join(' & ');
-            const body = conds || '<span class="empty">always</span>';
-            return `${body} → <span style="color:${TYPE_HEX[c.target]}">${TYPE_LABELS[c.target]}</span>`;
-        }).join('  <span style="color:#789">OR</span>  ');
+    // Human-readable "C1: G>0.25  C2: B>1  →  P if (C1 and C2)" for one type.
+    private dnfSummary(dt: { conditions: DnfCondition[]; rules: DnfRule[] }): string {
+        if (!dt.conditions.length && !dt.rules.length) return '<span class="empty">(no rules — never transforms)</span>';
+        const conds = dt.conditions.map((c, i) =>
+            `<span class="dnf-cref">C${i + 1}</span>:<span style="color:${TYPE_HEX[c.trigger]}">${TYPE_LABELS[c.trigger]}</span>${DNF_OPSYM[c.op]}${c.threshold}`).join('  ');
+        const rules = dt.rules.length
+            ? dt.rules.map(r => `→<span style="color:${TYPE_HEX[r.target]}">${TYPE_LABELS[r.target]}</span> if <code>${r.expr || '∅'}</code>`).join('  ')
+            : '<span class="empty">(no transform)</span>';
+        return `${conds}${conds ? '  ' : ''}${rules}`;
     }
 
     private buildDnfList(): void {
@@ -1600,14 +1602,14 @@ class ParticleLifeApp {
         if (!list || !this.sim) return;
         list.innerHTML = '';
         const n = this.sim.getNumTypes();
-        const rules = this.sim.getDnfRules();
+        const types = this.sim.getDnfTypes();
 
         for (let t = 0; t < n; t++) {
             const row = document.createElement('div');
             row.className = 'dnf-row';
             row.innerHTML =
                 `<span class="dnf-src" style="color:${TYPE_HEX[t]}">${TYPE_LABELS[t]}</span>` +
-                `<span class="dnf-summary">${this.dnfSummary(rules[t] ?? [])}</span>`;
+                `<span class="dnf-summary">${this.dnfSummary(types[t] ?? { conditions: [], rules: [] })}</span>`;
             row.addEventListener('click', () => {
                 this.dnfEditType = this.dnfEditType === t ? null : t;
                 this.buildDnfList();
@@ -1622,98 +1624,130 @@ class ParticleLifeApp {
         }
     }
 
-    // Inline editor for one source type. Mutates a working copy and commits to the
-    // sim on every change; structural edits (add/remove) re-render the editor.
-    private buildDnfEditor(t: number): HTMLElement {
+    private dnfTypeSelect(val: number, onset: (v: number) => void): HTMLSelectElement {
         const n = this.sim!.getNumTypes();
-        const work: DnfClause[] = (this.sim!.getDnfRules()[t] ?? []).map(c => ({
-            target: c.target, literals: c.literals.map(l => ({ ...l })),
-        }));
-        const commit = () => this.sim!.setDnfClauses(t, work);
+        const sel = document.createElement('select');
+        for (let i = 0; i < n; i++) {
+            const o = document.createElement('option');
+            o.value = String(i); o.textContent = TYPE_LABELS[i];
+            if (i === val) o.selected = true;
+            sel.appendChild(o);
+        }
+        sel.addEventListener('change', () => onset(Number(sel.value)));
+        return sel;
+    }
+
+    // Inline editor for one source type: a list of force conditions plus a list of
+    // transform rules (target + boolean expression over the conditions). Mutates a
+    // working copy and commits to the sim on every change.
+    private buildDnfEditor(t: number): HTMLElement {
+        const dt = this.sim!.getDnfTypes()[t] ?? { conditions: [], rules: [] };
+        const conditions: DnfCondition[] = dt.conditions.map(c => ({ ...c }));
+        const rules: DnfRule[] = dt.rules.map(r => ({ target: r.target, expr: r.expr, rpn: r.rpn.slice() }));
+        const commit = () => this.sim!.setDnfType(t, conditions, rules);
+        const rebuild = () => { commit(); const fresh = this.buildDnfEditor(t); wrap.replaceWith(fresh); fresh.addEventListener('click', e => e.stopPropagation()); };
 
         const wrap = document.createElement('div');
         wrap.className = 'dnf-edit';
 
-        const typeSelect = (val: number, onset: (v: number) => void) => {
-            const sel = document.createElement('select');
-            for (let i = 0; i < n; i++) {
+        // ── Conditions ───────────────────────────────────────────────────────
+        const cHead = document.createElement('div');
+        cHead.className = 'dnf-section'; cHead.textContent = 'Conditions (force from a type vs threshold)';
+        wrap.appendChild(cHead);
+
+        conditions.forEach((cd, ci) => {
+            const line = document.createElement('div');
+            line.className = 'dnf-line';
+            const tag = document.createElement('span');
+            tag.className = 'dnf-cref'; tag.textContent = `C${ci + 1}`;
+            line.appendChild(tag);
+            line.appendChild(document.createTextNode('force of'));
+            line.appendChild(this.dnfTypeSelect(cd.trigger, v => { cd.trigger = v; commit(); }));
+
+            const opSel = document.createElement('select');
+            DNF_OPSYM.forEach((sym, v) => {
                 const o = document.createElement('option');
-                o.value = String(i); o.textContent = TYPE_LABELS[i];
-                if (i === val) o.selected = true;
-                sel.appendChild(o);
-            }
-            sel.addEventListener('change', () => onset(Number(sel.value)));
-            return sel;
-        };
-
-        const rebuild = () => { commit(); const fresh = this.buildDnfEditor(t); wrap.replaceWith(fresh); };
-
-        work.forEach((clause, ci) => {
-            if (ci > 0) { const or = document.createElement('div'); or.className = 'dnf-or'; or.textContent = 'OR'; wrap.appendChild(or); }
-            const cl = document.createElement('div');
-            cl.className = 'dnf-clause';
-
-            (clause.literals ?? []).forEach((lit, li) => {
-                const line = document.createElement('div');
-                line.className = 'dnf-line';
-                line.appendChild(document.createTextNode('count of'));
-                line.appendChild(typeSelect(lit.neighborType, v => { lit.neighborType = v; commit(); }));
-
-                const opSel = document.createElement('select');
-                [['≥', '0'], ['≤', '1']].forEach(([lbl, v]) => {
-                    const o = document.createElement('option');
-                    o.value = v; o.textContent = lbl;
-                    if (Number(v) === lit.op) o.selected = true;
-                    opSel.appendChild(o);
-                });
-                opSel.addEventListener('change', () => { lit.op = Number(opSel.value) as 0 | 1; commit(); });
-                line.appendChild(opSel);
-
-                const cnt = document.createElement('input');
-                cnt.type = 'number'; cnt.min = '0'; cnt.max = '99'; cnt.value = String(lit.count);
-                cnt.addEventListener('change', () => { lit.count = Math.max(0, Number(cnt.value) | 0); cnt.value = String(lit.count); commit(); });
-                line.appendChild(cnt);
-
-                const del = document.createElement('button');
-                del.textContent = '✕';
-                del.title = 'remove condition';
-                del.addEventListener('click', () => { clause.literals.splice(li, 1); rebuild(); });
-                line.appendChild(del);
-
-                cl.appendChild(line);
+                o.value = String(v); o.textContent = sym;
+                if (v === cd.op) o.selected = true;
+                opSel.appendChild(o);
             });
+            opSel.addEventListener('change', () => { cd.op = Number(opSel.value) as 0 | 1 | 2 | 3; commit(); });
+            line.appendChild(opSel);
 
-            const ctrl = document.createElement('div');
-            ctrl.className = 'dnf-line';
-            if ((clause.literals ?? []).length < MAX_DNF_LITERALS) {
-                const add = document.createElement('button');
-                add.textContent = '+ condition';
-                add.addEventListener('click', () => {
-                    clause.literals.push({ neighborType: 0, op: 0, count: 1 });
-                    rebuild();
-                });
-                ctrl.appendChild(add);
-            }
-            ctrl.appendChild(document.createTextNode('→ become'));
-            ctrl.appendChild(typeSelect(clause.target, v => { clause.target = v; commit(); }));
-            const delC = document.createElement('button');
-            delC.textContent = '✕ clause';
-            delC.addEventListener('click', () => { work.splice(ci, 1); rebuild(); });
-            ctrl.appendChild(delC);
-            cl.appendChild(ctrl);
+            const thr = document.createElement('input');
+            thr.type = 'number'; thr.step = '0.05'; thr.min = '-3'; thr.max = '3'; thr.value = String(cd.threshold);
+            thr.addEventListener('change', () => { cd.threshold = Number(thr.value) || 0; thr.value = String(cd.threshold); commit(); });
+            line.appendChild(thr);
 
-            wrap.appendChild(cl);
+            const del = document.createElement('button');
+            del.textContent = '✕'; del.title = 'remove condition';
+            del.addEventListener('click', () => { conditions.splice(ci, 1); rebuild(); });
+            line.appendChild(del);
+            wrap.appendChild(line);
         });
 
-        if (work.length < MAX_DNF_CLAUSES) {
-            const addClause = document.createElement('button');
-            addClause.textContent = '+ clause (OR)';
-            addClause.style.alignSelf = 'flex-start';
-            addClause.addEventListener('click', () => {
-                work.push({ target: (t + 1) % Math.max(1, n), literals: [{ neighborType: 0, op: 0, count: 1 }] });
+        if (conditions.length < MAX_DNF_CONDITIONS) {
+            const add = document.createElement('button');
+            add.textContent = '+ condition';
+            add.style.alignSelf = 'flex-start';
+            add.addEventListener('click', () => { conditions.push({ trigger: 0, op: 0, threshold: 0.25 }); rebuild(); });
+            wrap.appendChild(add);
+        }
+
+        // ── Transform rules ──────────────────────────────────────────────────
+        const rHead = document.createElement('div');
+        rHead.className = 'dnf-section'; rHead.textContent = 'Transforms (first true rule wins)';
+        wrap.appendChild(rHead);
+
+        rules.forEach((ru, ri) => {
+            const line = document.createElement('div');
+            line.className = 'dnf-line';
+            line.appendChild(document.createTextNode('become'));
+            line.appendChild(this.dnfTypeSelect(ru.target, v => { ru.target = v; commit(); }));
+            line.appendChild(document.createTextNode('if'));
+
+            const expr = document.createElement('input');
+            expr.type = 'text'; expr.className = 'dnf-expr';
+            expr.placeholder = 'e.g. (C1 and C2) or not C3';
+            expr.value = ru.expr;
+            const status = document.createElement('span');
+            status.className = 'dnf-status';
+            const validate = () => {
+                const res = compileBoolExpr(expr.value, conditions.length);
+                ru.expr = expr.value;
+                ru.rpn = res.rpn;
+                if (res.error) { status.textContent = '✗ ' + res.error; status.style.color = '#e66'; }
+                else if (!expr.value.trim()) { status.textContent = ''; }
+                else { status.textContent = '✓'; status.style.color = '#6c6'; }
+                commit();
+            };
+            expr.addEventListener('input', validate);
+            line.appendChild(expr);
+
+            const del = document.createElement('button');
+            del.textContent = '✕'; del.title = 'remove transform';
+            del.addEventListener('click', () => { rules.splice(ri, 1); rebuild(); });
+            line.appendChild(del);
+            wrap.appendChild(line);
+
+            const statusLine = document.createElement('div');
+            statusLine.className = 'dnf-line';
+            statusLine.style.minHeight = '12px';
+            statusLine.appendChild(status);
+            wrap.appendChild(statusLine);
+            validate();
+        });
+
+        if (rules.length < MAX_DNF_RULES) {
+            const n = this.sim!.getNumTypes();
+            const add = document.createElement('button');
+            add.textContent = '+ transform';
+            add.style.alignSelf = 'flex-start';
+            add.addEventListener('click', () => {
+                rules.push({ target: (t + 1) % Math.max(1, n), expr: conditions.length ? 'C1' : '', rpn: [] });
                 rebuild();
             });
-            wrap.appendChild(addClause);
+            wrap.appendChild(add);
         }
 
         return wrap;
