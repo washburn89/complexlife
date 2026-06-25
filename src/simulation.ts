@@ -205,17 +205,23 @@ export class ParticleSimulation {
     // particle. Two particles bond when a patch on each points at the other, which
     // applies a radial spring (toward bondDist) plus a torque that aligns the patch.
     private patchCount: number[] = Array(MAX_TYPES).fill(0);
-    private patchBondStrength = 0.2;   // light by default: bonds nudge, the force matrix drives motion
     private patchBondRange    = 60;    // max centre-to-centre distance a bond can act over
-    private patchBondDist     = 26;    // preferred centre-to-centre bond distance (r0)
     private patchAngStiffness = 0.3;   // torque strength aligning a patch to the bond axis
     private patchAngFriction  = 0.8;   // angular-velocity damping per tick (lower = more damped)
     private patchWidth        = 6;     // angular selectivity (higher = narrower patches)
     private patchIsoScale     = 1.0;   // full asymmetric force matrix (the "ship" engine) by default
     private patchCoreStrength = 0.6;   // excluded-volume repulsion that keeps structures open
+    // Per-type bond params: each particle applies its OWN strength/rest-length to the
+    // pull it feels, so mismatched partners simply produce non-reciprocal (motile) bonds.
+    private patchTypeBondStr:  number[] = Array(MAX_TYPES).fill(0.2);
+    private patchTypeBondDist: number[] = Array(MAX_TYPES).fill(26);
+    // Bond-affinity matrix [from*MAX_TYPES + to]: 0 = no bond, >0 scales bond strength.
+    // Asymmetric is allowed (predator/prey bonds). Default 1 = everything can bond.
+    private patchAffinity: number[] = Array(MAX_TYPES * MAX_TYPES).fill(1);
     private orientationBuffer:       GPUBuffer | null = null;
     private sortedOrientationBuffer: GPUBuffer | null = null;
     private patchConfigBuffer:       GPUBuffer | null = null;
+    private patchTablesBuffer:       GPUBuffer | null = null;
     private mode3BGL:                GPUBindGroupLayout | null = null;
     private mode3Pipeline:           GPUComputePipeline | null = null;
     private mode3BindGroup:          GPUBindGroup       | null = null;
@@ -318,13 +324,15 @@ export class ParticleSimulation {
 
     // Mode 3 patch config uniform: 8 leading floats of global params followed by
     // the 20 per-type valence counts packed 4-per-vec4u (matches WGSL layout).
+    // (Slots 0 and 2 once held global bond strength/distance — now per-type, see
+    // generatePatchTablesData — so they are left as unused zeros.)
     private generatePatchConfigData(): ArrayBuffer {
         const ab  = new ArrayBuffer(8 * 4 + MAX_TYPES * 4);  // 32 + 80 = 112 bytes
         const f32 = new Float32Array(ab);
         const u32 = new Uint32Array(ab);
-        f32[0] = this.patchBondStrength;
+        f32[0] = 0;
         f32[1] = this.patchBondRange;
-        f32[2] = this.patchBondDist;
+        f32[2] = 0;
         f32[3] = this.patchAngStiffness;
         f32[4] = this.patchAngFriction;
         f32[5] = this.patchWidth;
@@ -332,6 +340,21 @@ export class ParticleSimulation {
         f32[7] = this.patchCoreStrength;
         for (let i = 0; i < MAX_TYPES; i++) {
             u32[8 + i] = Math.max(0, Math.min(6, Math.round(this.patchCount[i] ?? 0)));
+        }
+        return ab;
+    }
+
+    // Mode 3 per-type/affinity tables uniform. Layout (all f32, tight vec4 packing):
+    //   [0..399]   affinity[from*20 + to]   (array<vec4f,100>)
+    //   [400..419] per-type bond strength   (array<vec4f,5>)
+    //   [420..439] per-type bond rest dist  (array<vec4f,5>)
+    private generatePatchTablesData(): ArrayBuffer {
+        const ab  = new ArrayBuffer(440 * 4);  // 1760 bytes (multiple of 16)
+        const f32 = new Float32Array(ab);
+        for (let i = 0; i < MAX_TYPES * MAX_TYPES; i++) f32[i] = this.patchAffinity[i] ?? 0;
+        for (let t = 0; t < MAX_TYPES; t++) {
+            f32[400 + t] = this.patchTypeBondStr[t]  ?? 0;
+            f32[420 + t] = this.patchTypeBondDist[t] ?? 26;
         }
         return ab;
     }
@@ -512,6 +535,8 @@ export class ParticleSimulation {
         this.sortedOrientationBuffer = this.device!.createBuffer({ label: 'orientationSorted', size: MAX_PARTICLE_CAPACITY * 2 * 4, usage: GPUBufferUsage.STORAGE });
         this.patchConfigBuffer = this.device!.createBuffer({ label: 'patchConfig', size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.queue!.writeBuffer(this.patchConfigBuffer, 0, this.generatePatchConfigData());
+        this.patchTablesBuffer = this.device!.createBuffer({ label: 'patchTables', size: 1760, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.queue!.writeBuffer(this.patchTablesBuffer, 0, this.generatePatchTablesData());
     }
 
     private async createPipelines(): Promise<void> {
@@ -680,6 +705,7 @@ export class ParticleSimulation {
             { binding: 8,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // params
             { binding: 9,  visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // patchConfig
             { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // transformRules (mode 4)
+            { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // patchTables (affinity + per-type)
         ]});
         this.mode3Pipeline = this.device.createComputePipeline({
             layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.mode3BGL] }),
@@ -829,7 +855,7 @@ export class ParticleSimulation {
             });
         }
 
-        if (this.mode3BGL && this.orientationBuffer && this.sortedOrientationBuffer && this.patchConfigBuffer) {
+        if (this.mode3BGL && this.orientationBuffer && this.sortedOrientationBuffer && this.patchConfigBuffer && this.patchTablesBuffer) {
             this.mode3BindGroup = this.device.createBindGroup({
                 layout: this.mode3BGL,
                 entries: [
@@ -844,6 +870,7 @@ export class ParticleSimulation {
                     { binding: 8,  resource: { buffer: this.paramsBuffer            } },
                     { binding: 9,  resource: { buffer: this.patchConfigBuffer       } },
                     { binding: 10, resource: { buffer: this.transformBuffer         } },
+                    { binding: 11, resource: { buffer: this.patchTablesBuffer!      } },
                 ],
             });
         }
@@ -1806,9 +1833,14 @@ export class ParticleSimulation {
             struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
                                 friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
             struct PatchConfig {
-                bondStrength: f32, bondRange: f32, bondDist: f32, angStiffness: f32,
+                _bs: f32, bondRange: f32, _bd: f32, angStiffness: f32,
                 angFriction: f32, patchWidth: f32, isoScale: f32, coreStrength: f32,
                 patchCount: array<vec4u, 5>,
+            }
+            struct PatchTables {
+                affinity: array<vec4f, 100>,  // [from*20 + to]
+                bondStr:  array<vec4f, 5>,    // per-type bond strength
+                bondDist: array<vec4f, 5>,    // per-type bond rest length
             }
 
             @group(0) @binding(0)  var<storage, read_write> particles:         array<Particle>;
@@ -1822,8 +1854,12 @@ export class ParticleSimulation {
             @group(0) @binding(8)  var<uniform>             params:            SimParams;
             @group(0) @binding(9)  var<uniform>             cfg:               PatchConfig;
             @group(0) @binding(10) var<storage, read>       transformRules:    array<TransformRule>;
+            @group(0) @binding(11) var<uniform>             tab:               PatchTables;
 
             fn patchN(t: u32) -> u32 { return cfg.patchCount[t >> 2u][t & 3u]; }
+            fn bondStrOf(t: u32)  -> f32 { return tab.bondStr[t >> 2u][t & 3u]; }
+            fn bondDistOf(t: u32) -> f32 { return tab.bondDist[t >> 2u][t & 3u]; }
+            fn affinityOf(a: u32, b: u32) -> f32 { let i = a * 20u + b; return tab.affinity[i >> 2u][i & 3u]; }
 
             const TAU = 6.28318530718;
 
@@ -1896,7 +1932,9 @@ export class ParticleSimulation {
                 let cs   = gridParams.cellSize;
                 let myGx = clamp(i32(p.pos.x / cs), 0, gw - 1);
                 let myGy = clamp(i32(p.pos.y / cs), 0, gh - 1);
-                let core = cfg.bondDist * 0.9;   // excluded-volume radius
+                let myBondStr  = bondStrOf(myType);
+                let myBondDist = bondDistOf(myType);
+                let core = myBondDist * 0.9;     // excluded-volume radius (per-type size)
 
                 // ── Pass A: winner-take-all per patch. Each neighbour is assigned to my
                 // best-aligned patch; we keep only the single strongest candidate per
@@ -1931,10 +1969,12 @@ export class ParticleSimulation {
                                 }
                                 let dist = sqrt(dx * dx + dy * dy);
                                 if (dist < 0.1 || dist > cfg.bondRange) { continue; }
+                                let aff = affinityOf(myType, u32(other.typeId));
+                                if (aff <= 0.0) { continue; }
                                 let axis   = atan2(dy, dx);
                                 let mine   = bestPatch(myTheta, myPatch, axis);
                                 let theirs = bestPatch(sortedOrientation[k].x, otherPatch, axis + 3.14159265359);
-                                let bond   = pow(max(mine.x, 0.0), cfg.patchWidth) * pow(max(theirs.x, 0.0), cfg.patchWidth);
+                                let bond   = pow(max(mine.x, 0.0), cfg.patchWidth) * pow(max(theirs.x, 0.0), cfg.patchWidth) * aff;
                                 let pk     = u32(mine.z);
                                 if (bond > bestBond[pk]) { bestBond[pk] = bond; bestIdx[pk] = k; }
                             }
@@ -1999,24 +2039,28 @@ export class ParticleSimulation {
                             }
 
                             // Directional patch bond, winner-take-all per patch.
+                            // Each particle applies its OWN strength + rest length, gated by
+                            // its affinity to the partner's type (asymmetric = non-reciprocal).
                             let otherPatch = patchN(otherType);
-                            if (myPatch > 0u && otherPatch > 0u && dist <= cfg.bondRange) {
+                            let aff = affinityOf(myType, otherType);
+                            if (myPatch > 0u && otherPatch > 0u && aff > 0.0 && dist <= cfg.bondRange) {
                                 let axis   = atan2(dy, dx);          // me -> other
                                 let mine   = bestPatch(myTheta, myPatch, axis);
                                 let theirs = bestPatch(sortedOrientation[k].x, otherPatch, axis + 3.14159265359);
-                                let bond   = pow(max(mine.x, 0.0), cfg.patchWidth) * pow(max(theirs.x, 0.0), cfg.patchWidth);
+                                let bond   = pow(max(mine.x, 0.0), cfg.patchWidth) * pow(max(theirs.x, 0.0), cfg.patchWidth) * aff;
                                 let pk     = u32(mine.z);
                                 if (bond > 0.0001) {
                                     if (k == bestIdx[pk]) {
-                                        // Winner: a real bond — spring toward bondDist + torque.
-                                        let disp = (dist - cfg.bondDist) / cfg.bondRange;
-                                        accel  += dir * cfg.bondStrength * bond * disp;
+                                        // Winner: a real bond — spring toward this type's rest
+                                        // length + torque to lock the patch onto the axis.
+                                        let disp = (dist - myBondDist) / cfg.bondRange;
+                                        accel  += dir * myBondStr * bond * disp;
                                         torque += cfg.angStiffness * bond * sin(axis - mine.y);
                                     } else {
                                         // Loser competing for an occupied patch: push it away
                                         // so coordination stays at the valence and the
                                         // structure can keep tiling outward.
-                                        accel -= dir * cfg.bondStrength * bond * 0.6;
+                                        accel -= dir * myBondStr * bond * 0.6;
                                     }
                                 }
                             }
@@ -2109,6 +2153,7 @@ export class ParticleSimulation {
         }
         if (this.patchDirty) {
             this.queue.writeBuffer(this.patchConfigBuffer!, 0, this.generatePatchConfigData());
+            this.queue.writeBuffer(this.patchTablesBuffer!, 0, this.generatePatchTablesData());
             this.patchDirty = false;
         }
 
@@ -2537,28 +2582,33 @@ export class ParticleSimulation {
         this.patchDirty = true;
     }
 
-    // Randomize the global bonding parameters (the patchy sliders), kept in ranges
-    // that reliably still bond: bondDist sits well inside bondRange.
+    // Randomize all bonding knobs: globals, per-type strength/rest-length, and the
+    // affinity matrix (made sparse so types bond selectively → richer assemblies).
     randomizePatchParams(): void {
         const rand = (a: number, b: number) => a + Math.random() * (b - a);
         this.patchBondRange    = rand(40, 100);
-        this.patchBondDist     = this.patchBondRange * rand(0.3, 0.55);
-        this.patchBondStrength = rand(0.1, 0.5);   // light: bonds nudge, not freeze
         this.patchWidth        = rand(3, 12);
         this.patchAngStiffness = rand(0.15, 0.6);
         this.patchAngFriction  = rand(0.6, 0.95);  // multiplier; lower = more damping
         this.patchIsoScale     = rand(0.6, 1.0);   // keep the asymmetric force matrix strong
+        for (let t = 0; t < this.numTypes; t++) {
+            this.patchTypeBondStr[t]  = rand(0.1, 0.5);                       // light: bonds nudge
+            this.patchTypeBondDist[t] = this.patchBondRange * rand(0.3, 0.55);
+        }
+        // Sparse affinity: ~35% of ordered type pairs can bond, giving selective
+        // (often asymmetric) relationships rather than universal stickiness.
+        for (let from = 0; from < this.numTypes; from++)
+            for (let to = 0; to < this.numTypes; to++) {
+                this.patchAffinity[from * MAX_TYPES + to] = Math.random() < 0.35 ? rand(0.4, 1.0) : 0;
+            }
         this.patchDirty = true;
     }
 
     setPatchParams(p: Partial<{
-        bondStrength: number; bondRange: number; bondDist: number;
-        angStiffness: number; angFriction: number; patchWidth: number;
-        isoScale: number; coreStrength: number;
+        bondRange: number; angStiffness: number; angFriction: number;
+        patchWidth: number; isoScale: number; coreStrength: number;
     }>): void {
-        if (p.bondStrength != null) this.patchBondStrength = Math.max(0,   Math.min(2,   p.bondStrength));
         if (p.bondRange    != null) this.patchBondRange    = Math.max(5,   Math.min(200, p.bondRange));
-        if (p.bondDist     != null) this.patchBondDist     = Math.max(2,   Math.min(150, p.bondDist));
         if (p.angStiffness != null) this.patchAngStiffness = Math.max(0,   Math.min(2,   p.angStiffness));
         if (p.angFriction  != null) this.patchAngFriction  = Math.max(0,   Math.min(1,   p.angFriction));
         if (p.patchWidth   != null) this.patchWidth        = Math.max(1,   Math.min(20,  p.patchWidth));
@@ -2568,11 +2618,30 @@ export class ParticleSimulation {
     }
     getPatchParams() {
         return {
-            bondStrength: this.patchBondStrength, bondRange: this.patchBondRange,
-            bondDist:     this.patchBondDist,     angStiffness: this.patchAngStiffness,
-            angFriction:  this.patchAngFriction,  patchWidth: this.patchWidth,
-            isoScale:     this.patchIsoScale,     coreStrength: this.patchCoreStrength,
+            bondRange:   this.patchBondRange,   angStiffness: this.patchAngStiffness,
+            angFriction: this.patchAngFriction, patchWidth:   this.patchWidth,
+            isoScale:    this.patchIsoScale,    coreStrength: this.patchCoreStrength,
         };
+    }
+
+    // Per-type bond strength + rest length.
+    setPatchTypeBond(typeIdx: number, strength?: number, dist?: number): void {
+        if (typeIdx < 0 || typeIdx >= MAX_TYPES) return;
+        if (strength != null) this.patchTypeBondStr[typeIdx]  = Math.max(0, Math.min(2,   strength));
+        if (dist     != null) this.patchTypeBondDist[typeIdx] = Math.max(2, Math.min(150, dist));
+        this.patchDirty = true;
+    }
+    getPatchTypeBondStr():  number[] { return this.patchTypeBondStr.slice(0, this.numTypes); }
+    getPatchTypeBondDist(): number[] { return this.patchTypeBondDist.slice(0, this.numTypes); }
+
+    // Bond-affinity matrix (who-bonds-whom, asymmetric).
+    setAffinity(from: number, to: number, v: number): void {
+        if (from < 0 || from >= MAX_TYPES || to < 0 || to >= MAX_TYPES) return;
+        this.patchAffinity[from * MAX_TYPES + to] = Math.max(0, Math.min(2, v));
+        this.patchDirty = true;
+    }
+    getAffinity(from: number, to: number): number {
+        return this.patchAffinity[from * MAX_TYPES + to] ?? 0;
     }
 
     setTypeMass(typeIdx: number, mass: number): void {
@@ -2905,6 +2974,10 @@ export class ParticleSimulation {
             typeMass:         masses,
             patchCount:       patches,
             patchParams:      this.getPatchParams(),
+            patchBondStr:     this.patchTypeBondStr.slice(0, n),
+            patchBondDist:    this.patchTypeBondDist.slice(0, n),
+            patchAffinity:    Array.from({ length: n }, (_, from) =>
+                                  Array.from({ length: n }, (_, to) => this.patchAffinity[from * MAX_TYPES + to])),
         };
     }
 
@@ -2985,6 +3058,21 @@ export class ParticleSimulation {
             }
         }
         if (state.patchParams) this.setPatchParams(state.patchParams);
+        if (Array.isArray(state.patchBondStr)) {
+            for (let t = 0; t < n; t++) if (state.patchBondStr[t] != null)
+                this.patchTypeBondStr[t] = Math.max(0, Math.min(2, Number(state.patchBondStr[t])));
+        }
+        if (Array.isArray(state.patchBondDist)) {
+            for (let t = 0; t < n; t++) if (state.patchBondDist[t] != null)
+                this.patchTypeBondDist[t] = Math.max(2, Math.min(150, Number(state.patchBondDist[t])));
+        }
+        if (Array.isArray(state.patchAffinity)) {
+            for (let from = 0; from < n; from++)
+                for (let to = 0; to < n; to++) {
+                    const v = state.patchAffinity[from]?.[to];
+                    if (v != null) this.patchAffinity[from * MAX_TYPES + to] = Math.max(0, Math.min(2, Number(v)));
+                }
+        }
         this.patchDirty = true;
 
         if (!this.isInitialized || !this.queue) return;

@@ -267,7 +267,7 @@ class ParticleLifeApp {
         });
         document.getElementById('randomizeBondingBtn')!.addEventListener('click', () => {
             this.sim?.randomizePatchParams();
-            this.syncPatchSliders();
+            this.refreshPatchUI();
         });
 
         // Master randomize: action button + caret that opens the checklist.
@@ -285,7 +285,7 @@ class ParticleLifeApp {
             this.toggleRandomizeMenu(false);
         });
         const patchSlider = (id: string, valId: string, key:
-            'bondStrength' | 'bondRange' | 'bondDist' | 'angStiffness' | 'angFriction' | 'patchWidth' | 'isoScale',
+            'bondRange' | 'angStiffness' | 'angFriction' | 'patchWidth' | 'isoScale',
             fmt: (v: number) => string) => {
             const el  = document.getElementById(id) as HTMLInputElement;
             const out = document.getElementById(valId)!;
@@ -295,9 +295,7 @@ class ParticleLifeApp {
                 this.sim?.setPatchParams({ [key]: v });
             });
         };
-        patchSlider('patchStrengthSlider', 'patchStrengthValue', 'bondStrength', v => v.toFixed(2));
         patchSlider('patchRangeSlider',    'patchRangeValue',    'bondRange',    v => String(Math.round(v)));
-        patchSlider('patchDistSlider',     'patchDistValue',     'bondDist',     v => String(Math.round(v)));
         patchSlider('patchWidthSlider',    'patchWidthValue',    'patchWidth',   v => String(v));
         patchSlider('patchIsoSlider',      'patchIsoValue',      'isoScale',     v => v.toFixed(2));
         patchSlider('patchAngSlider',      'patchAngValue',      'angStiffness', v => v.toFixed(2));
@@ -490,7 +488,7 @@ class ParticleLifeApp {
             if (this.sim && this.sim.getPatchCount().every(v => v === 0)) {
                 this.sim.randomizePatches();
             }
-            this.refreshPatchTable();
+            this.refreshPatchUI();
         }
     }
 
@@ -1084,7 +1082,7 @@ class ParticleLifeApp {
         if (refreshes.has('poles'))     this.buildPolePanel();
         if (refreshes.has('masses'))    this.refreshMassTable();
         if (refreshes.has('valences'))  this.refreshPatchTable();
-        if (refreshes.has('bonding'))   this.syncPatchSliders();
+        if (refreshes.has('bonding'))   this.refreshPatchUI();
     }
 
     private refreshPaintTypePicker(): void {
@@ -1405,14 +1403,19 @@ class ParticleLifeApp {
             (document.getElementById(id) as HTMLInputElement).value = String(v);
             document.getElementById(valId)!.textContent = txt;
         };
-        setSlider('patchStrengthSlider', 'patchStrengthValue', pp.bondStrength, pp.bondStrength.toFixed(2));
         setSlider('patchRangeSlider',    'patchRangeValue',    pp.bondRange,    String(Math.round(pp.bondRange)));
-        setSlider('patchDistSlider',     'patchDistValue',     pp.bondDist,     String(Math.round(pp.bondDist)));
         setSlider('patchWidthSlider',    'patchWidthValue',    pp.patchWidth,   String(Math.round(pp.patchWidth)));
         setSlider('patchIsoSlider',      'patchIsoValue',      pp.isoScale,     pp.isoScale.toFixed(2));
         setSlider('patchAngSlider',      'patchAngValue',      pp.angStiffness, pp.angStiffness.toFixed(2));
         const spinDamp = 1 - pp.angFriction;  // slider = 1 - stored multiplier
         setSlider('patchAngFricSlider',  'patchAngFricValue',  spinDamp, spinDamp.toFixed(2));
+    }
+
+    // Refresh everything in the patchy panel (sliders, per-type table, affinity grid).
+    private refreshPatchUI(): void {
+        this.syncPatchSliders();
+        this.refreshPatchTable();
+        this.buildAffinityMatrix();
     }
 
     private refreshPatchTable(): void {
@@ -1421,6 +1424,30 @@ class ParticleLifeApp {
         tbl.innerHTML = '';
         const n       = this.sim.getNumTypes();
         const patches = this.sim.getPatchCount();
+        const strs    = this.sim.getPatchTypeBondStr();
+        const dists   = this.sim.getPatchTypeBondDist();
+
+        const hdr = tbl.insertRow();
+        ['', 'type', 'valence', 'strength', 'rest'].forEach(h => {
+            const th = document.createElement('th');
+            th.textContent = h;
+            th.style.cssText = 'font-size:9px;color:#666;text-align:left;font-weight:normal;padding:0 4px 2px';
+            hdr.appendChild(th);
+        });
+
+        const numInput = (val: number, min: number, max: number, step: number, onset: (v: number) => void) => {
+            const inp = document.createElement('input');
+            inp.type = 'number';
+            inp.min = String(min); inp.max = String(max); inp.step = String(step);
+            inp.value = String(val);
+            inp.addEventListener('change', () => {
+                const v = Math.max(min, Math.min(max, Number(inp.value)));
+                inp.value = String(v);
+                onset(v);
+            });
+            return inp;
+        };
+
         for (let t = 0; t < n; t++) {
             const row    = tbl.insertRow();
             const swCell = row.insertCell();
@@ -1433,25 +1460,60 @@ class ParticleLifeApp {
             labelCell.textContent = TYPE_LABELS[t];
             labelCell.style.color = TYPE_HEX[t];
 
-            const inputCell = row.insertCell();
-            const inp = document.createElement('input');
-            inp.type  = 'number';
-            inp.min   = '0'; inp.max = '6'; inp.step = '1';
-            inp.value = String(patches[t] ?? 0);
-
-            const hintCell = row.insertCell();
-            hintCell.style.fontSize = '9px';
-            hintCell.style.color    = '#555';
-            hintCell.textContent    = this.patchHint(patches[t] ?? 0);
-
-            inp.addEventListener('change', () => {
-                let v = Math.max(0, Math.min(6, Math.round(Number(inp.value))));
-                if (v === 1) v = 2;  // single patch is degenerate
-                inp.value = String(v);
-                this.sim?.setPatchCount(t, v);
-                hintCell.textContent = this.patchHint(v);
+            // Valence
+            const vInp = numInput(patches[t] ?? 0, 0, 6, 1, v => {
+                let nv = Math.round(v);
+                if (nv === 1) nv = 2;  // single patch is degenerate
+                vInp.value = String(nv);
+                this.sim?.setPatchCount(t, nv);
             });
-            inputCell.appendChild(inp);
+            row.insertCell().appendChild(vInp);
+
+            // Per-type bond strength
+            row.insertCell().appendChild(
+                numInput(Math.round((strs[t] ?? 0) * 100) / 100, 0, 2, 0.05, v => this.sim?.setPatchTypeBond(t, v, undefined)));
+
+            // Per-type rest length
+            row.insertCell().appendChild(
+                numInput(Math.round(dists[t] ?? 26), 2, 150, 1, v => this.sim?.setPatchTypeBond(t, undefined, v)));
+        }
+    }
+
+    // Bond-affinity matrix: who bonds whom. Click a cell to cycle 0 -> 0.5 -> 1.
+    private buildAffinityMatrix(): void {
+        const table = document.getElementById('affinity-table') as HTMLTableElement;
+        if (!table || !this.sim) return;
+        table.innerHTML = '';
+        const n = this.sim.getNumTypes();
+
+        const hdr = document.createElement('tr');
+        hdr.innerHTML = '<th></th>' + TYPE_LABELS.slice(0, n).map((lbl, i) =>
+            `<th><span class="type-pip" style="background:${TYPE_HEX[i]}"></span>${lbl}</th>`).join('');
+        table.appendChild(hdr);
+
+        const paint = (td: HTMLTableCellElement, v: number) => {
+            td.textContent = v > 0 ? v.toFixed(1) : '';
+            const a = Math.min(1, v);
+            td.style.background = v > 0 ? `rgba(120,200,140,${0.15 + 0.5 * a})` : 'rgba(255,255,255,0.03)';
+        };
+
+        for (let from = 0; from < n; from++) {
+            const row = document.createElement('tr');
+            row.innerHTML = `<th class="row-header"><span class="type-pip" style="background:${TYPE_HEX[from]}"></span>${TYPE_LABELS[from]}</th>`;
+            for (let to = 0; to < n; to++) {
+                const td = document.createElement('td');
+                td.className = 'mcell';
+                paint(td, this.sim.getAffinity(from, to));
+                td.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const cur = this.sim!.getAffinity(from, to);
+                    const next = cur <= 0 ? 0.5 : (cur < 1 ? 1 : 0);  // cycle 0 -> .5 -> 1 -> 0
+                    this.sim!.setAffinity(from, to, next);
+                    paint(td, next);
+                });
+                row.appendChild(td);
+            }
+            table.appendChild(row);
         }
     }
 
@@ -1827,8 +1889,7 @@ class ParticleLifeApp {
         (document.getElementById('maxTransformSlider') as HTMLInputElement).value = String(maxTransform);
         document.getElementById('maxTransformValue')!.textContent = maxTransform.toFixed(2);
 
-        this.syncPatchSliders();
-        this.refreshPatchTable();
+        this.refreshPatchUI();
 
         this.refreshForceMatrices();
         this.refreshTransformMatrix();  // also calls buildPolePanel()
