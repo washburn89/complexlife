@@ -211,7 +211,7 @@ export class ParticleSimulation {
     private patchAngStiffness = 0.3;   // torque strength aligning a patch to the bond axis
     private patchAngFriction  = 0.8;   // angular-velocity damping per tick (lower = more damped)
     private patchWidth        = 6;     // angular selectivity (higher = narrower patches)
-    private patchIsoScale     = 0.4;   // scales the isotropic "soup" so bonds dominate
+    private patchIsoScale     = 0.2;   // scales the isotropic "soup" so bonds dominate
     private patchCoreStrength = 1.5;   // excluded-volume repulsion that keeps structures open
     private orientationBuffer:       GPUBuffer | null = null;
     private sortedOrientationBuffer: GPUBuffer | null = null;
@@ -1888,7 +1888,8 @@ export class ParticleSimulation {
                 var accel  = vec2f(0.0);
                 var torque = 0.0;
                 var typeForce: array<f32, 20>;  // per-type accumulated force (Mode 4 transforms)
-                var budget: array<f32, 6>;      // per-patch bonding demand (valence saturation)
+                var bestBond: array<f32, 6>;    // strongest bond demand seen on each patch
+                var bestIdx:  array<u32, 6>;    // which neighbour won that patch
 
                 let gw   = i32(gridParams.gridW);
                 let gh   = i32(gridParams.gridH);
@@ -1897,10 +1898,10 @@ export class ParticleSimulation {
                 let myGy = clamp(i32(p.pos.y / cs), 0, gh - 1);
                 let core = cfg.bondDist * 0.9;   // excluded-volume radius
 
-                // ── Pass A: per-patch bonding budget. Each neighbour is assigned to my
-                // best-aligned patch; summing the demand lets pass B cap each patch to
-                // roughly one bond's worth of pull, so a particle saturates at its
-                // valence instead of accreting an unbounded shell (the "ball" failure).
+                // ── Pass A: winner-take-all per patch. Each neighbour is assigned to my
+                // best-aligned patch; we keep only the single strongest candidate per
+                // patch. Pass B then bonds the winner and *repels* the losers, so a
+                // particle truly saturates at its valence (no loose rosette shell).
                 if (myPatch > 0u) {
                     for (var goy = -1; goy <= 1; goy++) {
                         for (var gox = -1; gox <= 1; gox++) {
@@ -1934,7 +1935,8 @@ export class ParticleSimulation {
                                 let mine   = bestPatch(myTheta, myPatch, axis);
                                 let theirs = bestPatch(sortedOrientation[k].x, otherPatch, axis + 3.14159265359);
                                 let bond   = pow(max(mine.x, 0.0), cfg.patchWidth) * pow(max(theirs.x, 0.0), cfg.patchWidth);
-                                budget[u32(mine.z)] += bond;
+                                let pk     = u32(mine.z);
+                                if (bond > bestBond[pk]) { bestBond[pk] = bond; bestIdx[pk] = k; }
                             }
                         }
                     }
@@ -1996,20 +1998,26 @@ export class ParticleSimulation {
                                 accel -= dir * cfg.coreStrength * q * q;
                             }
 
-                            // Directional patch bond, capped by the per-patch budget.
+                            // Directional patch bond, winner-take-all per patch.
                             let otherPatch = patchN(otherType);
                             if (myPatch > 0u && otherPatch > 0u && dist <= cfg.bondRange) {
                                 let axis   = atan2(dy, dx);          // me -> other
                                 let mine   = bestPatch(myTheta, myPatch, axis);
                                 let theirs = bestPatch(sortedOrientation[k].x, otherPatch, axis + 3.14159265359);
                                 let bond   = pow(max(mine.x, 0.0), cfg.patchWidth) * pow(max(theirs.x, 0.0), cfg.patchWidth);
-                                // Share one bond's worth of pull among everyone competing
-                                // for this patch (saturation).
-                                let scale  = bond / max(budget[u32(mine.z)], 1.0);
-                                if (scale > 0.0001) {
-                                    let disp = (dist - cfg.bondDist) / cfg.bondRange;
-                                    accel  += dir * cfg.bondStrength * scale * disp;
-                                    torque += cfg.angStiffness * scale * sin(axis - mine.y);
+                                let pk     = u32(mine.z);
+                                if (bond > 0.0001) {
+                                    if (k == bestIdx[pk]) {
+                                        // Winner: a real bond — spring toward bondDist + torque.
+                                        let disp = (dist - cfg.bondDist) / cfg.bondRange;
+                                        accel  += dir * cfg.bondStrength * bond * disp;
+                                        torque += cfg.angStiffness * bond * sin(axis - mine.y);
+                                    } else {
+                                        // Loser competing for an occupied patch: push it away
+                                        // so coordination stays at the valence and the
+                                        // structure can keep tiling outward.
+                                        accel -= dir * cfg.bondStrength * bond * 0.6;
+                                    }
                                 }
                             }
                         }
@@ -2539,7 +2547,7 @@ export class ParticleSimulation {
         this.patchWidth        = rand(3, 12);
         this.patchAngStiffness = rand(0.15, 0.6);
         this.patchAngFriction  = rand(0.6, 0.95);  // multiplier; lower = more damping
-        this.patchIsoScale     = rand(0.1, 0.6);
+        this.patchIsoScale     = rand(0.0, 0.35);
         this.patchDirty = true;
     }
 
