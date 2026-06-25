@@ -285,7 +285,7 @@ class ParticleLifeApp {
             this.toggleRandomizeMenu(false);
         });
         const patchSlider = (id: string, valId: string, key:
-            'bondStrength' | 'bondRange' | 'bondDist' | 'angStiffness' | 'angFriction' | 'patchWidth',
+            'bondStrength' | 'bondRange' | 'bondDist' | 'angStiffness' | 'angFriction' | 'patchWidth' | 'isoScale',
             fmt: (v: number) => string) => {
             const el  = document.getElementById(id) as HTMLInputElement;
             const out = document.getElementById(valId)!;
@@ -299,6 +299,7 @@ class ParticleLifeApp {
         patchSlider('patchRangeSlider',    'patchRangeValue',    'bondRange',    v => String(Math.round(v)));
         patchSlider('patchDistSlider',     'patchDistValue',     'bondDist',     v => String(Math.round(v)));
         patchSlider('patchWidthSlider',    'patchWidthValue',    'patchWidth',   v => String(v));
+        patchSlider('patchIsoSlider',      'patchIsoValue',      'isoScale',     v => v.toFixed(2));
         patchSlider('patchAngSlider',      'patchAngValue',      'angStiffness', v => v.toFixed(2));
         // Spin damping reads 0 = none, 1 = full; internally angFriction is the
         // per-tick angular-velocity multiplier, i.e. the inverse of the slider.
@@ -1408,6 +1409,7 @@ class ParticleLifeApp {
         setSlider('patchRangeSlider',    'patchRangeValue',    pp.bondRange,    String(Math.round(pp.bondRange)));
         setSlider('patchDistSlider',     'patchDistValue',     pp.bondDist,     String(Math.round(pp.bondDist)));
         setSlider('patchWidthSlider',    'patchWidthValue',    pp.patchWidth,   String(Math.round(pp.patchWidth)));
+        setSlider('patchIsoSlider',      'patchIsoValue',      pp.isoScale,     pp.isoScale.toFixed(2));
         setSlider('patchAngSlider',      'patchAngValue',      pp.angStiffness, pp.angStiffness.toFixed(2));
         const spinDamp = 1 - pp.angFriction;  // slider = 1 - stored multiplier
         setSlider('patchAngFricSlider',  'patchAngFricValue',  spinDamp, spinDamp.toFixed(2));

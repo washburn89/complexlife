@@ -211,6 +211,8 @@ export class ParticleSimulation {
     private patchAngStiffness = 0.3;   // torque strength aligning a patch to the bond axis
     private patchAngFriction  = 0.8;   // angular-velocity damping per tick (lower = more damped)
     private patchWidth        = 6;     // angular selectivity (higher = narrower patches)
+    private patchIsoScale     = 0.4;   // scales the isotropic "soup" so bonds dominate
+    private patchCoreStrength = 1.5;   // excluded-volume repulsion that keeps structures open
     private orientationBuffer:       GPUBuffer | null = null;
     private sortedOrientationBuffer: GPUBuffer | null = null;
     private patchConfigBuffer:       GPUBuffer | null = null;
@@ -326,6 +328,8 @@ export class ParticleSimulation {
         f32[3] = this.patchAngStiffness;
         f32[4] = this.patchAngFriction;
         f32[5] = this.patchWidth;
+        f32[6] = this.patchIsoScale;
+        f32[7] = this.patchCoreStrength;
         for (let i = 0; i < MAX_TYPES; i++) {
             u32[8 + i] = Math.max(0, Math.min(6, Math.round(this.patchCount[i] ?? 0)));
         }
@@ -1268,7 +1272,7 @@ export class ParticleSimulation {
 
             struct PatchConfig {
                 bondStrength: f32, bondRange: f32, bondDist: f32, angStiffness: f32,
-                angFriction: f32, patchWidth: f32, _p0: f32, _p1: f32,
+                angFriction: f32, patchWidth: f32, isoScale: f32, coreStrength: f32,
                 patchCount: array<vec4u, 5>,
             }
 
@@ -1803,7 +1807,7 @@ export class ParticleSimulation {
                                 friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
             struct PatchConfig {
                 bondStrength: f32, bondRange: f32, bondDist: f32, angStiffness: f32,
-                angFriction: f32, patchWidth: f32, _p0: f32, _p1: f32,
+                angFriction: f32, patchWidth: f32, isoScale: f32, coreStrength: f32,
                 patchCount: array<vec4u, 5>,
             }
 
@@ -1846,17 +1850,18 @@ export class ParticleSimulation {
 
             // Best alignment of any of n evenly-spaced patches (first at angle base)
             // with the target direction aim. Returns the largest cos(patch - aim) in
-            // .x and the angle of that best patch in .y.
-            fn bestPatch(base: f32, n: u32, aim: f32) -> vec2f {
+            // .x, the angle of that best patch in .y, and its index in .z.
+            fn bestPatch(base: f32, n: u32, aim: f32) -> vec3f {
                 let step = TAU / f32(n);
                 var bestAl  = -2.0;
                 var bestAng = base;
+                var bestK   = 0u;
                 for (var i: u32 = 0u; i < n; i++) {
                     let ang = base + f32(i) * step;
                     let al  = cos(ang - aim);
-                    if (al > bestAl) { bestAl = al; bestAng = ang; }
+                    if (al > bestAl) { bestAl = al; bestAng = ang; bestK = i; }
                 }
-                return vec2f(bestAl, bestAng);
+                return vec3f(bestAl, bestAng, f32(bestK));
             }
 
             @compute @workgroup_size(256)
@@ -1883,13 +1888,59 @@ export class ParticleSimulation {
                 var accel  = vec2f(0.0);
                 var torque = 0.0;
                 var typeForce: array<f32, 20>;  // per-type accumulated force (Mode 4 transforms)
+                var budget: array<f32, 6>;      // per-patch bonding demand (valence saturation)
 
                 let gw   = i32(gridParams.gridW);
                 let gh   = i32(gridParams.gridH);
                 let cs   = gridParams.cellSize;
                 let myGx = clamp(i32(p.pos.x / cs), 0, gw - 1);
                 let myGy = clamp(i32(p.pos.y / cs), 0, gh - 1);
+                let core = cfg.bondDist * 0.9;   // excluded-volume radius
 
+                // ── Pass A: per-patch bonding budget. Each neighbour is assigned to my
+                // best-aligned patch; summing the demand lets pass B cap each patch to
+                // roughly one bond's worth of pull, so a particle saturates at its
+                // valence instead of accreting an unbounded shell (the "ball" failure).
+                if (myPatch > 0u) {
+                    for (var goy = -1; goy <= 1; goy++) {
+                        for (var gox = -1; gox <= 1; gox++) {
+                            var ngx = myGx + gox;
+                            var ngy = myGy + goy;
+                            if (edgeMode == 0u) {
+                                ngx = ((ngx % gw) + gw) % gw;
+                                ngy = ((ngy % gh) + gh) % gh;
+                            } else {
+                                if (ngx < 0 || ngx >= gw || ngy < 0 || ngy >= gh) { continue; }
+                            }
+                            let cell  = u32(ngy) * gridParams.gridW + u32(ngx);
+                            let start = cellStart[cell];
+                            let end   = start + cellCount[cell];
+                            for (var k = start; k < end; k++) {
+                                let other = sortedParticles[k];
+                                if (other.typeId < 0.0) { continue; }
+                                let otherPatch = patchN(u32(other.typeId));
+                                if (otherPatch == 0u) { continue; }
+                                var dx = other.pos.x - p.pos.x;
+                                var dy = other.pos.y - p.pos.y;
+                                if (edgeMode == 0u) {
+                                    if (dx >  width  * 0.5) { dx -= width;  }
+                                    if (dx < -width  * 0.5) { dx += width;  }
+                                    if (dy >  height * 0.5) { dy -= height; }
+                                    if (dy < -height * 0.5) { dy += height; }
+                                }
+                                let dist = sqrt(dx * dx + dy * dy);
+                                if (dist < 0.1 || dist > cfg.bondRange) { continue; }
+                                let axis   = atan2(dy, dx);
+                                let mine   = bestPatch(myTheta, myPatch, axis);
+                                let theirs = bestPatch(sortedOrientation[k].x, otherPatch, axis + 3.14159265359);
+                                let bond   = pow(max(mine.x, 0.0), cfg.patchWidth) * pow(max(theirs.x, 0.0), cfg.patchWidth);
+                                budget[u32(mine.z)] += bond;
+                            }
+                        }
+                    }
+                }
+
+                // ── Pass B: apply isotropic force, excluded volume, and saturated bonds.
                 for (var goy = -1; goy <= 1; goy++) {
                     for (var gox = -1; gox <= 1; gox++) {
                         var ngx = myGx + gox;
@@ -1920,39 +1971,45 @@ export class ParticleSimulation {
                             if (dist < 0.1) { continue; }
                             let dir = vec2f(dx, dy) / dist;
 
-                            // Isotropic background force (same curve as the classic mode).
+                            // Isotropic background force. Inner repulsion stays at full
+                            // strength (keeps a hard core); the outer attractive/repulsive
+                            // shell is scaled by isoScale so directional bonds — not the
+                            // particle-life soup — drive cohesion in patchy mode.
                             let f     = forces[myType * 20u + otherType];
                             let range = f.radius - f.minRadius;
                             if (dist >= f.minRadius && dist <= f.radius && range > 0.0) {
                                 let norm = (dist - f.minRadius) / range;
-                                var mag: f32;
-                                var outerMag: f32 = 0.0;
                                 if (norm < 0.3) {
-                                    mag = (norm / 0.3 - 1.0);
+                                    accel += dir * (norm / 0.3 - 1.0) * 0.1;
                                 } else {
-                                    mag = f.strength * (1.0 - abs(1.0 - norm) / 0.7);
-                                    outerMag = mag;
+                                    let outerMag = f.strength * (1.0 - abs(1.0 - norm) / 0.7);
+                                    accel += dir * outerMag * 0.1 * cfg.isoScale;
+                                    typeForce[otherType] += outerMag * 0.1;
                                 }
-                                accel += dir * mag * 0.1;
-                                typeForce[otherType] += outerMag * 0.1;
                             }
 
-                            // Directional patch bond.
+                            // Excluded volume: firm repulsion inside the core radius for
+                            // every neighbour, so saturated structures stay open instead
+                            // of collapsing to close-packed balls.
+                            if (dist < core) {
+                                let q = 1.0 - dist / core;
+                                accel -= dir * cfg.coreStrength * q * q;
+                            }
+
+                            // Directional patch bond, capped by the per-patch budget.
                             let otherPatch = patchN(otherType);
                             if (myPatch > 0u && otherPatch > 0u && dist <= cfg.bondRange) {
-                                let axis      = atan2(dy, dx);          // me -> other
-                                let mine      = bestPatch(myTheta, myPatch, axis);
-                                let oTheta    = sortedOrientation[k].x;
-                                let theirs    = bestPatch(oTheta, otherPatch, axis + 3.14159265359);
-                                let mAl       = max(mine.x,   0.0);
-                                let oAl       = max(theirs.x, 0.0);
-                                let bond      = pow(mAl, cfg.patchWidth) * pow(oAl, cfg.patchWidth);
-                                if (bond > 0.0001) {
-                                    // Radial spring toward bondDist (normalised by range).
+                                let axis   = atan2(dy, dx);          // me -> other
+                                let mine   = bestPatch(myTheta, myPatch, axis);
+                                let theirs = bestPatch(sortedOrientation[k].x, otherPatch, axis + 3.14159265359);
+                                let bond   = pow(max(mine.x, 0.0), cfg.patchWidth) * pow(max(theirs.x, 0.0), cfg.patchWidth);
+                                // Share one bond's worth of pull among everyone competing
+                                // for this patch (saturation).
+                                let scale  = bond / max(budget[u32(mine.z)], 1.0);
+                                if (scale > 0.0001) {
                                     let disp = (dist - cfg.bondDist) / cfg.bondRange;
-                                    accel  += dir * cfg.bondStrength * bond * disp;
-                                    // Torque: rotate my best patch onto the bond axis.
-                                    torque += cfg.angStiffness * bond * sin(axis - mine.y);
+                                    accel  += dir * cfg.bondStrength * scale * disp;
+                                    torque += cfg.angStiffness * scale * sin(axis - mine.y);
                                 }
                             }
                         }
@@ -2482,12 +2539,14 @@ export class ParticleSimulation {
         this.patchWidth        = rand(3, 12);
         this.patchAngStiffness = rand(0.15, 0.6);
         this.patchAngFriction  = rand(0.6, 0.95);  // multiplier; lower = more damping
+        this.patchIsoScale     = rand(0.1, 0.6);
         this.patchDirty = true;
     }
 
     setPatchParams(p: Partial<{
         bondStrength: number; bondRange: number; bondDist: number;
         angStiffness: number; angFriction: number; patchWidth: number;
+        isoScale: number; coreStrength: number;
     }>): void {
         if (p.bondStrength != null) this.patchBondStrength = Math.max(0,   Math.min(2,   p.bondStrength));
         if (p.bondRange    != null) this.patchBondRange    = Math.max(5,   Math.min(200, p.bondRange));
@@ -2495,6 +2554,8 @@ export class ParticleSimulation {
         if (p.angStiffness != null) this.patchAngStiffness = Math.max(0,   Math.min(2,   p.angStiffness));
         if (p.angFriction  != null) this.patchAngFriction  = Math.max(0,   Math.min(1,   p.angFriction));
         if (p.patchWidth   != null) this.patchWidth        = Math.max(1,   Math.min(20,  p.patchWidth));
+        if (p.isoScale     != null) this.patchIsoScale     = Math.max(0,   Math.min(1,   p.isoScale));
+        if (p.coreStrength != null) this.patchCoreStrength = Math.max(0,   Math.min(5,   p.coreStrength));
         this.patchDirty = true;
     }
     getPatchParams() {
@@ -2502,6 +2563,7 @@ export class ParticleSimulation {
             bondStrength: this.patchBondStrength, bondRange: this.patchBondRange,
             bondDist:     this.patchBondDist,     angStiffness: this.patchAngStiffness,
             angFriction:  this.patchAngFriction,  patchWidth: this.patchWidth,
+            isoScale:     this.patchIsoScale,     coreStrength: this.patchCoreStrength,
         };
     }
 
