@@ -509,8 +509,8 @@
                         <h4>Bonding</h4>
                         <div class="settings-row">
                             <label>Bond Strength</label>
-                            <input type="range" id="patchStrengthSlider" min="0" max="2" step="0.05" value="0.6">
-                            <span class="val" id="patchStrengthValue">0.60</span>
+                            <input type="range" id="patchStrengthSlider" min="0" max="2" step="0.05" value="0.2">
+                            <span class="val" id="patchStrengthValue">0.20</span>
                         </div>
                         <div class="settings-row">
                             <label>Bond Range</label>
@@ -539,14 +539,15 @@
                         </div>
                         <div class="settings-row">
                             <label>Isotropic Force</label>
-                            <input type="range" id="patchIsoSlider" min="0" max="1" step="0.05" value="0.2">
-                            <span class="val" id="patchIsoValue">0.20</span>
+                            <input type="range" id="patchIsoSlider" min="0" max="1" step="0.05" value="1">
+                            <span class="val" id="patchIsoValue">1.00</span>
                         </div>
                         <p class="hint">
-                            Patch Width: higher = narrower, more selective patches (sharper geometry).
-                            Each patch now holds ~one bond (valence saturation), so high-valence types
-                            open into sheets/lattices instead of balling up. Isotropic Force scales the
-                            background force-matrix "soup" — lower it to let directional bonds dominate.
+                            For dynamic, moving structures (like the base sim's "ships"), keep
+                            <strong>Isotropic Force high</strong> (the asymmetric force matrix is what
+                            makes things move) and <strong>Bond Strength low</strong> so bonds only nudge
+                            ships into chains instead of freezing them. Crank Bond Strength up and drop
+                            Isotropic Force for static crystals/sheets instead.
                         </p>
                     </div>
                 </div>

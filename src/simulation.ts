@@ -205,14 +205,14 @@ export class ParticleSimulation {
     // particle. Two particles bond when a patch on each points at the other, which
     // applies a radial spring (toward bondDist) plus a torque that aligns the patch.
     private patchCount: number[] = Array(MAX_TYPES).fill(0);
-    private patchBondStrength = 0.6;   // radial spring stiffness for a fully-aligned bond
+    private patchBondStrength = 0.2;   // light by default: bonds nudge, the force matrix drives motion
     private patchBondRange    = 60;    // max centre-to-centre distance a bond can act over
     private patchBondDist     = 26;    // preferred centre-to-centre bond distance (r0)
     private patchAngStiffness = 0.3;   // torque strength aligning a patch to the bond axis
     private patchAngFriction  = 0.8;   // angular-velocity damping per tick (lower = more damped)
     private patchWidth        = 6;     // angular selectivity (higher = narrower patches)
-    private patchIsoScale     = 0.2;   // scales the isotropic "soup" so bonds dominate
-    private patchCoreStrength = 1.5;   // excluded-volume repulsion that keeps structures open
+    private patchIsoScale     = 1.0;   // full asymmetric force matrix (the "ship" engine) by default
+    private patchCoreStrength = 0.6;   // excluded-volume repulsion that keeps structures open
     private orientationBuffer:       GPUBuffer | null = null;
     private sortedOrientationBuffer: GPUBuffer | null = null;
     private patchConfigBuffer:       GPUBuffer | null = null;
@@ -2543,11 +2543,11 @@ export class ParticleSimulation {
         const rand = (a: number, b: number) => a + Math.random() * (b - a);
         this.patchBondRange    = rand(40, 100);
         this.patchBondDist     = this.patchBondRange * rand(0.3, 0.55);
-        this.patchBondStrength = rand(0.3, 1.2);
+        this.patchBondStrength = rand(0.1, 0.5);   // light: bonds nudge, not freeze
         this.patchWidth        = rand(3, 12);
         this.patchAngStiffness = rand(0.15, 0.6);
         this.patchAngFriction  = rand(0.6, 0.95);  // multiplier; lower = more damping
-        this.patchIsoScale     = rand(0.0, 0.35);
+        this.patchIsoScale     = rand(0.6, 1.0);   // keep the asymmetric force matrix strong
         this.patchDirty = true;
     }
 
