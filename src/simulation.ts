@@ -145,6 +145,13 @@ export const MAX_DNF_CONDITIONS = 6;
 export const MAX_DNF_RULES      = 4;
 const DNF_TYPE_STRIDE_U32 = 4 + MAX_DNF_CONDITIONS * 4 + MAX_DNF_RULES * (4 + DNF_MAX_TOKENS);  // 140
 
+// Each particle re-evaluates its (Mode 4 / Mode 5) transform rules once every
+// TFORM_STRIDE frames instead of every frame; the kernel staggers this by
+// workgroup so ~1/TFORM_STRIDE of particles evaluate per frame (warp-uniform, so
+// it is a real cost reduction). Per-tick transform probability is scaled up to
+// compensate, keeping the long-run transform rate roughly unchanged.
+const TFORM_STRIDE = 3;
+
 const OPEN_MULT            = 8;
 const MAX_GRID_DIM         = 64;
 const MAX_CELLS            = MAX_GRID_DIM * MAX_GRID_DIM;  // 4096
@@ -331,6 +338,9 @@ export class ParticleSimulation {
     private isInitialized  = false;
     private isPaused       = false;
     private simulationTime = 0;
+    // Frame counter (mod a multiple of TFORM_STRIDE) so the kernel can spread the
+    // per-particle transform/DNF evaluation across frames for performance.
+    private frameCounter   = 0;
 
     // Dirty flags: config buffers are only re-uploaded to the GPU when their
     // CPU-side data actually changes, instead of every frame.
@@ -463,8 +473,8 @@ export class ParticleSimulation {
     }
 
     // Mode 5 DNF uniform. Flat u32 array, DNF_TYPE_STRIDE_U32 (140) per source type;
-    // see the constant's comment for the per-type layout. Decoded by matching u32
-    // offsets in the WGSL kernel (via the dnfU32 accessor).
+    // see the constant's comment for the per-type layout. Decoded by matching
+    // vec4 offsets in the WGSL kernel's Mode 5 transform block.
     private generateDnfData(): Uint32Array<ArrayBuffer> {
         const ab  = new ArrayBuffer(MAX_TYPES * DNF_TYPE_STRIDE_U32 * 4);
         const u32 = new Uint32Array(ab);
@@ -583,7 +593,7 @@ export class ParticleSimulation {
             this.friction,
             this.maxTransformRate,
             this.dnfBonding ? 1 : 0,
-            0,
+            this.frameCounter,
         ]) as Float32Array<ArrayBuffer>;
     }
 
@@ -1988,8 +1998,8 @@ export class ParticleSimulation {
                 bondStr:  array<vec4f, 5>,    // per-type bond strength
                 bondDist: array<vec4f, 5>,    // per-type bond rest length
             }
-            // Mode 5 DNF data. 35 vec4u (140 u32) per source type; decoded by u32
-            // offset via dnfU32(). 20 types * 35 = 700 vec4u.
+            // Mode 5 DNF data. 35 vec4u (140 u32) per source type, read a vec4 at a
+            // time in the Mode 5 transform block. 20 types * 35 = 700 vec4u.
             struct DnfRules { d: array<vec4u, 700> }
 
             @group(0) @binding(0)  var<storage, read_write> particles:         array<Particle>;
@@ -2010,7 +2020,6 @@ export class ParticleSimulation {
             fn bondStrOf(t: u32)  -> f32 { return tab.bondStr[t >> 2u][t & 3u]; }
             fn bondDistOf(t: u32) -> f32 { return tab.bondDist[t >> 2u][t & 3u]; }
             fn affinityOf(a: u32, b: u32) -> f32 { let i = a * 20u + b; return tab.affinity[i >> 2u][i & 3u]; }
-            fn dnfU32(i: u32) -> u32 { return dnf.d[i >> 2u][i & 3u]; }
 
             const TAU = 6.28318530718;
 
@@ -2245,8 +2254,14 @@ export class ParticleSimulation {
                 var theta = myTheta + myOmega * speed;
                 theta = theta - TAU * round(theta / TAU);
 
+                // Transforms (Mode 4 & 5) are evaluated once per TFORM_STRIDE frames,
+                // staggered by workgroup so only ~1/stride of particles evaluate each
+                // frame. Warp-uniform, so it is a genuine cost reduction; the dice are
+                // scaled by the stride to keep the long-run transform rate similar.
+                let doTransform = ((u32(params._p3) + (idx >> 8u)) % ${TFORM_STRIDE}u) == 0u;
+
                 // Mode 4: Mode-1-style type transforms driven by accumulated force.
-                if (simMode == 4u) {
+                if (simMode == 4u && doTransform) {
                     let baseSeed = uhash(idx) ^ uhash(u32(abs(p.pos.x) * 157.0 + 1.0))
                                               ^ uhash(u32(abs(p.pos.y) * 239.0 + 1.0));
                     var maxProb: f32 = 0.0;
@@ -2256,14 +2271,14 @@ export class ParticleSimulation {
                         if (rule.upperEnabled > 0.5) {
                             let prob = transformProb(typeForce[t], rule.upperThreshold, rule.upperEnabled, 1.0);
                             maxProb = max(maxProb, prob);
-                            if (newType < 0 && prob > 0.0 && rand01(baseSeed ^ uhash(t * 3u + 0u)) < prob) {
+                            if (newType < 0 && prob > 0.0 && rand01(baseSeed ^ uhash(t * 3u + 0u)) < min(1.0, prob * ${TFORM_STRIDE}.0)) {
                                 newType = i32(rule.upperTarget);
                             }
                         }
                         if (rule.lowerEnabled > 0.5) {
                             let prob = transformProb(typeForce[t], rule.lowerThreshold, rule.lowerEnabled, 0.0);
                             maxProb = max(maxProb, prob);
-                            if (newType < 0 && prob > 0.0 && rand01(baseSeed ^ uhash(t * 3u + 1u)) < prob) {
+                            if (newType < 0 && prob > 0.0 && rand01(baseSeed ^ uhash(t * 3u + 1u)) < min(1.0, prob * ${TFORM_STRIDE}.0)) {
                                 newType = i32(rule.lowerTarget);
                             }
                         }
@@ -2271,41 +2286,44 @@ export class ParticleSimulation {
                     if (newType >= 0) { p.typeId = f32(newType); }
                     let prevProb = clamp(p._pad, 0.0, 0.5);
                     p._pad = mix(prevProb, maxProb, 0.06);
-                } else if (simMode == 5u) {
+                } else if (simMode == 5u && doTransform) {
                     // Mode 5 / Transform #2: force-based conditions combined by a
                     // boolean expression per rule. Conditions compare accumulated
                     // per-type force against a threshold; the first rule whose RPN
                     // expression evaluates true wins its dice roll and transforms.
+                    // Each per-type block is ${DNF_TYPE_STRIDE_U32 / 4} vec4u; read a whole vec4 at a time.
                     let baseSeed = uhash(idx) ^ uhash(u32(abs(p.pos.x) * 157.0 + 1.0))
                                               ^ uhash(u32(abs(p.pos.y) * 239.0 + 1.0));
-                    let base    = myType * ${DNF_TYPE_STRIDE_U32}u;
-                    let numCond = dnfU32(base);
-                    let numRule = dnfU32(base + 1u);
+                    let tbase   = myType * ${DNF_TYPE_STRIDE_U32 / 4}u;   // vec4 index of this type's block
+                    let hdr     = dnf.d[tbase];
+                    let numCond = hdr.x;
+                    let numRule = hdr.y;
                     var cond: array<bool, ${MAX_DNF_CONDITIONS}>;
                     for (var ci: u32 = 0u; ci < numCond; ci++) {
-                        let co   = base + 4u + ci * 4u;
-                        let trig = dnfU32(co);
-                        let op   = dnfU32(co + 1u);
-                        let thr  = bitcast<f32>(dnfU32(co + 2u));
-                        let fv   = typeForce[trig];
+                        let cv  = dnf.d[tbase + 1u + ci];     // [trigger, op, threshold, _]
+                        let fv  = typeForce[cv.x];
+                        let thr = bitcast<f32>(cv.z);
                         var r: bool;
-                        if      (op == 0u) { r = fv >  thr; }
-                        else if (op == 1u) { r = fv >= thr; }
-                        else if (op == 2u) { r = fv <  thr; }
-                        else               { r = fv <= thr; }
+                        if      (cv.y == 0u) { r = fv >  thr; }
+                        else if (cv.y == 1u) { r = fv >= thr; }
+                        else if (cv.y == 2u) { r = fv <  thr; }
+                        else                 { r = fv <= thr; }
                         cond[ci] = r;
                     }
                     var newType: i32 = -1;
                     var fired: f32 = 0.0;
+                    let rate = min(1.0, params.maxRate * ${TFORM_STRIDE}.0);
                     for (var ri: u32 = 0u; ri < numRule; ri++) {
-                        let roff = base + 4u + ${MAX_DNF_CONDITIONS * 4}u + ri * ${4 + DNF_MAX_TOKENS}u;
-                        let tgt  = dnfU32(roff);
-                        let nTok = dnfU32(roff + 1u);
+                        let rbase = tbase + ${(4 + MAX_DNF_CONDITIONS * 4) / 4}u + ri * ${(4 + DNF_MAX_TOKENS) / 4}u;
+                        let rh    = dnf.d[rbase];             // [target, numTokens, _, _]
+                        let tgt   = rh.x;
+                        let nTok  = rh.y;
                         if (nTok == 0u) { continue; }
                         var st: array<bool, 16>;
                         var sp: u32 = 0u;
                         for (var ti: u32 = 0u; ti < nTok; ti++) {
-                            let tok  = dnfU32(roff + 4u + ti);
+                            let tv   = dnf.d[rbase + 1u + (ti >> 2u)];  // 4 tokens per vec4
+                            let tok  = tv[ti & 3u];
                             let kind = tok >> 16u;
                             let val  = tok & 0xFFFFu;
                             if (kind == 0u) {
@@ -2324,7 +2342,7 @@ export class ParticleSimulation {
                         }
                         if (sp >= 1u && st[0]) {
                             fired = 1.0;
-                            if (newType < 0 && rand01(baseSeed ^ uhash(ri * 7u + 13u)) < params.maxRate) {
+                            if (newType < 0 && rand01(baseSeed ^ uhash(ri * 7u + 13u)) < rate) {
                                 newType = i32(tgt);
                             }
                         }
@@ -2332,7 +2350,7 @@ export class ParticleSimulation {
                     if (newType >= 0) { p.typeId = f32(newType); }
                     let prevProb = clamp(p._pad, 0.0, 0.5);
                     p._pad = mix(prevProb, fired * params.maxRate, 0.06);
-                } else {
+                } else if (simMode != 4u && simMode != 5u) {
                     p._pad = 0.0;
                 }
 
@@ -2378,6 +2396,9 @@ export class ParticleSimulation {
         }
 
         if (!this.isPaused) {
+            // Advance the transform-stagger phase. Kept under 2^24 so it stays an
+            // exact f32, and a multiple of TFORM_STRIDE so the phase never jumps.
+            this.frameCounter = (this.frameCounter + 1) % (TFORM_STRIDE * 1_000_000);
             this.queue.writeBuffer(this.paramsBuffer!,    0, this.paramsArray());
 
             const gp = this.computeGridParams();
