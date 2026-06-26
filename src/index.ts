@@ -1,5 +1,7 @@
 import { ParticleSimulation, TransformRule, DnfCondition, DnfRule, MAX_TYPES, MAX_DNF_CONDITIONS, MAX_DNF_RULES, compileBoolExpr, TYPE_COLORS_HEX, DiagnosticData } from './simulation';
-import { Muxer, ArrayBufferTarget } from 'webm-muxer';
+// Vendored (MIT) so the repo is self-contained — no npm install needed. See
+// src/vendor/webm-muxer.LICENSE.txt.
+import { Muxer, ArrayBufferTarget } from './vendor/webm-muxer';
 
 const TYPE_LABELS = [
     'R', 'G', 'B', 'Y', 'M', 'C', 'O', 'P', 'K', 'S',
