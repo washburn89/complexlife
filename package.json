@@ -25,5 +25,7 @@
     "webpack-cli": "^5.1.0",
     "webpack-dev-server": "^4.15.0"
   },
-  "dependencies": {}
+  "dependencies": {
+    "webm-muxer": "^5.1.4"
+  }
 }

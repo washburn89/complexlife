@@ -684,7 +684,7 @@
                     <p class="hint" style="margin-top:7px">
                         <strong>Full Canvas</strong> saves the whole canvas as a lossless PNG (closed/Loop edge mode only).<br>
                         <strong>Select &amp; Export</strong> — drag a rectangle on the canvas; release to save just that region (sim pauses while you compose). The box shows its output pixel size.<br>
-                        <strong>Record Video</strong> captures the live simulation (full canvas or a dragged region) as a WebM video of the chosen length.
+                        <strong>Record Video</strong> renders the simulation (full canvas or a dragged region) to a smooth 60 fps WebM of the chosen length. It computes frame-by-frame as fast as the GPU allows — slower than real time for heavy sims, but the output always plays back at full speed. Click the button again (or Esc) to cancel and discard.
                     </p>
                 </div>
 

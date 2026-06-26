@@ -1,4 +1,5 @@
 import { ParticleSimulation, TransformRule, DnfCondition, DnfRule, MAX_TYPES, MAX_DNF_CONDITIONS, MAX_DNF_RULES, compileBoolExpr, TYPE_COLORS_HEX, DiagnosticData } from './simulation';
+import { Muxer, ArrayBufferTarget } from 'webm-muxer';
 
 const TYPE_LABELS = [
     'R', 'G', 'B', 'Y', 'M', 'C', 'O', 'P', 'K', 'S',
@@ -132,6 +133,10 @@ class ParticleLifeApp {
     private recordCopy: (() => void) | null = null;   // per-frame blit into the record canvas
     private recordStopTimer = 0;
     private recordCountdownTimer = 0;
+    // Offline (deterministic) render: steps the sim frame-by-frame and encodes a
+    // fixed-60fps video regardless of how long each frame takes to compute.
+    private isRenderingVideo = false;
+    private renderCancel     = false;
 
     constructor() {
         this.canvas = document.getElementById('sim-canvas') as HTMLCanvasElement;
@@ -453,11 +458,17 @@ class ParticleLifeApp {
         });
         document.getElementById('exportSelBtn')!.addEventListener('click', () => this.togglePhotoSelect('png'));
 
-        // Video export (WebM)
+        // Video export (WebM). While busy, the buttons cancel the current job.
         document.getElementById('recordFullBtn')!.addEventListener('click', () => {
-            if (this.isRecording) this.stopRecording(); else this.recordFullVideo();
+            if (this.isRenderingVideo) { this.renderCancel = true; }
+            else if (this.isRecording) { this.stopRecording(); }
+            else this.recordFullVideo();
         });
-        document.getElementById('recordSelBtn')!.addEventListener('click', () => this.togglePhotoSelect('video'));
+        document.getElementById('recordSelBtn')!.addEventListener('click', () => {
+            if (this.isRenderingVideo) { this.renderCancel = true; return; }
+            if (this.isRecording) return;
+            this.togglePhotoSelect('video');
+        });
         const durEl = document.getElementById('videoDurSlider') as HTMLInputElement;
         durEl.addEventListener('input', () => {
             this.videoDurationSec = Math.max(5, Math.min(30, Math.round(Number(durEl.value) / 5) * 5));
@@ -480,7 +491,8 @@ class ParticleLifeApp {
                 this.closeForceEditor(); this.closeTransformEditor();
                 if (this.trackMode === 'selecting') { this.trackMode = 'idle'; this.syncTrackButton(); }
                 if (this.photoSelMode) this.exitPhotoSelect();
-                if (this.isRecording) this.stopRecording();  // Esc ends recording early (saves what's captured)
+                if (this.isRenderingVideo) this.renderCancel = true;   // cancel & discard offline render
+                else if (this.isRecording) this.stopRecording();       // end real-time capture (saves what's captured)
             }
             if (e.key === ' ' && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
                 e.preventDefault();
@@ -975,7 +987,7 @@ class ParticleLifeApp {
                 // already paused before entering select mode).
                 this.exitPhotoSelect();
                 // Video records the live sim, so start only after resuming.
-                if (target === 'video' && rect) this.startRecording(rect);
+                if (target === 'video' && rect) this.startVideoExport(rect);
             }
             if (e.button === 0 && this.selBoxActive && this.trackMode === 'selecting') {
                 this.selBoxActive = false;
@@ -1348,10 +1360,111 @@ class ParticleLifeApp {
         return `particle-life-${stamp}-${tag}.${ext}`;
     }
 
-    // ── Video recording (WebM via MediaRecorder) ────────────────────────────────
+    // ── Video export ─────────────────────────────────────────────────────────
     private recordFullVideo(): void {
-        if (this.isRecording || !this.sim) return;
-        this.startRecording({ x: 0, y: 0, w: this.canvas.width, h: this.canvas.height });
+        if (this.isRecording || this.isRenderingVideo || !this.sim) return;
+        this.startVideoExport({ x: 0, y: 0, w: this.canvas.width, h: this.canvas.height });
+    }
+
+    // Prefer the deterministic offline renderer (WebCodecs): it steps the sim
+    // frame-by-frame and encodes a fixed-60fps clip however long the compute takes,
+    // so heavy sims don't slow/stutter the output. Falls back to real-time capture.
+    private startVideoExport(rect: { x: number; y: number; w: number; h: number }): void {
+        const hasWebCodecs = typeof (window as any).VideoEncoder !== 'undefined'
+            && typeof (window as any).VideoFrame !== 'undefined';
+        if (hasWebCodecs) this.renderVideoOffline(rect);
+        else this.startRecording(rect);
+    }
+
+    private async renderVideoOffline(rect: { x: number; y: number; w: number; h: number }): Promise<void> {
+        if (this.isRecording || this.isRenderingVideo || !this.sim) return;
+        const VE: any = (window as any).VideoEncoder;
+        const fps = 60;
+        const total = Math.round(this.videoDurationSec * fps);
+        let w = Math.max(2, Math.round(rect.w)); w -= w % 2;   // codecs want even dims
+        let h = Math.max(2, Math.round(rect.h)); h -= h % 2;
+        const bitrate = Math.min(60_000_000, Math.max(8_000_000, Math.round(w * h * fps * 0.12)));
+
+        // Pick a supported codec (VP9 preferred, then VP8).
+        let codecStr = '', muxCodec = 'V_VP9';
+        for (const [c, m] of [['vp09.00.10.08', 'V_VP9'], ['vp8', 'V_VP8']] as const) {
+            try {
+                const sup = await VE.isConfigSupported({ codec: c, width: w, height: h, bitrate, framerate: fps });
+                if (sup && sup.supported) { codecStr = c; muxCodec = m; break; }
+            } catch { /* try next */ }
+        }
+        if (!codecStr) { this.startRecording(rect); return; }   // fall back to real-time
+
+        const target = new ArrayBufferTarget();
+        const muxer = new Muxer({ target, video: { codec: muxCodec, width: w, height: h, frameRate: fps } });
+        let encErr: any = null;
+        const encoder = new VE({
+            output: (chunk: any, meta: any) => muxer.addVideoChunk(chunk, meta),
+            error:  (e: any) => { encErr = e; },
+        });
+        encoder.configure({ codec: codecStr, width: w, height: h, bitrate, framerate: fps, latencyMode: 'quality' });
+
+        const VF: any = (window as any).VideoFrame;
+        this.isRecording = true;
+        this.isRenderingVideo = true;
+        this.renderCancel = false;
+        const savedAutoPause = this.autoPause;
+        this.autoPause = false;
+
+        let ok = false;
+        try {
+            for (let i = 0; i < total; i++) {
+                if (this.renderCancel || encErr) break;
+                await this.sim.stepAndAwait();   // deterministic physics step (+ on-screen render for feedback)
+                // Grab real pixels from an offscreen render (avoids canvas-present
+                // timing issues), cropped tightly to the target rect.
+                const cap = await this.sim.captureRGBA();
+                if (!cap) break;
+                const buf = new Uint8ClampedArray(w * h * 4);
+                for (let row = 0; row < h; row++) {
+                    const srcStart = ((rect.y + row) * cap.width + rect.x) * 4;
+                    buf.set(cap.data.subarray(srcStart, srcStart + w * 4), row * w * 4);
+                }
+                const frame = new VF(buf, {
+                    format: 'RGBA', codedWidth: w, codedHeight: h,
+                    timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps),
+                });
+                encoder.encode(frame, { keyFrame: i % fps === 0 });
+                frame.close();
+                this.syncRenderProgress(i + 1, total);
+                // Drain encoder backpressure and yield so the UI stays responsive
+                // (progress repaint + cancel clicks) and GPU memory doesn't pile up.
+                while (encoder.encodeQueueSize > 6 && !this.renderCancel) {
+                    await new Promise(r => setTimeout(r, 0));
+                }
+                if (i % 2 === 0) await new Promise(r => requestAnimationFrame(() => r(null)));
+            }
+            if (!this.renderCancel && !encErr) {
+                await encoder.flush();
+                muxer.finalize();
+                const blob = new Blob([target.buffer], { type: 'video/webm' });
+                if (blob.size) this.downloadBlob(blob, this.exportFilename(`${w}x${h}-${this.videoDurationSec}s`, 'webm'));
+                ok = true;
+            }
+        } catch (e) {
+            console.error('Video render failed:', e);
+        } finally {
+            try { encoder.close(); } catch { /* already closed */ }
+            this.autoPause = savedAutoPause;
+            this.isRecording = false;
+            this.isRenderingVideo = false;
+            this.renderCancel = false;
+            this.syncRecordButtons(0);
+            if (encErr && !ok) alert('Video render failed (encoder error). See console.');
+        }
+    }
+
+    private syncRenderProgress(done: number, total: number): void {
+        const pct = Math.round(done / total * 100);
+        const full = document.getElementById('recordFullBtn');
+        if (full) full.innerHTML = `&#9209; Rendering ${pct}% · cancel`;
+        const sel = document.getElementById('recordSelBtn');
+        if (sel) { sel.classList.add('disabled-look'); sel.innerHTML = '&#9209; cancel'; }
     }
 
     private pickVideoMime(): string {
@@ -2328,7 +2441,9 @@ class ParticleLifeApp {
                     this.sim.eraseParticlesInBrush(wx, wy, this.brushWorldRadius, 1.0, -1);
                 }
             }
-            this.sim?.update();
+            // During an offline render the render loop drives the sim itself; skip
+            // the normal step so we don't advance/capture frames twice.
+            if (!this.isRenderingVideo) this.sim?.update();
             this.updateStats();
             this.drawOverlay();
             // Blit the freshly-rendered frame into the video record canvas, if active.

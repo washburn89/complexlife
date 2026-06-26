@@ -3249,6 +3249,17 @@ export class ParticleSimulation {
         this.simulationTime = 0;
     }
 
+    // Offline render: force exactly one physics step + render regardless of pause
+    // state, then wait for the GPU to finish so the canvas holds a complete frame
+    // (used by the deterministic video renderer, which decouples sim from wallclock).
+    async stepAndAwait(): Promise<void> {
+        const wasPaused = this.isPaused;
+        this.isPaused = false;
+        this.update();
+        this.isPaused = wasPaused;
+        if (this.device) await this.device.queue.onSubmittedWorkDone();
+    }
+
     togglePause(): void { this.isPaused = !this.isPaused; }
     getTime(): number   { return this.simulationTime; }
     getParams(): SimulationParams { return this.params; }
