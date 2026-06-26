@@ -142,7 +142,7 @@ export const MAX_TYPES = 20;
 //   rules:      MAX_DNF_RULES × [target, numTokens, pad, pad, token0..23]
 // → 4 + 6*4 + 4*(4+24) = 4 + 24 + 112 = 140 u32 (35 vec4u) per type.
 export const MAX_DNF_CONDITIONS = 6;
-export const MAX_DNF_RULES      = 4;
+export const MAX_DNF_RULES      = 8;
 const DNF_TYPE_STRIDE_U32 = 4 + MAX_DNF_CONDITIONS * 4 + MAX_DNF_RULES * (4 + DNF_MAX_TOKENS);  // 140
 
 // Each particle re-evaluates its (Mode 4 / Mode 5) transform rules once every
@@ -1998,9 +1998,9 @@ export class ParticleSimulation {
                 bondStr:  array<vec4f, 5>,    // per-type bond strength
                 bondDist: array<vec4f, 5>,    // per-type bond rest length
             }
-            // Mode 5 DNF data. 35 vec4u (140 u32) per source type, read a vec4 at a
-            // time in the Mode 5 transform block. 20 types * 35 = 700 vec4u.
-            struct DnfRules { d: array<vec4u, 700> }
+            // Mode 5 DNF data. ${DNF_TYPE_STRIDE_U32 / 4} vec4u per source type, read a vec4 at a
+            // time in the Mode 5 transform block.
+            struct DnfRules { d: array<vec4u, ${MAX_TYPES * DNF_TYPE_STRIDE_U32 / 4}> }
 
             @group(0) @binding(0)  var<storage, read_write> particles:         array<Particle>;
             @group(0) @binding(1)  var<storage, read>       sortedParticles:   array<Particle>;
@@ -3182,8 +3182,10 @@ export class ParticleSimulation {
         }
     }
 
-    // Generate plausible force-based rules: each type gets a couple of force
-    // conditions and one transform rule with a small random boolean expression.
+    // Generate plausible force-based rules. Each type gets several force conditions
+    // and a handful of transform rules (mirroring the classic transform's density,
+    // so particles rarely dead-end). Rules combine conditions with random boolean
+    // expressions and aim at varied target types.
     randomizeDnfRules(): void {
         const n = this.numTypes;
         const randType = (exclude = -1) => {
@@ -3192,9 +3194,29 @@ export class ParticleSimulation {
             return t;
         };
         const randThresh = () => Math.round((Math.random() * 1.4 - 0.4) * 100) / 100;  // ~ -0.4 .. 1.0
+        const pick = <T,>(a: T[]) => a[Math.floor(Math.random() * a.length)];
+
+        // A random boolean expression over conditions C1..C{nCond}.
+        const randExpr = (nCond: number): string => {
+            const k = 1 + Math.floor(Math.random() * Math.min(3, nCond));  // 1-3 terms
+            const pool = Array.from({ length: nCond }, (_, i) => i + 1);
+            // shuffle
+            for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+            const term = (i: number) => (Math.random() < 0.25 ? 'not C' : 'C') + pool[i];
+            let expr = term(0);
+            for (let i = 1; i < k; i++) expr = `${expr} ${pick(['and', 'or', 'nand', 'nor'])} ${term(i)}`;
+            // Occasionally parenthesise the head pair for variety: (A op B) op C.
+            if (k === 3 && Math.random() < 0.4) {
+                const op1 = pick(['and', 'or', 'nand', 'nor']);
+                const op2 = pick(['and', 'or']);
+                expr = `(${term(0)} ${op1} ${term(1)}) ${op2} ${term(2)}`;
+            }
+            return expr;
+        };
+
         for (let s = 0; s < MAX_TYPES; s++) {
             if (s >= n) { this.dnfTypes[s] = { conditions: [], rules: [] }; continue; }
-            const nCond = 1 + Math.floor(Math.random() * 2);  // 1 or 2
+            const nCond = 2 + Math.floor(Math.random() * 3);  // 2-4 conditions
             const conditions: DnfCondition[] = [];
             for (let c = 0; c < nCond; c++) {
                 conditions.push({
@@ -3203,11 +3225,14 @@ export class ParticleSimulation {
                     threshold: randThresh(),
                 });
             }
-            // Build a small expression over the available conditions.
-            let expr = 'C1';
-            if (nCond >= 2) expr = Math.random() < 0.5 ? 'C1 and C2' : 'C1 or C2';
-            const { rpn } = compileBoolExpr(expr, nCond);
-            this.dnfTypes[s] = { conditions, rules: [{ target: randType(s), expr, rpn }] };
+            const nRules = 2 + Math.floor(Math.random() * (MAX_DNF_RULES - 1));  // 2..MAX_DNF_RULES
+            const rules: DnfRule[] = [];
+            for (let r = 0; r < nRules; r++) {
+                const expr = randExpr(nCond);
+                const { rpn } = compileBoolExpr(expr, nCond);
+                rules.push({ target: randType(s), expr, rpn });
+            }
+            this.dnfTypes[s] = { conditions, rules };
         }
         this.dnfDirty = true;
     }
