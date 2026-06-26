@@ -3196,20 +3196,20 @@ export class ParticleSimulation {
         const randThresh = () => Math.round((Math.random() * 1.4 - 0.4) * 100) / 100;  // ~ -0.4 .. 1.0
         const pick = <T,>(a: T[]) => a[Math.floor(Math.random() * a.length)];
 
-        // A random boolean expression over conditions C1..C{nCond}.
+        // A random boolean expression over conditions C1..C{nCond}. Only positive
+        // and/or logic — negation (not/nor/nand) is true in the common low-force
+        // state, which makes rules fire almost every tick and particles never settle.
         const randExpr = (nCond: number): string => {
             const k = 1 + Math.floor(Math.random() * Math.min(3, nCond));  // 1-3 terms
             const pool = Array.from({ length: nCond }, (_, i) => i + 1);
             // shuffle
             for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
-            const term = (i: number) => (Math.random() < 0.25 ? 'not C' : 'C') + pool[i];
+            const term = (i: number) => 'C' + pool[i];
             let expr = term(0);
-            for (let i = 1; i < k; i++) expr = `${expr} ${pick(['and', 'or', 'nand', 'nor'])} ${term(i)}`;
+            for (let i = 1; i < k; i++) expr = `${expr} ${pick(['and', 'or'])} ${term(i)}`;
             // Occasionally parenthesise the head pair for variety: (A op B) op C.
             if (k === 3 && Math.random() < 0.4) {
-                const op1 = pick(['and', 'or', 'nand', 'nor']);
-                const op2 = pick(['and', 'or']);
-                expr = `(${term(0)} ${op1} ${term(1)}) ${op2} ${term(2)}`;
+                expr = `(${term(0)} ${pick(['and', 'or'])} ${term(1)}) ${pick(['and', 'or'])} ${term(2)}`;
             }
             return expr;
         };

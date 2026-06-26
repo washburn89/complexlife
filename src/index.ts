@@ -1710,7 +1710,7 @@ class ParticleLifeApp {
 
             const expr = document.createElement('input');
             expr.type = 'text'; expr.className = 'dnf-expr';
-            expr.placeholder = 'e.g. (C1 and C2) or not C3';
+            expr.placeholder = 'e.g. (C1 and C2) or C3';
             expr.value = ru.expr;
             const status = document.createElement('span');
             status.className = 'dnf-status';

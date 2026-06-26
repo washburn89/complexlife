@@ -570,12 +570,15 @@
 
                 <div id="dnf-panel">
                     <p class="tr-hint">
-                        <strong>Transform #2 — DNF rules.</strong> Each particle counts its neighbours by type
-                        (within bond range) and checks its source-type's rules. A rule is a set of
-                        <em>clauses</em> OR'd together; a clause is a set of conditions AND'd together
-                        (e.g. <code>≥2 red &amp; ≤0 blue → green</code>). The first satisfied clause that wins
-                        its dice roll transforms the particle. This drives composition-based "metabolism":
-                        structures change type as their local mix changes. Patchy bonding (above) still applies.
+                        <strong>Transform #2 — rule logic.</strong> Each source type defines force
+                        <em>conditions</em> (C1, C2…), each comparing the accumulated force from a trigger
+                        type against a threshold. Transform rules then combine those conditions with a
+                        boolean expression (e.g. <code>(C1 and C2) or C3</code>); the first rule whose
+                        expression is true wins its dice roll and transforms the particle. Prefer
+                        <code>and</code>/<code>or</code>: <code>not</code>/<code>nand</code>/<code>nor</code>
+                        are true whenever forces are <em>below</em> threshold (the common case), so they fire
+                        almost every tick and particles never settle. This drives composition-based
+                        "metabolism". Patchy bonding (above) still applies when enabled.
                     </p>
                     <div class="settings-row">
                         <label>Max Transform</label>
