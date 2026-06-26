@@ -3214,9 +3214,14 @@ export class ParticleSimulation {
             return expr;
         };
 
+        const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+        const others = n - 1;  // number of other types a source can sense / become
         for (let s = 0; s < MAX_TYPES; s++) {
-            if (s >= n) { this.dnfTypes[s] = { conditions: [], rules: [] }; continue; }
-            const nCond = 2 + Math.floor(Math.random() * 3);  // 2-4 conditions
+            // Transforms need at least two types; otherwise there's nothing to become.
+            if (s >= n || n < 2) { this.dnfTypes[s] = { conditions: [], rules: [] }; continue; }
+            // Condition & rule counts scale with the number of other types (so a
+            // 2-type sim stays sparse and a 20-type sim gets rich), capped by layout.
+            const nCond = clamp(Math.round(others * (0.4 + Math.random() * 0.5)), 2, MAX_DNF_CONDITIONS);
             const conditions: DnfCondition[] = [];
             for (let c = 0; c < nCond; c++) {
                 conditions.push({
@@ -3225,7 +3230,7 @@ export class ParticleSimulation {
                     threshold: randThresh(),
                 });
             }
-            const nRules = 2 + Math.floor(Math.random() * (MAX_DNF_RULES - 1));  // 2..MAX_DNF_RULES
+            const nRules = clamp(Math.round(others * (0.6 + Math.random() * 0.8)), 2, MAX_DNF_RULES);
             const rules: DnfRule[] = [];
             for (let r = 0; r < nRules; r++) {
                 const expr = randExpr(nCond);
