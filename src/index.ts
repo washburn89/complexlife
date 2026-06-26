@@ -945,9 +945,9 @@ class ParticleLifeApp {
                     const r = this.clientBoxToCanvasRect(box);
                     if (r.w >= 1 && r.h >= 1) this.exportSelection(box);
                 }
-                // Releasing the selection square resumes the sim (unless it was
-                // already paused before entering select mode).
-                this.resumeAfterPhotoPause();
+                // Selecting + exporting auto-ends the selection (and resumes the sim
+                // unless it was already paused before entering select mode).
+                this.exitPhotoSelect();
             }
             if (e.button === 0 && this.selBoxActive && this.trackMode === 'selecting') {
                 this.selBoxActive = false;
@@ -1260,7 +1260,9 @@ class ParticleLifeApp {
 
     private async exportFullCanvas(): Promise<void> {
         if (!this.sim) return;
-        const cap = await this.sim.captureRGBA();
+        // Export exactly the physics-simmed world area at full resolution, ignoring
+        // the live camera framing (full export is only offered in loop edge mode).
+        const cap = await this.sim.captureRGBA({ fullWorld: true });
         if (!cap) return;
         const blob = await this.rgbaToPngBlob(cap.data, cap.width, cap.height);
         if (blob) this.downloadBlob(blob, this.exportFilename(`${cap.width}x${cap.height}`));

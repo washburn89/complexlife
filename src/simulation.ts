@@ -2974,19 +2974,35 @@ export class ParticleSimulation {
     // Render the current frame into an offscreen texture at full canvas resolution
     // and read the pixels back as tightly-packed, top-to-bottom RGBA (alpha forced
     // opaque to match the on-screen 'opaque' canvas). Returns null if not ready.
-    async captureRGBA(): Promise<{ data: Uint8ClampedArray; width: number; height: number } | null> {
+    // opts.fullWorld: ignore the live camera and render the entire physics-simmed
+    // area (the toroidal world rect) at its native resolution — used by full export
+    // in loop edge mode so the image is exactly the simulated region, not the
+    // current zoom/pan framing.
+    async captureRGBA(opts?: { fullWorld?: boolean }): Promise<{ data: Uint8ClampedArray; width: number; height: number } | null> {
         if (!this.isInitialized || !this.device || !this.queue || !this.viewBuffer ||
             !this.renderBindGroup || !this.renderPipeline || !this.renderPipelineAdd || !this.quadVertexBuffer) {
             return null;
         }
-        const w = this.canvas.width;
-        const h = this.canvas.height;
+        let w: number, h: number, viewCx: number, viewCy: number, viewZoom: number;
+        if (opts?.fullWorld) {
+            // Render the whole world rect [0,worldW]×[0,worldH] at zoom 1, centred.
+            const maxDim = this.device.limits.maxTextureDimension2D;
+            let tw = Math.round(this.params.worldWidth);
+            let th = Math.round(this.params.worldHeight);
+            const over = Math.max(tw, th) / maxDim;
+            if (over > 1) { tw = Math.round(tw / over); th = Math.round(th / over); }  // clamp to device limit
+            w = Math.max(1, tw); h = Math.max(1, th);
+            viewCx = this.params.worldWidth / 2; viewCy = this.params.worldHeight / 2; viewZoom = 1;
+        } else {
+            w = this.canvas.width; h = this.canvas.height;
+            viewCx = this.view.cx; viewCy = this.view.cy; viewZoom = this.view.zoom;
+        }
         if (w <= 0 || h <= 0) return null;
         const fmt = navigator.gpu.getPreferredCanvasFormat();
 
         // Make sure the view uniform reflects current state (also valid while paused).
         this.queue.writeBuffer(this.viewBuffer, 0, new Float32Array([
-            this.view.cx, this.view.cy, this.view.zoom,
+            viewCx, viewCy, viewZoom,
             this.colorSaturation, this.particleGlow, this.particleAlpha,
             w, h, this.additiveStrength, this.shapeMode, this.simulationTime, 0,
         ]) as Float32Array<ArrayBuffer>);
