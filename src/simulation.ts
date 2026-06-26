@@ -152,16 +152,6 @@ const DNF_TYPE_STRIDE_U32 = 4 + MAX_DNF_CONDITIONS * 4 + MAX_DNF_RULES * (4 + DN
 // compensate, keeping the long-run transform rate roughly unchanged.
 const TFORM_STRIDE = 3;
 
-// Per-particle neighbour budget for the patchy kernel. The spatial grid is capped
-// at 64×64 with cells sized to the largest interaction radius, so when particles
-// collapse into a few cells the neighbour scan would otherwise grow without bound
-// (thousands per cell) and the frame rate decays until auto-pause. Capping the
-// number of neighbours each particle processes keeps cost bounded; the value is
-// well above typical uniform-density windows so normal scenes are unaffected, but
-// it tames dense clumps. Forces/bonds saturate anyway, so the visual impact in a
-// clump is minimal.
-const PATCHY_NEIGHBOR_CAP = 512;
-
 const OPEN_MULT            = 8;
 const MAX_GRID_DIM         = 64;
 const MAX_CELLS            = MAX_GRID_DIM * MAX_GRID_DIM;  // 4096
@@ -2113,8 +2103,6 @@ export class ParticleSimulation {
                 // best-aligned patch; we keep only the single strongest candidate per
                 // patch. Pass B then bonds the winner and *repels* the losers, so a
                 // particle truly saturates at its valence (no loose rosette shell).
-                var budgetA: u32 = ${PATCHY_NEIGHBOR_CAP}u;
-                var stopA = false;
                 if (myPatch > 0u) {
                     for (var goy = -1; goy <= 1; goy++) {
                         for (var gox = -1; gox <= 1; gox++) {
@@ -2132,8 +2120,6 @@ export class ParticleSimulation {
                             for (var k = start; k < end; k++) {
                                 let other = sortedParticles[k];
                                 if (other.typeId < 0.0) { continue; }
-                                if (budgetA == 0u) { stopA = true; break; }
-                                budgetA = budgetA - 1u;
                                 let otherPatch = patchN(u32(other.typeId));
                                 if (otherPatch == 0u) { continue; }
                                 var dx = other.pos.x - p.pos.x;
@@ -2155,15 +2141,11 @@ export class ParticleSimulation {
                                 let pk     = u32(mine.z);
                                 if (bond > bestBond[pk]) { bestBond[pk] = bond; bestIdx[pk] = k; }
                             }
-                            if (stopA) { break; }
                         }
-                        if (stopA) { break; }
                     }
                 }
 
                 // ── Pass B: apply isotropic force, excluded volume, and saturated bonds.
-                var budgetB: u32 = ${PATCHY_NEIGHBOR_CAP}u;
-                var stopB = false;
                 for (var goy = -1; goy <= 1; goy++) {
                     for (var gox = -1; gox <= 1; gox++) {
                         var ngx = myGx + gox;
@@ -2180,8 +2162,6 @@ export class ParticleSimulation {
                         for (var k = start; k < end; k++) {
                             let other = sortedParticles[k];
                             if (other.typeId < 0.0) { continue; }
-                            if (budgetB == 0u) { stopB = true; break; }
-                            budgetB = budgetB - 1u;
                             let otherType = u32(other.typeId);
 
                             var dx = other.pos.x - p.pos.x;
@@ -2249,9 +2229,7 @@ export class ParticleSimulation {
                                 }
                             }
                         }
-                        if (stopB) { break; }
                     }
-                    if (stopB) { break; }
                 }
 
                 let fric = pow(params.friction, speed);
