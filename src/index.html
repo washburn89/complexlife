@@ -667,16 +667,24 @@
             <!-- ── Look (photo + visuals) ──────────────────────────────── -->
             <div id="pane-look" class="tab-pane">
                 <div class="settings-section">
-                    <h4>Photo Export</h4>
+                    <h4>Photo / Video Export</h4>
                     <div class="btn-row">
                         <button id="exportFullBtn">&#11015; Full Canvas PNG</button>
+                        <button id="recordFullBtn">&#9210; Record Full Video</button>
                     </div>
                     <div class="btn-row" style="margin-top:7px">
                         <button id="exportSelBtn">&#9645; Select &amp; Export PNG</button>
+                        <button id="recordSelBtn">&#9210; Select &amp; Record Video</button>
+                    </div>
+                    <div class="settings-row" style="margin-top:7px">
+                        <label>Video length</label>
+                        <input type="range" id="videoDurSlider" min="5" max="30" step="5" value="10">
+                        <span class="val" id="videoDurValue">10s</span>
                     </div>
                     <p class="hint" style="margin-top:7px">
                         <strong>Full Canvas</strong> saves the whole canvas as a lossless PNG (closed/Loop edge mode only).<br>
-                        <strong>Select &amp; Export</strong> — drag a rectangle on the canvas; release to save just that region (sim pauses while you compose). The box shows its output pixel size.
+                        <strong>Select &amp; Export</strong> — drag a rectangle on the canvas; release to save just that region (sim pauses while you compose). The box shows its output pixel size.<br>
+                        <strong>Record Video</strong> captures the live simulation (full canvas or a dragged region) as a WebM video of the chosen length.
                     </p>
                 </div>
 

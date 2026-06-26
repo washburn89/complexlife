@@ -123,6 +123,15 @@ class ParticleLifeApp {
     private photoSelDragging = false;
     private photoSelDidPause  = false;  // true if entering select mode paused the sim (so release can resume)
     private photoSelBox: { sx0: number; sy0: number; sx1: number; sy1: number } | null = null;
+    private photoSelTarget: 'png' | 'video' = 'png';   // what a completed selection does
+
+    // ── Video recording ───────────────────────────────────────────────────────
+    private videoDurationSec = 10;
+    private isRecording      = false;
+    private recorder: MediaRecorder | null = null;
+    private recordCopy: (() => void) | null = null;   // per-frame blit into the record canvas
+    private recordStopTimer = 0;
+    private recordCountdownTimer = 0;
 
     constructor() {
         this.canvas = document.getElementById('sim-canvas') as HTMLCanvasElement;
@@ -442,7 +451,18 @@ class ParticleLifeApp {
             if (this.sim?.getEdgeMode() === 1) return;  // disabled in open mode
             this.exportFullCanvas();
         });
-        document.getElementById('exportSelBtn')!.addEventListener('click', () => this.togglePhotoSelect());
+        document.getElementById('exportSelBtn')!.addEventListener('click', () => this.togglePhotoSelect('png'));
+
+        // Video export (WebM)
+        document.getElementById('recordFullBtn')!.addEventListener('click', () => {
+            if (this.isRecording) this.stopRecording(); else this.recordFullVideo();
+        });
+        document.getElementById('recordSelBtn')!.addEventListener('click', () => this.togglePhotoSelect('video'));
+        const durEl = document.getElementById('videoDurSlider') as HTMLInputElement;
+        durEl.addEventListener('input', () => {
+            this.videoDurationSec = Math.max(5, Math.min(30, Math.round(Number(durEl.value) / 5) * 5));
+            document.getElementById('videoDurValue')!.textContent = `${this.videoDurationSec}s`;
+        });
 
         // Export / Import
         document.getElementById('exportBtn')!.addEventListener('click', () => this.exportConfig());
@@ -460,6 +480,7 @@ class ParticleLifeApp {
                 this.closeForceEditor(); this.closeTransformEditor();
                 if (this.trackMode === 'selecting') { this.trackMode = 'idle'; this.syncTrackButton(); }
                 if (this.photoSelMode) this.exitPhotoSelect();
+                if (this.isRecording) this.stopRecording();  // Esc ends recording early (saves what's captured)
             }
             if (e.key === ' ' && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
                 e.preventDefault();
@@ -941,13 +962,20 @@ class ParticleLifeApp {
             if (e.button === 0 && this.photoSelDragging) {
                 this.photoSelDragging = false;
                 const box = this.photoSelBox;
+                const target = this.photoSelTarget;
+                let rect: { x: number; y: number; w: number; h: number } | null = null;
                 if (box && this.sim) {
                     const r = this.clientBoxToCanvasRect(box);
-                    if (r.w >= 1 && r.h >= 1) this.exportSelection(box);
+                    if (r.w >= 1 && r.h >= 1) {
+                        if (target === 'png') this.exportSelection(box);
+                        else rect = r;
+                    }
                 }
-                // Selecting + exporting auto-ends the selection (and resumes the sim
-                // unless it was already paused before entering select mode).
+                // Selecting auto-ends the selection (and resumes the sim unless it was
+                // already paused before entering select mode).
                 this.exitPhotoSelect();
+                // Video records the live sim, so start only after resuming.
+                if (target === 'video' && rect) this.startRecording(rect);
             }
             if (e.button === 0 && this.selBoxActive && this.trackMode === 'selecting') {
                 this.selBoxActive = false;
@@ -1182,8 +1210,12 @@ class ParticleLifeApp {
 
     // ── Photo export ───────────────────────────────────────────────────────────
 
-    private togglePhotoSelect(): void {
-        if (this.photoSelMode) { this.exitPhotoSelect(); return; }
+    private togglePhotoSelect(target: 'png' | 'video' = 'png'): void {
+        // Clicking the same tool again cancels; switching target re-arms.
+        if (this.photoSelMode && this.photoSelTarget === target) { this.exitPhotoSelect(); return; }
+        if (this.isRecording) return;
+        this.photoSelTarget = target;
+        if (this.photoSelMode) { this.syncPhotoSelButton(); return; }
         // Turn off any conflicting interaction modes
         if (this.activeCursorTool !== 'none') this.setActiveCursorTool(this.activeCursorTool);  // toggles off
         if (this.trackMode === 'selecting') {
@@ -1225,12 +1257,18 @@ class ParticleLifeApp {
     }
 
     private syncPhotoSelButton(): void {
-        const btn = document.getElementById('exportSelBtn');
-        if (!btn) return;
-        btn.classList.toggle('active', this.photoSelMode);
-        btn.innerHTML = this.photoSelMode
-            ? '&#9645; Drag a box · Esc to cancel'
-            : '&#9645; Select &amp; Export PNG';
+        const png = document.getElementById('exportSelBtn');
+        const vid = document.getElementById('recordSelBtn');
+        const pngActive = this.photoSelMode && this.photoSelTarget === 'png';
+        const vidActive = this.photoSelMode && this.photoSelTarget === 'video';
+        if (png) {
+            png.classList.toggle('active', pngActive);
+            png.innerHTML = pngActive ? '&#9645; Drag a box · Esc to cancel' : '&#9645; Select &amp; Export PNG';
+        }
+        if (vid) {
+            vid.classList.toggle('active', vidActive);
+            vid.innerHTML = vidActive ? '&#9645; Drag a box · Esc to cancel' : '&#9210; Select &amp; Record Video';
+        }
     }
 
     // Grey out full-canvas export in open edge mode (its framing isn't a complete image)
@@ -1303,11 +1341,112 @@ class ParticleLifeApp {
         setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 
-    private exportFilename(tag: string): string {
+    private exportFilename(tag: string, ext = 'png'): string {
         const d = new Date();
         const p = (n: number) => String(n).padStart(2, '0');
         const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-        return `particle-life-${stamp}-${tag}.png`;
+        return `particle-life-${stamp}-${tag}.${ext}`;
+    }
+
+    // ── Video recording (WebM via MediaRecorder) ────────────────────────────────
+    private recordFullVideo(): void {
+        if (this.isRecording || !this.sim) return;
+        this.startRecording({ x: 0, y: 0, w: this.canvas.width, h: this.canvas.height });
+    }
+
+    private pickVideoMime(): string {
+        const cands = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4'];
+        for (const c of cands) {
+            if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(c)) return c;
+        }
+        return '';
+    }
+
+    // Record the live simulation over the given canvas-pixel rect for the chosen
+    // duration. A 2D record canvas is blitted from the WebGPU canvas each frame
+    // (so we can crop to a sub-region) and captured via MediaRecorder.
+    private startRecording(rect: { x: number; y: number; w: number; h: number }): void {
+        if (this.isRecording || !this.sim) return;
+        if (typeof MediaRecorder === 'undefined') { alert('Video recording is not supported in this browser.'); return; }
+        const mime = this.pickVideoMime();
+        const w = Math.max(2, Math.round(rect.w)), h = Math.max(2, Math.round(rect.h));
+        const fps = 30;
+
+        // Whole canvas → capture its stream directly (most reliable). A sub-region →
+        // blit the crop into a 2D record canvas each frame and capture that.
+        const fullCanvas = rect.x === 0 && rect.y === 0 && w === this.canvas.width && h === this.canvas.height;
+        let stream: MediaStream;
+        let perFrame: (() => void) | null = null;
+        if (fullCanvas) {
+            stream = this.canvas.captureStream(fps);
+        } else {
+            const rc = document.createElement('canvas');
+            rc.width = w; rc.height = h;
+            const rctx = rc.getContext('2d');
+            if (!rctx) return;
+            const bg = this.sim.getBackgroundColor();
+            rctx.fillStyle = `rgb(${Math.round(bg.r * 255)},${Math.round(bg.g * 255)},${Math.round(bg.b * 255)})`;
+            rctx.fillRect(0, 0, w, h);
+            stream = rc.captureStream(fps);
+            perFrame = () => { try { rctx.drawImage(this.canvas, rect.x, rect.y, w, h, 0, 0, w, h); } catch { /* frame not ready */ } };
+        }
+        // Bitrate scaled to area, capped — high enough to keep particle detail crisp.
+        const bitrate = Math.min(40_000_000, Math.max(6_000_000, Math.round(w * h * fps * 0.15)));
+        let rec: MediaRecorder;
+        try {
+            rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: bitrate } : { videoBitsPerSecond: bitrate });
+        } catch {
+            alert('Could not start video recording.');
+            return;
+        }
+        const chunks: BlobPart[] = [];
+        rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+        rec.onstop = () => {
+            const type = rec.mimeType || mime || 'video/webm';
+            const ext  = type.includes('mp4') ? 'mp4' : 'webm';
+            const blob = new Blob(chunks, { type });
+            if (blob.size) this.downloadBlob(blob, this.exportFilename(`${w}x${h}-${this.videoDurationSec}s`, ext));
+            stream.getTracks().forEach(t => t.stop());
+        };
+
+        // Per-frame blit (sub-region only): runs in the animation loop after render.
+        this.recordCopy = perFrame;
+
+        rec.start();
+        this.isRecording = true;
+        this.recorder = rec;
+        const endAt = performance.now() + this.videoDurationSec * 1000;
+        this.recordStopTimer = window.setTimeout(() => this.stopRecording(), this.videoDurationSec * 1000);
+        this.recordCountdownTimer = window.setInterval(() => {
+            const left = Math.max(0, Math.ceil((endAt - performance.now()) / 1000));
+            this.syncRecordButtons(left);
+        }, 250);
+        this.syncRecordButtons(this.videoDurationSec);
+    }
+
+    private stopRecording(): void {
+        if (!this.isRecording) return;
+        window.clearTimeout(this.recordStopTimer);
+        window.clearInterval(this.recordCountdownTimer);
+        this.recordCopy = null;
+        try { this.recorder?.stop(); } catch { /* already stopped */ }
+        this.recorder = null;
+        this.isRecording = false;
+        this.syncRecordButtons(0);
+    }
+
+    private syncRecordButtons(secondsLeft: number): void {
+        const full = document.getElementById('recordFullBtn');
+        const sel  = document.getElementById('recordSelBtn');
+        const rec  = this.isRecording;
+        if (full) {
+            full.classList.toggle('active', rec);
+            full.innerHTML = rec ? `&#9209; Recording… ${secondsLeft}s` : '&#9210; Record Full Video';
+        }
+        if (sel && !(this.photoSelMode && this.photoSelTarget === 'video')) {
+            sel.classList.toggle('disabled-look', rec);
+            sel.innerHTML = rec ? '&#9210; Recording…' : '&#9210; Select &amp; Record Video';
+        }
     }
 
     // ── Force matrices ────────────────────────────────────────────────────────
@@ -2192,6 +2331,8 @@ class ParticleLifeApp {
             this.sim?.update();
             this.updateStats();
             this.drawOverlay();
+            // Blit the freshly-rendered frame into the video record canvas, if active.
+            this.recordCopy?.();
             this.animId = requestAnimationFrame(tick);
         };
         this.animId = requestAnimationFrame(tick);
