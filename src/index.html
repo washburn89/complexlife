@@ -582,9 +582,9 @@
                         "metabolism". Patchy bonding (above) still applies when enabled.
                     </p>
                     <div class="settings-row">
-                        <label>Max Transform</label>
-                        <input type="range" id="dnfMaxSlider" min="0.01" max="1.0" step="0.01" value="0.5">
-                        <span class="val" id="dnfMaxValue">0.50</span>
+                        <label>Transform 1 in</label>
+                        <input type="number" id="dnfMaxSlider" min="1" step="1" value="2" style="width:7em" title="50% chance per tick">
+                        <span class="val" id="dnfMaxValue" title="50% chance per tick">50%</span>
                     </div>
                     <div class="settings-row">
                         <label>Directional bonding</label>
@@ -618,15 +618,10 @@
                         <label>Fields</label>
                         <input type="number" id="qftFieldCount" min="1" max="12" value="3" step="1">
                     </div>
-                    <div class="settings-row">
-                        <label>Temperature</label>
-                        <input type="range" id="qftTempSlider" min="0" max="3" step="0.05" value="0.3">
-                        <span class="val" id="qftTempValue">0.30</span>
-                    </div>
                     <p class="tr-hint" style="margin-top:2px;">
                         Charge forces are conservative (like real physics), so they settle into a static
-                        packing. Temperature adds a random kick each tick — kinetic energy that keeps things
-                        moving and structures forming/breaking. 0 = freeze into equilibrium.
+                        packing. Use the global <strong>Temperature</strong> control (World &gt; Physics) to add a
+                        random kick each tick that keeps things moving and structures forming/breaking.
                     </p>
                     <div class="btn-row" style="margin:8px 0;">
                         <button id="randomizeChargesBtn">Randomize charges</button>
@@ -652,9 +647,9 @@
                             exclusion field is never a trigger. Click a cell to edit its rule.
                         </p>
                         <div class="settings-row">
-                            <label>Max Transform</label>
-                            <input type="range" id="qftMaxSlider" min="0.01" max="1.0" step="0.01" value="0.5">
-                            <span class="val" id="qftMaxValue">0.50</span>
+                            <label>Transform 1 in</label>
+                            <input type="number" id="qftMaxSlider" min="1" step="1" value="2" style="width:7em" title="50% chance per tick">
+                            <span class="val" id="qftMaxValue" title="50% chance per tick">50%</span>
                         </div>
                         <div class="btn-row" style="margin:8px 0;">
                             <button id="randomizeQftTransformBtn">Randomize transforms</button>
@@ -687,9 +682,9 @@
                         the higher the chance (up to Max Transform per tick at 3× threshold). First match wins.
                     </p>
                     <div class="settings-row">
-                        <label>Max Transform</label>
-                        <input type="range" id="maxTransformSlider" min="0.01" max="1.0" step="0.01" value="0.5">
-                        <span class="val" id="maxTransformValue">0.50</span>
+                        <label>Transform 1 in</label>
+                        <input type="number" id="maxTransformSlider" min="1" step="1" value="2" style="width:7em" title="50% chance per tick">
+                        <span class="val" id="maxTransformValue" title="50% chance per tick">50%</span>
                     </div>
                     <div class="btn-row" style="margin:8px 0;">
                         <button id="randomizeTransformBtn">Randomize rules</button>
@@ -755,8 +750,8 @@
                     <div class="settings-row">
                         <label>Blend</label>
                         <div class="edge-toggle-row" style="flex:1">
-                            <button class="edge-btn" id="blendStandardBtn">Standard</button>
-                            <button class="edge-btn selected" id="blendAdditiveBtn">Additive</button>
+                            <button class="edge-btn selected" id="blendStandardBtn">Standard</button>
+                            <button class="edge-btn" id="blendAdditiveBtn">Additive</button>
                         </div>
                     </div>
                     <div class="settings-row">
@@ -786,13 +781,15 @@
                         <span class="val" id="alphaValue">1.00</span>
                     </div>
                     <div class="settings-row">
-                        <label>Add. Strength</label>
-                        <input type="range" id="addStrSlider" min="0" max="1" step="0.05" value="0.7">
-                        <span class="val" id="addStrValue">0.70</span>
+                        <label>Dense Glow</label>
+                        <input type="range" id="addStrSlider" min="0" max="1" step="0.05" value="0.5">
+                        <span class="val" id="addStrValue">0.50</span>
                     </div>
                     <p class="hint">
-                        Glow 0 = hard solid circles. Glow 1 = wide soft orbs that bloom where they overlap.
-                        Add. Strength scales per-particle light in additive mode — lower = less bloom.
+                        Particles stay solid and bright on their own; crowded clusters glow.
+                        Glow scales the halo that dense regions get (lone particles stay crisp).
+                        Dense Glow adds additive build-up where particles overlap — 0 = fully solid.
+                        Additive blend mode makes everything fully additive (classic bloom).
                     </p>
                 </div>
             </div>
@@ -807,6 +804,12 @@
                         <span class="val" id="frictionValue">0.15</span>
                     </div>
                     <p class="hint">Friction: how quickly particles lose speed each tick. Higher = more drag (0 = frictionless, 1 = stops almost immediately).</p>
+                    <div class="settings-row">
+                        <label>Temperature</label>
+                        <input type="range" id="tempSlider" min="0" max="3" step="0.05" value="0.3">
+                        <span class="val" id="tempValue">0.30</span>
+                    </div>
+                    <p class="hint">Temperature: a random thermal kick added to every particle each tick, in all modes. Keeps energy in the system so it doesn't settle into a static lattice. 0 = no kick.</p>
                 </div>
 
                 <div class="settings-section">

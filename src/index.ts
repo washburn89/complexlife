@@ -379,11 +379,12 @@ class ParticleLifeApp {
             this.sim?.setNumFields(v);
             this.refreshQftPanel();
         });
-        const qftTempSlider = document.getElementById('qftTempSlider') as HTMLInputElement;
-        qftTempSlider.addEventListener('input', () => {
-            const v = Number(qftTempSlider.value);
-            document.getElementById('qftTempValue')!.textContent = v.toFixed(2);
-            this.sim?.setQftTemperature(v);
+        // Global temperature (applies to every mode), lives in the World/Physics panel.
+        const tempSlider = document.getElementById('tempSlider') as HTMLInputElement;
+        tempSlider.addEventListener('input', () => {
+            const v = Number(tempSlider.value);
+            document.getElementById('tempValue')!.textContent = v.toFixed(2);
+            this.sim?.setTemperature(v);
         });
         document.getElementById('randomizeQftTransformBtn')!.addEventListener('click', () => {
             this.sim?.randomizeQftTransforms();
@@ -397,18 +398,13 @@ class ParticleLifeApp {
         });
         const qftMaxSlider = document.getElementById('qftMaxSlider') as HTMLInputElement;
         qftMaxSlider.addEventListener('input', () => {
-            const v = parseFloat(qftMaxSlider.value);
-            document.getElementById('qftMaxValue')!.textContent = v.toFixed(2);
-            this.sim?.setMaxTransformRate(v);
+            const x = parseFloat(qftMaxSlider.value);
+            if (isFinite(x)) this.updateTransformRateUI(x, 'qftMaxSlider');
         });
         const dnfMaxSlider = document.getElementById('dnfMaxSlider') as HTMLInputElement;
         dnfMaxSlider.addEventListener('input', () => {
-            const v = parseFloat(dnfMaxSlider.value);
-            document.getElementById('dnfMaxValue')!.textContent = v.toFixed(2);
-            this.sim?.setMaxTransformRate(v);
-            // Keep the Transform-mode slider in sync (same global rate).
-            const ot = document.getElementById('maxTransformSlider') as HTMLInputElement | null;
-            if (ot) { ot.value = String(v); document.getElementById('maxTransformValue')!.textContent = v.toFixed(2); }
+            const x = parseFloat(dnfMaxSlider.value);
+            if (isFinite(x)) this.updateTransformRateUI(x, 'dnfMaxSlider');
         });
 
         // Randomize poles
@@ -496,12 +492,11 @@ class ParticleLifeApp {
             this.sim?.setFriction(1 - v);
         });
 
-        // Max transform rate
+        // Max transform rate — entered as "1 in X" odds per tick (rate = 1/X).
         const maxTransformSlider = document.getElementById('maxTransformSlider') as HTMLInputElement;
         maxTransformSlider.addEventListener('input', () => {
-            const v = parseFloat(maxTransformSlider.value);
-            document.getElementById('maxTransformValue')!.textContent = v.toFixed(2);
-            this.sim?.setMaxTransformRate(v);
+            const x = parseFloat(maxTransformSlider.value);
+            if (isFinite(x)) this.updateTransformRateUI(x, 'maxTransformSlider');
         });
 
         // Photo export (PNG)
@@ -654,6 +649,45 @@ class ParticleLifeApp {
         this.sim?.setBlendMode(mode);
         document.getElementById('blendStandardBtn')!.classList.toggle('selected', mode === 0);
         document.getElementById('blendAdditiveBtn')!.classList.toggle('selected', mode === 1);
+    }
+
+    // ── Transform odds ("1 in X" per tick) ──────────────────────────────────────
+    // The engine stores a per-tick probability; the UI exposes its reciprocal so
+    // users can dial in rare events (e.g. 1 in 1,000,000). All three transform-rate
+    // inputs (classic / DNF / QFT) share the same global rate, so they stay synced.
+    private oddsFromRate(rate: number): number {
+        return rate > 0 ? Math.max(1, Math.round(1 / rate)) : 1_000_000;
+    }
+    private fmtPctFull(X: number): string {
+        // Full-precision percent, no scientific notation (for the hover tooltip).
+        const s = (100 / X).toFixed(12).replace(/0+$/, '').replace(/\.$/, '');
+        return s + '%';
+    }
+    private fmtPctShort(X: number): string {
+        const pct = 100 / X;
+        if (pct >= 1) return (Math.round(pct * 10) / 10) + '%';
+        return this.fmtPctFull(X);  // below 1%, show full precision inline too
+    }
+    // Apply an entered "1 in X" value to the engine (unless apply=false) and mirror
+    // it across all three inputs/readouts. The input the user is typing in is left
+    // alone (sourceId) so its caret/value isn't clobbered mid-edit.
+    private updateTransformRateUI(xRaw: number, sourceId?: string, apply = true): void {
+        const X = Math.max(1, Math.round(xRaw));
+        if (apply) this.sim?.setMaxTransformRate(1 / X);
+        const full = `${this.fmtPctFull(X)} chance per tick`;
+        const short = this.fmtPctShort(X);
+        for (const id of ['maxTransformSlider', 'qftMaxSlider', 'dnfMaxSlider']) {
+            const inp = document.getElementById(id) as HTMLInputElement | null;
+            if (!inp) continue;
+            if (id !== sourceId) inp.value = String(X);
+            inp.title = full;
+        }
+        for (const id of ['maxTransformValue', 'qftMaxValue', 'dnfMaxValue']) {
+            const sp = document.getElementById(id);
+            if (!sp) continue;
+            sp.textContent = short;
+            sp.title = full;
+        }
     }
 
     private setShapeMode(mode: 0 | 1): void {
@@ -1917,12 +1951,7 @@ class ParticleLifeApp {
     private refreshQftPanel(): void {
         if (!this.sim) return;
         (document.getElementById('qftFieldCount') as HTMLInputElement).value = String(this.sim.getNumFields());
-        const temp = this.sim.getQftTemperature();
-        (document.getElementById('qftTempSlider') as HTMLInputElement).value = String(temp);
-        document.getElementById('qftTempValue')!.textContent = temp.toFixed(2);
-        const rate = this.sim.getMaxTransformRate();
-        (document.getElementById('qftMaxSlider') as HTMLInputElement).value = String(rate);
-        document.getElementById('qftMaxValue')!.textContent = rate.toFixed(2);
+        this.updateTransformRateUI(this.oddsFromRate(this.sim.getMaxTransformRate()), undefined, false);
         this.buildQftFieldTable();
         this.buildQftMatrix('qft-charge-table', this.sim.getCharges(), (t, f, v) => this.sim?.setCharge(t, f, v));
         this.buildQftMatrix('qft-susc-table',   this.sim.getSusc(),    (t, f, v) => this.sim?.setSusc(t, f, v));
@@ -2085,9 +2114,7 @@ class ParticleLifeApp {
     // ── DNF rules panel (mode 5 / Transform #2) ─────────────────────────────────
     private refreshDnfPanel(): void {
         if (!this.sim) return;
-        const rate = this.sim.getMaxTransformRate();
-        const slider = document.getElementById('dnfMaxSlider') as HTMLInputElement | null;
-        if (slider) { slider.value = String(rate); document.getElementById('dnfMaxValue')!.textContent = rate.toFixed(2); }
+        this.updateTransformRateUI(this.oddsFromRate(this.sim.getMaxTransformRate()), undefined, false);
         this.buildDnfList();
     }
 
@@ -2626,9 +2653,11 @@ class ParticleLifeApp {
         (document.getElementById('frictionSlider') as HTMLInputElement).value = String(drag);
         document.getElementById('frictionValue')!.textContent = drag.toFixed(2);
 
-        const maxTransform = this.sim.getMaxTransformRate();
-        (document.getElementById('maxTransformSlider') as HTMLInputElement).value = String(maxTransform);
-        document.getElementById('maxTransformValue')!.textContent = maxTransform.toFixed(2);
+        const temp = this.sim.getTemperature();
+        (document.getElementById('tempSlider') as HTMLInputElement).value = String(temp);
+        document.getElementById('tempValue')!.textContent = temp.toFixed(2);
+
+        this.updateTransformRateUI(this.oddsFromRate(this.sim.getMaxTransformRate()), undefined, false);
 
         this.refreshPatchUI();
         this.refreshDnfPanel();

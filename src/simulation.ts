@@ -163,8 +163,15 @@ const TFORM_STRIDE = 3;
 export const MAX_FIELDS = 12;
 
 const OPEN_MULT            = 8;
-const MAX_GRID_DIM         = 64;
-const MAX_CELLS            = MAX_GRID_DIM * MAX_GRID_DIM;  // 4096
+// Spatial-grid budget. The grid must cover the whole world (particles bounce at
+// the world edge), but neighbour search is only cheap when cellSize ≈ the
+// interaction radius. In open mode the world is OPEN_MULT× larger per axis, so a
+// small per-axis cap forced cells far bigger than the interaction radius —
+// every populated cell then held a huge particle count and the O(per-cell)
+// neighbour loop blew up. A 256-cap keeps cellSize ≈ maxRadius across the open
+// world; the extra (mostly empty) cells only cost a trivially cheap clear/scan.
+const MAX_GRID_DIM         = 256;
+const MAX_CELLS            = MAX_GRID_DIM * MAX_GRID_DIM;  // 65536; must stay a multiple of 256 (prefix-sum CHUNK)
 const MAX_PARTICLE_CAPACITY = 300_000;
 
 function hslToHex(h: number, s: number, l: number): string {
@@ -283,11 +290,11 @@ export class ParticleSimulation {
 
     private backgroundColor = { r: 0.05, g: 0.05, b: 0.08 };
     private colorSaturation  = 1.0;
-    private particleGlow     = 0.0;  // 0 = hard solid circle, 1 = wide gaussian orb
+    private particleGlow     = 0.0;  // 0 = no halo; 1 = max density-driven glow halo
     private particleAlpha    = 1.0;  // 0 = fully transparent, 1 = fully opaque
-    private additiveStrength = 0.7;  // scales per-particle light contribution in additive mode
+    private additiveStrength = 0.5;  // 0 = pure solid (over); higher = more additive build-up where particles overlap densely
     private shapeMode        = 1;    // 0 = circles, 1 = procedural polygons
-    private blendMode        = 1;    // 0 = standard over, 1 = additive (bloom)
+    private blendMode        = 0;    // 0 = solid+dense-additive (default), 1 = full additive (bloom)
     private friction         = 0.85; // velocity multiplier per tick (1 = no drag, 0 = full stop)
     private maxTransformRate = 0.5;  // peak probability per tick for type conversion in mode 1
 
@@ -397,7 +404,7 @@ export class ParticleSimulation {
     // opposite → attract) and acts within range = fieldRange * |qi*qj|. Field 0 is
     // the universal exclusion field ("exc") — all types charge 1 by default.
     private numFields = 3;
-    private qftTemperature = 0.3;           // thermal agitation (random kick / tick)
+    private temperature = 0.3;              // global thermal agitation (random kick / tick), all modes
     private fieldRange:    number[] = [];   // intrinsic max range per field
     private fieldStrength: number[] = [];   // force multiplier per field
     private fieldNames:    string[] = [];
@@ -558,8 +565,8 @@ export class ParticleSimulation {
             data[f * 4 + 0] = this.fieldRange[f]    ?? 0;
             data[f * 4 + 1] = this.fieldStrength[f] ?? 0;
         }
-        data[2] = this.numFields;       // f[0].z
-        data[3] = this.qftTemperature;  // f[0].w
+        data[2] = this.numFields;     // f[0].z
+        data[3] = this.temperature;   // f[0].w (legacy slot; QFT kernel now reads params.temp)
         return data as Float32Array<ArrayBuffer>;
     }
 
@@ -734,9 +741,10 @@ export class ParticleSimulation {
         return data;
     }
 
-    // params: two vec4f (32 bytes).
+    // params: three vec4f (48 bytes).
     // [0] speed, worldW, worldH, packed(simMode|edgeMode|numTypes|poleWorldFrame as float)
-    // [1] friction, maxTransformRate, dnfBonding(0/1), 0
+    // [1] friction, maxTransformRate, dnfBonding(0/1), frameCounter
+    // [2] temperature (global thermal kick, all modes), 0, 0, 0
     private paramsArray(): Float32Array<ArrayBuffer> {
         const packed = (this.poleWorldFrame ? (1 << 24) : 0)
                      | (this.numTypes << 16) | (this.edgeMode << 8) | this.simMode;
@@ -749,6 +757,8 @@ export class ParticleSimulation {
             this.maxTransformRate,
             this.dnfBonding ? 1 : 0,
             this.frameCounter,
+            this.temperature,
+            0, 0, 0,
         ]) as Float32Array<ArrayBuffer>;
     }
 
@@ -910,6 +920,8 @@ export class ParticleSimulation {
             { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
             { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } }, // orientation (Mode 3)
             { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },           // patchConfig (Mode 3)
+            { binding: 5, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } }, // cellCount (density glow)
+            { binding: 6, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },           // gridParams (density glow)
         ]});
         const renderPipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [renderLayout] });
         const renderModule = this.device.createShaderModule({ code: this.getRenderShaderCode() });
@@ -922,8 +934,13 @@ export class ParticleSimulation {
             layout: renderPipelineLayout, vertex: vertexState, primitive: { topology: 'triangle-list' },
             fragment: { module: renderModule, entryPoint: 'fragmentMain',
                 targets: [{ format: fmt, blend: {
-                    color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-                    alpha: { srcFactor: 'one',       dstFactor: 'zero',                operation: 'add' },
+                    // Premultiplied "over": the fragment outputs premultiplied light
+                    // (rgb already × coverage) and an occlusion alpha that can be lower
+                    // than the deposited light. occ=1 → ordinary solid over; occ<1 lets
+                    // overlapping particles deposit more light than they occlude, so
+                    // dense clusters build up additively while sparse ones stay solid.
+                    color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
                 } }] },
         });
         this.renderPipelineAdd = this.device.createRenderPipeline({
@@ -1111,6 +1128,8 @@ export class ParticleSimulation {
                 { binding: 2, resource: { buffer: this.viewBuffer        } },
                 { binding: 3, resource: { buffer: this.orientationBuffer! } },
                 { binding: 4, resource: { buffer: this.patchConfigBuffer! } },
+                { binding: 5, resource: { buffer: this.gridCellCountBuffer! } },
+                { binding: 6, resource: { buffer: this.gridParamsBuffer! } },
             ],
         });
 
@@ -1406,7 +1425,8 @@ export class ParticleSimulation {
             }
             struct GridParams  { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
             struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
-                                friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+                                friction: f32, maxRate: f32, _p2: f32, _p3: f32,
+                                temp: f32, _p5: f32, _p6: f32, _p7: f32 }
 
             struct TypeMasses { m: array<vec4u, ${TYPE_VEC4}> }
 
@@ -1591,6 +1611,11 @@ export class ParticleSimulation {
                 } else {
                     p.vel = p.vel * fric + accel * speed;
                 }
+                // Global temperature: random thermal kick each tick (all modes).
+                if (params.temp > 0.0) {
+                    let ta = rand01(uhash(idx) ^ uhash(u32(params._p3) * 2654435761u)) * 6.28318530718;
+                    p.vel += vec2f(cos(ta), sin(ta)) * params.temp;
+                }
                 p.pos = p.pos + p.vel;
 
                 if (edgeMode == 0u) {
@@ -1663,7 +1688,8 @@ export class ParticleSimulation {
                           canvasW:f32, canvasH:f32, additiveStr:f32, shapeMode:f32, simTime:f32, _p3:f32 }
 
             struct SimParams { speed: f32, worldW: f32, worldH: f32, packed: f32,
-                              friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+                              friction: f32, maxRate: f32, _p2: f32, _p3: f32,
+                                temp: f32, _p5: f32, _p6: f32, _p7: f32 }
 
             struct PatchConfig {
                 bondStrength: f32, bondRange: f32, bondDist: f32, angStiffness: f32,
@@ -1671,11 +1697,15 @@ export class ParticleSimulation {
                 patchCount: array<vec4u, ${TYPE_VEC4}>,
             }
 
+            struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
+
             @group(0) @binding(0) var<storage, read> particles: array<Particle>;
             @group(0) @binding(1) var<uniform>       params:    SimParams;
             @group(0) @binding(2) var<uniform>       view:      View;
             @group(0) @binding(3) var<storage, read> orientation: array<vec2f>;
             @group(0) @binding(4) var<uniform>       patchCfg:  PatchConfig;
+            @group(0) @binding(5) var<storage, read> cellCount: array<u32>;   // per-cell occupancy (local density)
+            @group(0) @binding(6) var<uniform>       grid:      GridParams;
 
             const COLORS = array<vec4f, ${MAX_TYPES}>(${colorsWGSL()});
 
@@ -1720,7 +1750,21 @@ export class ParticleSimulation {
                 // Particle tints toward white in its own hue; at max prob → 75% toward white.
                 let normProb  = clamp(p._pad * 2.0, 0.0, 1.0);  // 0→0, 0.5→1
                 let whiteness = normProb * 0.75;
-                let rWorld = 20.0 * (1.0 + view.glow * 3.5);
+
+                // Density-driven glow: lone particles stay crisp/solid; particles in
+                // crowded grid cells glow. cellCount holds per-cell occupancy after the
+                // scatter pass (cell ≈ interaction radius), a cheap local-density proxy.
+                // The global slider (view.glow) sets the maximum glow.
+                let cs   = grid.cellSize;
+                let cgx  = min(u32(max(p.pos.x, 0.0) / cs), grid.gridW - 1u);
+                let cgy  = min(u32(max(p.pos.y, 0.0) / cs), grid.gridH - 1u);
+                let occ  = cellCount[cgy * grid.gridW + cgx];
+                let dens = clamp((f32(occ) - 1.0) / 12.0, 0.0, 1.0);   // ~12 neighbours → full
+                let glowAmt = view.glow * dens;
+
+                // The quad grows with glow to leave room for the halo, but the solid
+                // core stays a constant world size (the fragment normalises by coreFrac).
+                let rWorld = 20.0 * (1.0 + glowAmt * 3.5);
                 let qx = rWorld / spanX;
                 let qy = rWorld / spanY;
                 var o: VOut;
@@ -1728,7 +1772,7 @@ export class ParticleSimulation {
                 o.uv     = quad;
                 let ownColor = COLORS[min(u32(p.typeId), ${MAX_TYPES - 1}u)];
                 o.color  = mix(ownColor, vec4f(1.0, 1.0, 1.0, 1.0), whiteness);
-                o.glow   = view.glow;
+                o.glow   = glowAmt;
                 o.typeId = p.typeId;
                 let tt   = u32(p.typeId);
                 o.spin   = select(0.0, orientation[inst].x, simMode3);
@@ -1783,24 +1827,36 @@ export class ParticleSimulation {
                     let c = cos(i.spin); let s = sin(i.spin);
                     uv = vec2f(c * i.uv.x - s * i.uv.y, s * i.uv.x + c * i.uv.y);
                 }
-                let d = select(length(uv), shapeDist(uv, u32(i.typeId)), view.shapeMode > 0.5);
+                let r = length(uv);
 
-                let solidBright = max(0.0, 1.0 - d * 0.3);
-                let solidAlpha  = select(0.0, solidBright, d < 1.0);
+                // The solid core is a constant world size even as the quad grows for the
+                // halo: coreFrac is the core's fraction of the (glow-expanded) quad.
+                let coreFrac = 1.0 / (1.0 + i.glow * 3.5);
+                let dShape   = select(r, shapeDist(uv, u32(i.typeId)), view.shapeMode > 0.5);
+                let dCore    = dShape / coreFrac;                       // 1 at the core edge
+                let solidBright = max(0.0, 1.0 - dCore * 0.3);
+                let solidAlpha  = select(0.0, solidBright, dCore < 1.0);
 
-                let k         = mix(12.0, 1.8, i.glow);
-                let glowAlpha = exp(-d * d * k);
+                // Soft halo, windowed so it reaches exactly 0 at the quad's inscribed
+                // edge (r = 1). Subtracting the edge value and renormalising removes the
+                // hard cutoff that used to show the quad as a bright square at high glow.
+                let w     = 0.5;
+                let gss   = exp(-(r * r) / (w * w));
+                let gEdge = exp(-1.0 / (w * w));
+                let halo  = clamp((gss - gEdge) / (1.0 - gEdge), 0.0, 1.0);
 
-                var alpha = mix(solidAlpha, glowAlpha, i.glow) * view.alpha;
+                // Halo only appears with glow (already density-scaled per particle); the
+                // solid core is always present so sparse particles stay crisp.
+                var alpha = max(solidAlpha, halo * i.glow) * view.alpha;
 
-                // Patch nubs: bright lobes at each valence direction near the rim.
+                // Patch nubs: bright lobes at each valence direction near the core rim.
                 var patchBoost = 0.0;
                 if (i.patchN > 0.5) {
                     let ang  = atan2(uv.y, uv.x);
                     let step = 6.28318530718 / i.patchN;
                     let pa   = round(ang / step) * step;
                     let nub  = pow(max(cos(ang - pa), 0.0), 16.0);
-                    let ring = smoothstep(0.45, 0.85, d) * (1.0 - smoothstep(1.0, 1.25, d));
+                    let ring = smoothstep(0.45, 0.85, dCore) * (1.0 - smoothstep(1.0, 1.25, dCore));
                     patchBoost = nub * ring;
                     alpha = max(alpha, patchBoost * 0.95 * view.alpha);
                 }
@@ -1808,7 +1864,13 @@ export class ParticleSimulation {
 
                 let lum = dot(i.color.rgb, vec3f(0.299, 0.587, 0.114));
                 let col = mix(vec3f(lum), i.color.rgb, view.sat) + vec3f(patchBoost) * 0.7;
-                return vec4f(col * alpha * view.additiveStr, alpha);
+
+                // Premultiplied output. We deposit full light (col * alpha) but write a
+                // lower occlusion alpha (× occK) so overlapping particles in dense regions
+                // build up additively while isolated ones still read as solid.
+                // additiveStr 0 → occK 1 (pure solid); higher → more additive build-up.
+                let occK = mix(1.0, 0.2, view.additiveStr);
+                return vec4f(col * alpha, alpha * occK);
             }
         `;
     }
@@ -1858,7 +1920,8 @@ export class ParticleSimulation {
                                 lEnabled: f32, lThresh: f32, lTarget: f32 }
             struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
             struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
-                                friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+                                friction: f32, maxRate: f32, _p2: f32, _p3: f32,
+                                temp: f32, _p5: f32, _p6: f32, _p7: f32 }
             struct DiagParams { selectedIdx: u32, _p1: u32, _p2: u32, _p3: u32 }
             struct DiagOutput {
                 pos:           vec2f,
@@ -2205,7 +2268,8 @@ export class ParticleSimulation {
             }
             struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
             struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
-                                friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+                                friction: f32, maxRate: f32, _p2: f32, _p3: f32,
+                                temp: f32, _p5: f32, _p6: f32, _p7: f32 }
             struct PatchConfig {
                 _bs: f32, bondRange: f32, _bd: f32, angStiffness: f32,
                 angFriction: f32, patchWidth: f32, isoScale: f32, coreStrength: f32,
@@ -2452,6 +2516,11 @@ export class ParticleSimulation {
 
                 let fric = pow(params.friction, speed);
                 p.vel = p.vel * fric + accel * speed;
+                // Global temperature: random thermal kick each tick (all modes).
+                if (params.temp > 0.0) {
+                    let ta = rand01(uhash(idx) ^ uhash(u32(params._p3) * 2654435761u)) * 6.28318530718;
+                    p.vel += vec2f(cos(ta), sin(ta)) * params.temp;
+                }
                 p.pos = p.pos + p.vel;
 
                 if (edgeMode == 0u) {
@@ -2587,7 +2656,8 @@ export class ParticleSimulation {
             struct Particle   { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
             struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
             struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
-                                friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+                                friction: f32, maxRate: f32, _p2: f32, _p3: f32,
+                                temp: f32, _p5: f32, _p6: f32, _p7: f32 }
             struct FieldParams { f: array<vec4f, ${MAX_FIELDS}> }  // .x range, .y strength; f[0].z = numFields
 
             @group(0) @binding(0) var<storage, read_write> particles:       array<Particle>;
@@ -2632,7 +2702,7 @@ export class ParticleSimulation {
                 let packed   = u32(params.packed);
                 let edgeMode = (packed >> 8u) & 0xFFu;
                 let numFields = u32(fp.f[0].z);
-                let temp      = fp.f[0].w;           // thermal agitation
+                let temp      = params.temp;          // global thermal agitation
                 let frame     = u32(params._p3);
 
                 var p = particles[idx];
@@ -2642,12 +2712,36 @@ export class ParticleSimulation {
                 var accel  = vec2f(0.0);
                 var fieldForce: array<f32, ${MAX_FIELDS}>;  // signed per-field force felt (transforms)
 
+                // Hoist self-only data out of the neighbour loop. Only fields this
+                // particle is actually susceptible to can produce force, so compact
+                // them into a dense active list once — neighbours then iterate just
+                // those, and the per-field susceptibility/range/strength are read
+                // once instead of once per neighbour per field.
+                var afIdx:   array<u32, ${MAX_FIELDS}>;   // real field index
+                var afSusc:  array<f32, ${MAX_FIELDS}>;   // my susceptibility
+                var afRange: array<f32, ${MAX_FIELDS}>;   // field range param
+                var afStr:   array<f32, ${MAX_FIELDS}>;   // field strength param
+                var nActive: u32 = 0u;
+                for (var fi: u32 = 0u; fi < numFields; fi++) {
+                    let s = susc[myBase + fi];
+                    if (s != 0.0 && fp.f[fi].x > 0.0) {
+                        afIdx[nActive]   = fi;
+                        afSusc[nActive]  = s;
+                        afRange[nActive] = fp.f[fi].x;
+                        afStr[nActive]   = fp.f[fi].y;
+                        nActive++;
+                    }
+                }
+
                 let gw = i32(gridParams.gridW);
                 let gh = i32(gridParams.gridH);
                 let cs = gridParams.cellSize;
                 let myGx = clamp(i32(p.pos.x / cs), 0, gw - 1);
                 let myGy = clamp(i32(p.pos.y / cs), 0, gh - 1);
+                let halfW = width  * 0.5;
+                let halfH = height * 0.5;
 
+                if (nActive > 0u) {
                 for (var goy = -1; goy <= 1; goy++) {
                     for (var gox = -1; gox <= 1; gox++) {
                         var ngx = myGx + gox;
@@ -2669,29 +2763,33 @@ export class ParticleSimulation {
                             var dx = other.pos.x - p.pos.x;
                             var dy = other.pos.y - p.pos.y;
                             if (edgeMode == 0u) {
-                                if (dx >  width  * 0.5) { dx -= width;  }
-                                if (dx < -width  * 0.5) { dx += width;  }
-                                if (dy >  height * 0.5) { dy -= height; }
-                                if (dy < -height * 0.5) { dy += height; }
+                                if (dx >  halfW) { dx -= width;  }
+                                if (dx < -halfW) { dx += width;  }
+                                if (dy >  halfH) { dy -= height; }
+                                if (dy < -halfH) { dy += height; }
                             }
-                            let dist = sqrt(dx * dx + dy * dy);
-                            if (dist < 0.1) { continue; }
+                            let d2 = dx * dx + dy * dy;
+                            if (d2 < 0.01) { continue; }
+                            let dist = sqrt(d2);
                             let dir = vec2f(dx, dy) / dist;
 
-                            // Force I feel in each field: my susceptibility × the other's
-                            // charge (non-reciprocal — i feeling j differs from j feeling i).
-                            for (var fi: u32 = 0u; fi < numFields; fi++) {
-                                let cpl = susc[myBase + fi] * charges[otherBase + fi];
+                            // Force I feel in each active field: my susceptibility × the
+                            // other's charge (non-reciprocal — i feeling j differs from
+                            // j feeling i).
+                            for (var a: u32 = 0u; a < nActive; a++) {
+                                let fi  = afIdx[a];
+                                let cpl = afSusc[a] * charges[otherBase + fi];
                                 if (cpl == 0.0) { continue; }
-                                let range = fp.f[fi].x * min(abs(cpl), 2.0);   // capped so outliers don't blow up the grid
-                                if (range <= 0.0 || dist >= range) { continue; }
+                                let range = afRange[a] * min(abs(cpl), 2.0);   // capped so outliers don't blow up the grid
+                                if (dist >= range) { continue; }
                                 let prof = 1.0 - dist / range;                 // 1 near → 0 at range
-                                let mag  = fp.f[fi].y * cpl * prof * 0.1;      // cpl>0 = repel
+                                let mag  = afStr[a] * cpl * prof * 0.1;        // cpl>0 = repel
                                 accel -= dir * mag;                            // repel pushes away
                                 fieldForce[fi] += mag;                         // signed force felt (transforms)
                             }
                         }
                     }
+                }
                 }
 
                 let fric = pow(params.friction, speed);
@@ -3192,9 +3290,12 @@ export class ParticleSimulation {
 
     setSimMode(mode: 0 | 1 | 2 | 3 | 4 | 5 | 6): void { this.simMode = mode; }
 
+    // Global temperature: thermal kick per tick, applied in every mode. Read from
+    // the per-frame params buffer, so no dirty flag is needed.
+    getTemperature(): number { return this.temperature; }
+    setTemperature(v: number): void { this.temperature = Math.max(0, v); }
+
     // ── Mode 6 (QFT) controls ───────────────────────────────────────────────────
-    getQftTemperature(): number { return this.qftTemperature; }
-    setQftTemperature(v: number): void { this.qftTemperature = Math.max(0, v); this.qftDirty = true; }
     getNumFields(): number { return this.numFields; }
     setNumFields(n: number): void {
         this.numFields = Math.max(1, Math.min(MAX_FIELDS, Math.round(n)));
@@ -3478,7 +3579,9 @@ export class ParticleSimulation {
     setFriction(v: number): void { this.friction = Math.max(0, Math.min(0.99,v)); }
     getFriction(): number { return this.friction; }
 
-    setMaxTransformRate(v: number): void { this.maxTransformRate = Math.max(0.01, Math.min(1.0, v)); }
+    // Stored as a per-tick probability; the UI feeds 1/X so very rare rates
+    // (e.g. 1 in 1,000,000 → 1e-6) must be allowed through, hence no 0.01 floor.
+    setMaxTransformRate(v: number): void { this.maxTransformRate = Math.max(0, Math.min(1.0, v)); }
     getMaxTransformRate(): number { return this.maxTransformRate; }
 
     setView(cx: number, cy: number, zoom: number): void { this.view = { cx, cy, zoom }; }
@@ -3877,7 +3980,7 @@ export class ParticleSimulation {
             dnfTypes:         this.getDnfTypes(),
             dnfBonding:       this.dnfBonding,
             numFields:        this.numFields,
-            qftTemperature:   this.qftTemperature,
+            temperature:      this.temperature,
             fieldRange:       this.fieldRange.slice(0, this.numFields),
             fieldStrength:    this.fieldStrength.slice(0, this.numFields),
             charges:          this.getCharges(),
@@ -3993,7 +4096,9 @@ export class ParticleSimulation {
         if (state.dnfBonding != null) this.dnfBonding = Boolean(state.dnfBonding);
 
         if (state.numFields != null) this.numFields = Math.max(1, Math.min(MAX_FIELDS, Number(state.numFields)));
-        if (state.qftTemperature != null) this.qftTemperature = Math.max(0, Number(state.qftTemperature));
+        // `temperature` (global); accept legacy `qftTemperature` from older saves.
+        if (state.temperature != null) this.temperature = Math.max(0, Number(state.temperature));
+        else if (state.qftTemperature != null) this.temperature = Math.max(0, Number(state.qftTemperature));
         if (Array.isArray(state.fieldRange))    for (let f = 0; f < this.numFields; f++) if (state.fieldRange[f]    != null) this.fieldRange[f]    = Math.max(0, Number(state.fieldRange[f]));
         if (Array.isArray(state.fieldStrength)) for (let f = 0; f < this.numFields; f++) if (state.fieldStrength[f] != null) this.fieldStrength[f] = Number(state.fieldStrength[f]);
         if (Array.isArray(state.charges)) {
