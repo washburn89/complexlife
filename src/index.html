@@ -643,6 +643,27 @@
                         non-reciprocal (A chases B while B flees A) — that asymmetry is what makes motion and
                         chasing behaviours emerge. Set susceptibility to 0 for "ignores this field".
                     </p>
+
+                    <div class="settings-section" style="margin-top:14px;">
+                        <h4>Transforms</h4>
+                        <p class="tr-hint">
+                            Each tick a particle measures the net force it feels in each field; if that crosses
+                            a threshold (above and/or below) it probabilistically becomes a target type. The
+                            exclusion field is never a trigger. Click a cell to edit its rule.
+                        </p>
+                        <div class="settings-row">
+                            <label>Max Transform</label>
+                            <input type="range" id="qftMaxSlider" min="0.01" max="1.0" step="0.01" value="0.5">
+                            <span class="val" id="qftMaxValue">0.50</span>
+                        </div>
+                        <div class="btn-row" style="margin:8px 0;">
+                            <button id="randomizeQftTransformBtn">Randomize transforms</button>
+                            <button id="clearQftTransformBtn">Clear</button>
+                        </div>
+                        <p class="matrix-label">Row = type · Col = field (force trigger)</p>
+                        <div class="matrix-wrap"><table class="matrix" id="qft-transform-table"></table></div>
+                        <div id="qft-transform-editor"></div>
+                    </div>
                 </div>
 
                 <div id="mode2-panel">

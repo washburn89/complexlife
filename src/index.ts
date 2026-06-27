@@ -1,4 +1,4 @@
-import { ParticleSimulation, TransformRule, DnfCondition, DnfRule, MAX_TYPES, MAX_DNF_CONDITIONS, MAX_DNF_RULES, compileBoolExpr, TYPE_COLORS_HEX, DiagnosticData } from './simulation';
+import { ParticleSimulation, TransformRule, DnfCondition, DnfRule, MAX_TYPES, MAX_FIELDS, MAX_DNF_CONDITIONS, MAX_DNF_RULES, compileBoolExpr, TYPE_COLORS_HEX, DiagnosticData } from './simulation';
 // Vendored (MIT) so the repo is self-contained — no npm install needed. See
 // src/vendor/webm-muxer.LICENSE.txt.
 import { Muxer, ArrayBufferTarget } from './vendor/webm-muxer';
@@ -118,15 +118,19 @@ class ParticleLifeApp {
         { key: 'bonding',   label: 'Bonding',        modes: [3, 4, 5], run: () => this.sim!.randomizePatchParams(),   refresh: 'bonding' },
         { key: 'dnf',       label: 'DNF rules',      modes: [5],       run: () => this.sim!.randomizeDnfRules(),      refresh: 'dnf' },
         { key: 'charges',   label: 'Charges',        modes: [6],       run: () => this.sim!.randomizeCharges(),       refresh: 'charges' },
+        { key: 'qftTransform', label: 'QFT transforms', modes: [6],    run: () => this.sim!.randomizeQftTransforms(), refresh: 'charges' },
     ];
     // Default selection — minRadius and poles off, as those are rarely wanted.
     private randomizeSel: Record<string, boolean> = {
         strength: true, maxRadius: true, minRadius: false,
         transform: true, poles: false, masses: true, valences: true, bonding: true, dnf: true,
+        charges: true, qftTransform: true,
     };
 
     // ── DNF editor (mode 5) ───────────────────────────────────────────────────
     private dnfEditType: number | null = null;   // which source type's editor is open
+    // ── QFT transform editor (mode 6) ─────────────────────────────────────────
+    private qftEditCell: { type: number; field: number } | null = null;
 
     // ── Photo export selection ────────────────────────────────────────────────
     private photoSelMode     = false;   // armed: dragging a region to export
@@ -380,6 +384,22 @@ class ParticleLifeApp {
             const v = Number(qftTempSlider.value);
             document.getElementById('qftTempValue')!.textContent = v.toFixed(2);
             this.sim?.setQftTemperature(v);
+        });
+        document.getElementById('randomizeQftTransformBtn')!.addEventListener('click', () => {
+            this.sim?.randomizeQftTransforms();
+            this.qftEditCell = null;
+            this.buildQftTransformMatrix();
+        });
+        document.getElementById('clearQftTransformBtn')!.addEventListener('click', () => {
+            this.sim?.clearQftTransforms();
+            this.qftEditCell = null;
+            this.buildQftTransformMatrix();
+        });
+        const qftMaxSlider = document.getElementById('qftMaxSlider') as HTMLInputElement;
+        qftMaxSlider.addEventListener('input', () => {
+            const v = parseFloat(qftMaxSlider.value);
+            document.getElementById('qftMaxValue')!.textContent = v.toFixed(2);
+            this.sim?.setMaxTransformRate(v);
         });
         const dnfMaxSlider = document.getElementById('dnfMaxSlider') as HTMLInputElement;
         dnfMaxSlider.addEventListener('input', () => {
@@ -1900,9 +1920,107 @@ class ParticleLifeApp {
         const temp = this.sim.getQftTemperature();
         (document.getElementById('qftTempSlider') as HTMLInputElement).value = String(temp);
         document.getElementById('qftTempValue')!.textContent = temp.toFixed(2);
+        const rate = this.sim.getMaxTransformRate();
+        (document.getElementById('qftMaxSlider') as HTMLInputElement).value = String(rate);
+        document.getElementById('qftMaxValue')!.textContent = rate.toFixed(2);
         this.buildQftFieldTable();
         this.buildQftMatrix('qft-charge-table', this.sim.getCharges(), (t, f, v) => this.sim?.setCharge(t, f, v));
         this.buildQftMatrix('qft-susc-table',   this.sim.getSusc(),    (t, f, v) => this.sim?.setSusc(t, f, v));
+        this.buildQftTransformMatrix();
+    }
+
+    // Type × field grid of transform rules; a cell is tinted if it has a rule.
+    private buildQftTransformMatrix(): void {
+        const table = document.getElementById('qft-transform-table') as HTMLTableElement;
+        if (!table || !this.sim) return;
+        table.innerHTML = '';
+        const n = this.sim.getNumTypes();
+        const fields = this.sim.getFields();
+        const rules = this.sim.getQftTransform();
+        
+        const hdr = document.createElement('tr');
+        // Skip field 0 (exc) — never a transform trigger.
+        hdr.innerHTML = '<th></th>' + fields.slice(1).map(fd => `<th>${fd.name}</th>`).join('');
+        table.appendChild(hdr);
+
+        for (let t = 0; t < n; t++) {
+            const row = document.createElement('tr');
+            const th = document.createElement('th');
+            th.className = 'row-header';
+            th.innerHTML = `<span class="type-pip" style="background:${TYPE_HEX[t]}"></span>${TYPE_LABELS[t]}`;
+            row.appendChild(th);
+            for (let f = 1; f < fields.length; f++) {
+                const r = rules[t * MAX_FIELDS + f];
+                const td = document.createElement('td');
+                td.className = 'mcell';
+                const up = r?.upperEnabled, lo = r?.lowerEnabled;
+                td.textContent = up && lo ? '↕' : up ? '↑' : lo ? '↓' : '';
+                td.style.background = (up || lo) ? 'rgba(120,200,140,0.4)' : 'rgba(255,255,255,0.03)';
+                td.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.qftEditCell = (this.qftEditCell && this.qftEditCell.type === t && this.qftEditCell.field === f) ? null : { type: t, field: f };
+                    this.buildQftTransformEditor();
+                });
+                row.appendChild(td);
+            }
+            table.appendChild(row);
+        }
+        this.buildQftTransformEditor();
+    }
+
+    private buildQftTransformEditor(): void {
+        const host = document.getElementById('qft-transform-editor');
+        if (!host || !this.sim) return;
+        host.innerHTML = '';
+        const cell = this.qftEditCell;
+        if (!cell) return;
+                const n = this.sim.getNumTypes();
+        const fields = this.sim.getFields();
+        const rule = { ...this.sim.getQftTransform()[cell.type * MAX_FIELDS + cell.field] };
+        const commit = () => this.sim!.setQftTransform(cell.type, cell.field, rule);
+
+        const wrap = document.createElement('div');
+        wrap.className = 'dnf-edit';
+        const title = document.createElement('div');
+        title.className = 'dnf-section';
+        title.innerHTML = `<span style="color:${TYPE_HEX[cell.type]}">${TYPE_LABELS[cell.type]}</span> · force in field <strong>${fields[cell.field]?.name ?? cell.field}</strong>`;
+        wrap.appendChild(title);
+
+        const targetSel = (val: number, onset: (v: number) => void) => {
+            const sel = document.createElement('select');
+            for (let i = 0; i < n; i++) {
+                const o = document.createElement('option');
+                o.value = String(i); o.textContent = TYPE_LABELS[i];
+                if (i === val) o.selected = true;
+                sel.appendChild(o);
+            }
+            sel.addEventListener('change', () => { onset(Number(sel.value)); commit(); this.buildQftTransformMatrix(); });
+            return sel;
+        };
+        const numIn = (val: number, onset: (v: number) => void) => {
+            const inp = document.createElement('input');
+            inp.type = 'number'; inp.step = '0.5'; inp.min = '-50'; inp.max = '50'; inp.value = String(val);
+            inp.addEventListener('change', () => { onset(Number(inp.value) || 0); commit(); });
+            return inp;
+        };
+        const half = (label: string, enabled: boolean, thr: number, tgt: number,
+                      setEn: (b: boolean) => void, setThr: (v: number) => void, setTgt: (v: number) => void) => {
+            const line = document.createElement('div');
+            line.className = 'dnf-line';
+            const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = enabled;
+            cb.addEventListener('change', () => { setEn(cb.checked); commit(); this.buildQftTransformMatrix(); });
+            line.appendChild(cb);
+            line.appendChild(document.createTextNode(label));
+            line.appendChild(numIn(thr, setThr));
+            line.appendChild(document.createTextNode('→'));
+            line.appendChild(targetSel(tgt, setTgt));
+            wrap.appendChild(line);
+        };
+        half('force >', rule.upperEnabled, rule.upperThreshold, rule.upperTarget,
+             b => rule.upperEnabled = b, v => rule.upperThreshold = v, v => rule.upperTarget = v);
+        half('force <', rule.lowerEnabled, rule.lowerThreshold, rule.lowerTarget,
+             b => rule.lowerEnabled = b, v => rule.lowerThreshold = v, v => rule.lowerTarget = v);
+        host.appendChild(wrap);
     }
 
     private buildQftFieldTable(): void {

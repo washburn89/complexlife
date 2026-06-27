@@ -406,6 +406,11 @@ export class ParticleSimulation {
     private chargesBuffer:     GPUBuffer | null = null;
     private suscBuffer:        GPUBuffer | null = null;
     private fieldParamsBuffer: GPUBuffer | null = null;
+    // QFT transforms: per (sourceType, field) upper/lower threshold→target rules
+    // (original-style), keyed on the per-field force a particle feels. Field 0 (exc)
+    // is never used as a transform trigger.
+    private qftTransform: TransformRule[] = [];
+    private qftTransformBuffer: GPUBuffer | null = null;
     private mode6BGL:       GPUBindGroupLayout | null = null;
     private mode6Pipeline:  GPUComputePipeline | null = null;
     private mode6BindGroup: GPUBindGroup       | null = null;
@@ -506,7 +511,30 @@ export class ParticleSimulation {
             this.susc[t * MAX_FIELDS + 0]    = 1;  // ...and responds to the exclusion field
         }
         this.randomizeCharges();   // seed interaction fields (1..) with random charge + susceptibility
+        this.qftTransform = Array.from({ length: MAX_TYPES * MAX_FIELDS }, () => this.emptyRule());
         this.qftDirty = true;
+    }
+
+    private emptyRule(): TransformRule {
+        return { upperEnabled: false, upperInclusive: false, upperThreshold: 0, upperTarget: 0,
+                 lowerEnabled: false, lowerInclusive: false, lowerThreshold: 0, lowerTarget: 0 };
+    }
+
+    // 6 floats per (type, field) rule, matching the mode-1 transform GPU layout.
+    private generateQftTransformData(): Float32Array<ArrayBuffer> {
+        const data = new Float32Array(MAX_TYPES * MAX_FIELDS * 6);
+        for (let i = 0; i < MAX_TYPES * MAX_FIELDS; i++) {
+            const r = this.qftTransform[i] ?? this.emptyRule();
+            const b = i * 6;
+            const maxT = Math.max(0, this.numTypes - 1);
+            data[b + 0] = r.upperEnabled ? (r.upperInclusive ? 2 : 1) : 0;
+            data[b + 1] = r.upperThreshold;
+            data[b + 2] = Math.min(maxT, r.upperTarget);
+            data[b + 3] = r.lowerEnabled ? (r.lowerInclusive ? 2 : 1) : 0;
+            data[b + 4] = r.lowerThreshold;
+            data[b + 5] = Math.min(maxT, r.lowerTarget);
+        }
+        return data as Float32Array<ArrayBuffer>;
     }
 
     // charges[type*MAX_FIELDS + field] as a flat storage buffer.
@@ -824,6 +852,8 @@ export class ParticleSimulation {
         this.queue!.writeBuffer(this.suscBuffer, 0, this.generateSuscData());
         this.fieldParamsBuffer = this.device!.createBuffer({ label: 'fieldParams', size: MAX_FIELDS * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.queue!.writeBuffer(this.fieldParamsBuffer, 0, this.generateFieldParamsData());
+        this.qftTransformBuffer = this.device!.createBuffer({ label: 'qftTransform', size: MAX_TYPES * MAX_FIELDS * 6 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        this.queue!.writeBuffer(this.qftTransformBuffer, 0, this.generateQftTransformData());
     }
 
     private async createPipelines(): Promise<void> {
@@ -1011,6 +1041,7 @@ export class ParticleSimulation {
             { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // charges (source)
             { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // fieldParams
             { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // susceptibility (response)
+            { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // qft transforms
         ]});
         this.mode6Pipeline = this.device.createComputePipeline({
             layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.mode6BGL] }),
@@ -1181,7 +1212,7 @@ export class ParticleSimulation {
             });
         }
 
-        if (this.mode6BGL && this.chargesBuffer && this.fieldParamsBuffer && this.suscBuffer) {
+        if (this.mode6BGL && this.chargesBuffer && this.fieldParamsBuffer && this.suscBuffer && this.qftTransformBuffer) {
             this.mode6BindGroup = this.device.createBindGroup({
                 layout: this.mode6BGL,
                 entries: [
@@ -1194,6 +1225,7 @@ export class ParticleSimulation {
                     { binding: 6, resource: { buffer: this.chargesBuffer         } },
                     { binding: 7, resource: { buffer: this.fieldParamsBuffer     } },
                     { binding: 8, resource: { buffer: this.suscBuffer            } },
+                    { binding: 9, resource: { buffer: this.qftTransformBuffer   } },
                 ],
             });
         }
@@ -2567,9 +2599,27 @@ export class ParticleSimulation {
             @group(0) @binding(6) var<storage, read>       charges:         array<f32>;
             @group(0) @binding(7) var<uniform>             fp:              FieldParams;
             @group(0) @binding(8) var<storage, read>       susc:            array<f32>;
+            struct QftRule { upEn: f32, upThr: f32, upTgt: f32, loEn: f32, loThr: f32, loTgt: f32 }
+            @group(0) @binding(9) var<storage, read>       qftT:            array<QftRule>;
 
             fn uhash(v: u32) -> u32 { var x = v ^ (v >> 16u); x *= 0x45d9f3bu; x ^= x >> 16u; return x; }
             fn rand01(seed: u32) -> f32 { return f32(uhash(seed)) / 4294967295.0; }
+
+            // Probability a transform fires for a given per-field force vs threshold.
+            fn qftProb(force: f32, threshold: f32, enabled: f32, isUpper: f32, maxRate: f32) -> f32 {
+                if (enabled > 1.5) {  // inclusive: step compare
+                    if (isUpper > 0.5) { return select(0.0, maxRate, force >= threshold); }
+                    return select(0.0, maxRate, force <= threshold);
+                }
+                if (abs(threshold) < 0.001) {
+                    if (isUpper > 0.5) { return select(0.0, maxRate, force > 0.0); }
+                    return select(0.0, maxRate, force < 0.0);
+                }
+                let x = force / threshold;
+                if (x <= 0.0) { return 0.0; }
+                let t = min(x, 1.0);
+                return t * t * maxRate;
+            }
 
             @compute @workgroup_size(256)
             fn main(@builtin(global_invocation_id) id: vec3u) {
@@ -2590,6 +2640,7 @@ export class ParticleSimulation {
                 let myType = u32(p.typeId);
                 let myBase = myType * ${MAX_FIELDS}u;
                 var accel  = vec2f(0.0);
+                var fieldForce: array<f32, ${MAX_FIELDS}>;  // signed per-field force felt (transforms)
 
                 let gw = i32(gridParams.gridW);
                 let gh = i32(gridParams.gridH);
@@ -2637,6 +2688,7 @@ export class ParticleSimulation {
                                 let prof = 1.0 - dist / range;                 // 1 near → 0 at range
                                 let mag  = fp.f[fi].y * cpl * prof * 0.1;      // cpl>0 = repel
                                 accel -= dir * mag;                            // repel pushes away
+                                fieldForce[fi] += mag;                         // signed force felt (transforms)
                             }
                         }
                     }
@@ -2661,6 +2713,25 @@ export class ParticleSimulation {
                     if (p.pos.y < 0.0)    { p.pos.y = 0.0;    p.vel.y =  abs(p.vel.y) * 0.5; }
                     if (p.pos.y > height) { p.pos.y = height; p.vel.y = -abs(p.vel.y) * 0.5; }
                 }
+
+                // QFT transforms: per-field force thresholds (exclusion field skipped).
+                // First matching rule wins; gated by Max Transform (params.maxRate).
+                let maxRate = params.maxRate;
+                let tseed = uhash(idx) ^ uhash(u32(abs(p.pos.x) * 157.0 + 1.0)) ^ uhash(frame * 40503u);
+                var newType: i32 = -1;
+                for (var fi: u32 = 1u; fi < numFields; fi++) {
+                    let r = qftT[myBase + fi];
+                    if (r.upEn > 0.5) {
+                        let pr = qftProb(fieldForce[fi], r.upThr, r.upEn, 1.0, maxRate);
+                        if (newType < 0 && pr > 0.0 && rand01(tseed ^ uhash(fi * 7u + 1u)) < pr) { newType = i32(r.upTgt); }
+                    }
+                    if (r.loEn > 0.5) {
+                        let pr = qftProb(fieldForce[fi], r.loThr, r.loEn, 0.0, maxRate);
+                        if (newType < 0 && pr > 0.0 && rand01(tseed ^ uhash(fi * 7u + 2u)) < pr) { newType = i32(r.loTgt); }
+                    }
+                }
+                if (newType >= 0) { p.typeId = f32(newType); }
+
                 p._pad = 0.0;
                 particles[idx] = p;
             }
@@ -2702,9 +2773,10 @@ export class ParticleSimulation {
             this.dnfDirty = false;
         }
         if (this.qftDirty) {
-            this.queue.writeBuffer(this.chargesBuffer!,     0, this.generateChargesData());
-            this.queue.writeBuffer(this.suscBuffer!,        0, this.generateSuscData());
-            this.queue.writeBuffer(this.fieldParamsBuffer!, 0, this.generateFieldParamsData());
+            this.queue.writeBuffer(this.chargesBuffer!,      0, this.generateChargesData());
+            this.queue.writeBuffer(this.suscBuffer!,         0, this.generateSuscData());
+            this.queue.writeBuffer(this.fieldParamsBuffer!,  0, this.generateFieldParamsData());
+            this.queue.writeBuffer(this.qftTransformBuffer!, 0, this.generateQftTransformData());
             this.qftDirty = false;
         }
 
@@ -3173,6 +3245,51 @@ export class ParticleSimulation {
             for (let f = 1; f < MAX_FIELDS; f++) {
                 this.charges[t * MAX_FIELDS + f] = rv();
                 this.susc[t * MAX_FIELDS + f]    = rv();
+            }
+        }
+        // Randomize each interaction field's reach and strength too (exc untouched).
+        // Strength can be negative and mostly sits near ±1 with a tail to ±5.
+        for (let f = 1; f < MAX_FIELDS; f++) {
+            this.fieldRange[f]    = Math.round(triRand(40, 110, 240));
+            this.fieldStrength[f] = randStrength();   // signed, ~±1 typical, tail to ±5
+        }
+        this.qftDirty = true;
+    }
+
+    // QFT transforms (per active type × active interaction field; exc excluded).
+    getQftTransform(): TransformRule[] {
+        return this.qftTransform.map(r => ({ ...r }));
+    }
+    setQftTransform(type: number, field: number, rule: TransformRule): void {
+        if (type < 0 || type >= MAX_TYPES || field < 1 || field >= MAX_FIELDS) return;
+        this.qftTransform[type * MAX_FIELDS + field] = { ...rule };
+        this.qftDirty = true;
+    }
+    clearQftTransforms(): void {
+        this.qftTransform = Array.from({ length: MAX_TYPES * MAX_FIELDS }, () => this.emptyRule());
+        this.qftDirty = true;
+    }
+    // Thresholds mostly ±5 with a tail to ±50 (low-weighted).
+    randomizeQftTransforms(): void {
+        const n = this.numTypes;
+        const randTgt = (exclude: number) => {
+            let t = Math.floor(Math.random() * n);
+            while (t === exclude && n > 1) t = Math.floor(Math.random() * n);
+            return t;
+        };
+        const thMag = () => {
+            let m = 0.2 + Math.random() * 5;                                  // core 0.2..5.2
+            if (Math.random() < 0.2) m = 5 + Math.pow(Math.random(), 3) * 45; // tail to 50
+            return Math.round(m * 100) / 100;
+        };
+        for (let s = 0; s < MAX_TYPES; s++) {
+            for (let f = 0; f < MAX_FIELDS; f++) {
+                const idx = s * MAX_FIELDS + f;
+                if (s >= n || f === 0 || f >= this.numFields) { this.qftTransform[idx] = this.emptyRule(); continue; }
+                const r = this.emptyRule();
+                if (Math.random() < 0.22) { r.upperEnabled = true; r.upperThreshold = thMag();  r.upperTarget = randTgt(s); }
+                if (Math.random() < 0.22) { r.lowerEnabled = true; r.lowerThreshold = -thMag(); r.lowerTarget = randTgt(s); }
+                this.qftTransform[idx] = r;
             }
         }
         this.qftDirty = true;
@@ -3742,6 +3859,8 @@ export class ParticleSimulation {
             fieldStrength:    this.fieldStrength.slice(0, this.numFields),
             charges:          this.getCharges(),
             susc:             this.getSusc(),
+            qftTransform:     Array.from({ length: n }, (_, t) =>
+                                  Array.from({ length: this.numFields }, (_, f) => ({ ...this.qftTransform[t * MAX_FIELDS + f] }))),
         };
     }
 
@@ -3869,6 +3988,21 @@ export class ParticleSimulation {
             // Pre-susceptibility export: default response = charge (reciprocal, as it was).
             for (let i = 0; i < MAX_TYPES * MAX_FIELDS; i++) this.susc[i] = this.charges[i];
         }
+        if (Array.isArray(state.qftTransform)) {
+            for (let t = 0; t < n; t++) {
+                const row = state.qftTransform[t];
+                if (!Array.isArray(row)) continue;
+                for (let f = 1; f < this.numFields; f++) {
+                    const r = row[f];
+                    if (r) this.qftTransform[t * MAX_FIELDS + f] = {
+                        upperEnabled: Boolean(r.upperEnabled), upperInclusive: Boolean(r.upperInclusive),
+                        upperThreshold: Number(r.upperThreshold) || 0, upperTarget: Number(r.upperTarget) || 0,
+                        lowerEnabled: Boolean(r.lowerEnabled), lowerInclusive: Boolean(r.lowerInclusive),
+                        lowerThreshold: Number(r.lowerThreshold) || 0, lowerTarget: Number(r.lowerTarget) || 0,
+                    };
+                }
+            }
+        }
         this.qftDirty = true;
 
         if (!this.isInitialized || !this.queue) return;
@@ -3881,6 +4015,7 @@ export class ParticleSimulation {
         if (this.chargesBuffer)     this.queue.writeBuffer(this.chargesBuffer,     0, this.generateChargesData());
         if (this.suscBuffer)        this.queue.writeBuffer(this.suscBuffer,        0, this.generateSuscData());
         if (this.fieldParamsBuffer) this.queue.writeBuffer(this.fieldParamsBuffer, 0, this.generateFieldParamsData());
+        if (this.qftTransformBuffer) this.queue.writeBuffer(this.qftTransformBuffer, 0, this.generateQftTransformData());
         this.simulationTime = 0;
     }
 }
