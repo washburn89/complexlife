@@ -7,6 +7,8 @@ dist/
 # TypeScript declaration maps (generated)
 **/*.d.ts
 **/*.d.ts.map
+# ...but keep hand-vendored third-party type declarations
+!src/vendor/*.d.ts
 
 # Logs
 *.log

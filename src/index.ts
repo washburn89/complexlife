@@ -1,17 +1,28 @@
-import { ParticleSimulation, TransformRule, MAX_TYPES, TYPE_COLORS_HEX, DiagnosticData } from './simulation';
+import { ParticleSimulation, TransformRule, DnfCondition, DnfRule, MAX_TYPES, MAX_FIELDS, MAX_DNF_CONDITIONS, MAX_DNF_RULES, compileBoolExpr, TYPE_COLORS_HEX, DiagnosticData } from './simulation';
+// Vendored (MIT) so the repo is self-contained — no npm install needed. See
+// src/vendor/webm-muxer.LICENSE.txt.
+import { Muxer, ArrayBufferTarget } from './vendor/webm-muxer';
 
+// Short 3-letter type names, decoupled from colours (we have up to 50 types).
 const TYPE_LABELS = [
-    'R', 'G', 'B', 'Y', 'M', 'C', 'O', 'P', 'K', 'S',
-    'W', 'A', 'L', 'T', 'I', 'N', 'Q', 'H', 'F', 'Z',
+    'Axo', 'Bex', 'Cyl', 'Dax', 'Eon', 'Fyn', 'Gad', 'Hex', 'Ivo', 'Jax',
+    'Kor', 'Lum', 'Mox', 'Nyx', 'Orb', 'Pyx', 'Qua', 'Rho', 'Syl', 'Tau',
+    'Uxo', 'Vex', 'Wyn', 'Xan', 'Yvo', 'Zed', 'Arc', 'Bly', 'Cri', 'Dro',
+    'Elu', 'Fro', 'Gly', 'Hru', 'Ixi', 'Jek', 'Kip', 'Lof', 'Mun', 'Nim',
+    'Oss', 'Pel', 'Qib', 'Rax', 'Sol', 'Tiv', 'Umo', 'Vit', 'Wox', 'Zor',
 ];
 const TYPE_HEX = TYPE_COLORS_HEX;
+// DNF condition operators, indexed by op code (0:> 1:>= 2:< 3:<=).
+const DNF_OPSYM = ['>', '≥', '<', '≤'];
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
 
 function strengthToColor(v: number): string {
-    const c = Math.max(-1, Math.min(1, v));
-    if (c < 0) { const t = Math.round(-c * 180); return `rgb(${t},0,0)`; }
-    const t = Math.round(c * 180); return `rgb(0,${t},0)`;
+    // Perceptual ramp so the full ±5 range stays distinguishable (sqrt keeps small
+    // values visible; magnitudes past ±5 saturate).
+    const mag = Math.sqrt(Math.min(Math.abs(v), 5) / 5);
+    const t = Math.round(40 + mag * 190);
+    return v < 0 ? `rgb(${t},0,0)` : `rgb(0,${t},0)`;
 }
 
 function radiusToColor(v: number): string {
@@ -89,7 +100,56 @@ class ParticleLifeApp {
     private cursorMouseX          = -9999;
     private cursorMouseY          = -9999;
     private cursorMouseButtons    = 0;   // bitmask: bit 0 = left, bit 2 = right
-    private cursorPanelCollapsed  = false;
+
+    // ── Master randomize ──────────────────────────────────────────────────────
+    // Which categories the master Randomize button affects. `modes: null` = always
+    // shown (forces); otherwise only when the current sim mode is in the list.
+    private readonly randomizeCats: {
+        key: string; label: string; modes: number[] | null;
+        run: () => void; refresh: 'forces' | 'transform' | 'poles' | 'masses' | 'valences' | 'bonding' | 'dnf' | 'charges';
+    }[] = [
+        { key: 'strength',  label: 'Force strength', modes: null,      run: () => this.sim!.randomizeStrengths(),     refresh: 'forces' },
+        { key: 'maxRadius', label: 'Max radius',     modes: null,      run: () => this.sim!.randomizeMaxRadii(),      refresh: 'forces' },
+        { key: 'minRadius', label: 'Min radius',     modes: null,      run: () => this.sim!.randomizeMinRadii(),      refresh: 'forces' },
+        { key: 'transform', label: 'Transform rules', modes: [1, 2, 4], run: () => this.sim!.randomizeTransformRules(), refresh: 'transform' },
+        { key: 'poles',     label: 'Poles',          modes: [1, 2],    run: () => this.sim!.randomizePoles(),         refresh: 'poles' },
+        { key: 'masses',    label: 'Masses',         modes: [2],       run: () => this.sim!.randomizeMasses(),        refresh: 'masses' },
+        { key: 'valences',  label: 'Valences',       modes: [3, 4, 5], run: () => this.sim!.randomizePatches(),       refresh: 'valences' },
+        { key: 'bonding',   label: 'Bonding',        modes: [3, 4, 5], run: () => this.sim!.randomizePatchParams(),   refresh: 'bonding' },
+        { key: 'dnf',       label: 'DNF rules',      modes: [5],       run: () => this.sim!.randomizeDnfRules(),      refresh: 'dnf' },
+        { key: 'charges',   label: 'Charges',        modes: [6],       run: () => this.sim!.randomizeCharges(),       refresh: 'charges' },
+        { key: 'qftTransform', label: 'QFT transforms', modes: [6],    run: () => this.sim!.randomizeQftTransforms(), refresh: 'charges' },
+    ];
+    // Default selection — minRadius and poles off, as those are rarely wanted.
+    private randomizeSel: Record<string, boolean> = {
+        strength: true, maxRadius: true, minRadius: false,
+        transform: true, poles: false, masses: true, valences: true, bonding: true, dnf: true,
+        charges: true, qftTransform: true,
+    };
+
+    // ── DNF editor (mode 5) ───────────────────────────────────────────────────
+    private dnfEditType: number | null = null;   // which source type's editor is open
+    // ── QFT transform editor (mode 6) ─────────────────────────────────────────
+    private qftEditCell: { type: number; field: number } | null = null;
+
+    // ── Photo export selection ────────────────────────────────────────────────
+    private photoSelMode     = false;   // armed: dragging a region to export
+    private photoSelDragging = false;
+    private photoSelDidPause  = false;  // true if entering select mode paused the sim (so release can resume)
+    private photoSelBox: { sx0: number; sy0: number; sx1: number; sy1: number } | null = null;
+    private photoSelTarget: 'png' | 'video' = 'png';   // what a completed selection does
+
+    // ── Video recording ───────────────────────────────────────────────────────
+    private videoDurationSec = 10;
+    private isRecording      = false;
+    private recorder: MediaRecorder | null = null;
+    private recordCopy: (() => void) | null = null;   // per-frame blit into the record canvas
+    private recordStopTimer = 0;
+    private recordCountdownTimer = 0;
+    // Offline (deterministic) render: steps the sim frame-by-frame and encodes a
+    // fixed-60fps video regardless of how long each frame takes to compute.
+    private isRenderingVideo = false;
+    private renderCancel     = false;
 
     constructor() {
         this.canvas = document.getElementById('sim-canvas') as HTMLCanvasElement;
@@ -117,12 +177,16 @@ class ParticleLifeApp {
 
     // ── Canvas sizing ─────────────────────────────────────────────────────────
 
+    // The canvas (viewport) fills the window; the simulation world is a separate
+    // size projected into it (centred, with background margins) by the renderer —
+    // so there are no letterbox bars and the world needn't be screen-shaped.
     private fitCanvas(): void {
-        const w = this.canvas.width, h = this.canvas.height;
-        if (!w || !h) return;
-        const scale = Math.min(window.innerWidth / w, window.innerHeight / h);
-        this.canvas.style.width  = `${w * scale}px`;
-        this.canvas.style.height = `${h * scale}px`;
+        const w = Math.max(1, window.innerWidth);
+        const h = Math.max(1, window.innerHeight);
+        this.canvas.width  = w;
+        this.canvas.height = h;
+        this.canvas.style.width  = `${w}px`;
+        this.canvas.style.height = `${h}px`;
     }
 
     private setCanvasSize(w: number, h: number): void {
@@ -178,6 +242,7 @@ class ParticleLifeApp {
                 this.refreshForceMatrices();
                 this.refreshTransformMatrix();
                 this.refreshMassTable();
+                this.refreshDnfPanel();
                 this.refreshPaintTypePicker();
             }
         };
@@ -206,6 +271,10 @@ class ParticleLifeApp {
         document.getElementById('mode0-btn')!.addEventListener('click', () => this.setSimMode(0));
         document.getElementById('mode1-btn')!.addEventListener('click', () => this.setSimMode(1));
         document.getElementById('mode2-btn')!.addEventListener('click', () => this.setSimMode(2));
+        document.getElementById('mode3-btn')!.addEventListener('click', () => this.setSimMode(3));
+        document.getElementById('mode4-btn')!.addEventListener('click', () => this.setSimMode(4));
+        document.getElementById('mode5-btn')!.addEventListener('click', () => this.setSimMode(5));
+        document.getElementById('mode6-btn')!.addEventListener('click', () => this.setSimMode(6));
 
         // Per-matrix randomize buttons
         document.getElementById('randomizeStrengthBtn')!.addEventListener('click', () => {
@@ -231,16 +300,131 @@ class ParticleLifeApp {
             this.refreshMassTable();
         });
 
+        // Patchy mode (mode 3) controls
+        document.getElementById('randomizePatchesBtn')!.addEventListener('click', () => {
+            this.sim?.randomizePatches();
+            this.refreshPatchTable();
+        });
+        document.getElementById('randomizeBondingBtn')!.addEventListener('click', () => {
+            this.sim?.randomizePatchParams();
+            this.refreshPatchUI();
+        });
+
+        // Master randomize: action button + caret that opens the checklist.
+        document.getElementById('randomizeNowBtn')!.addEventListener('click', () => this.runMasterRandomize());
+        document.getElementById('randomizeMenuBtn')!.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.toggleRandomizeMenu();
+        });
+        // Click anywhere else closes the menu.
+        document.addEventListener('click', (e) => {
+            const pop = document.getElementById('randomize-popover');
+            const caret = document.getElementById('randomizeMenuBtn');
+            if (!pop || !pop.classList.contains('visible')) return;
+            if (pop.contains(e.target as Node) || caret?.contains(e.target as Node)) return;
+            this.toggleRandomizeMenu(false);
+        });
+        const patchSlider = (id: string, valId: string, key:
+            'bondRange' | 'angStiffness' | 'angFriction' | 'patchWidth' | 'isoScale',
+            fmt: (v: number) => string) => {
+            const el  = document.getElementById(id) as HTMLInputElement;
+            const out = document.getElementById(valId)!;
+            el.addEventListener('input', () => {
+                const v = Number(el.value);
+                out.textContent = fmt(v);
+                this.sim?.setPatchParams({ [key]: v });
+            });
+        };
+        patchSlider('patchRangeSlider',    'patchRangeValue',    'bondRange',    v => String(Math.round(v)));
+        patchSlider('patchWidthSlider',    'patchWidthValue',    'patchWidth',   v => String(v));
+        patchSlider('patchIsoSlider',      'patchIsoValue',      'isoScale',     v => v.toFixed(2));
+        patchSlider('patchAngSlider',      'patchAngValue',      'angStiffness', v => v.toFixed(2));
+        // Spin damping reads 0 = none, 1 = full; internally angFriction is the
+        // per-tick angular-velocity multiplier, i.e. the inverse of the slider.
+        const spinDampEl  = document.getElementById('patchAngFricSlider') as HTMLInputElement;
+        const spinDampOut = document.getElementById('patchAngFricValue')!;
+        spinDampEl.addEventListener('input', () => {
+            const v = Number(spinDampEl.value);
+            spinDampOut.textContent = v.toFixed(2);
+            this.sim?.setPatchParams({ angFriction: 1 - v });
+        });
+
         // Randomize transform rules
         document.getElementById('randomizeTransformBtn')!.addEventListener('click', () => {
             this.sim?.randomizeTransformRules();
             this.refreshTransformMatrix();
         });
 
+        // DNF (mode 5 / Transform #2) controls
+        document.getElementById('randomizeDnfBtn')!.addEventListener('click', () => {
+            this.sim?.randomizeDnfRules();
+            this.refreshDnfPanel();
+        });
+        document.getElementById('clearDnfBtn')!.addEventListener('click', () => {
+            this.sim?.clearDnfRules();
+            this.refreshDnfPanel();
+        });
+        document.getElementById('dnfBondOffBtn')!.addEventListener('click', () => this.setDnfBonding(false));
+        document.getElementById('dnfBondOnBtn')!.addEventListener('click', () => this.setDnfBonding(true));
+
+        // QFT (mode 6) controls
+        document.getElementById('randomizeChargesBtn')!.addEventListener('click', () => {
+            this.sim?.randomizeCharges();
+            this.refreshQftPanel();
+        });
+        const qftFieldCount = document.getElementById('qftFieldCount') as HTMLInputElement;
+        qftFieldCount.addEventListener('change', () => {
+            const v = Math.max(1, Math.min(12, Math.round(Number(qftFieldCount.value) || 3)));
+            qftFieldCount.value = String(v);
+            this.sim?.setNumFields(v);
+            this.refreshQftPanel();
+        });
+        const qftTempSlider = document.getElementById('qftTempSlider') as HTMLInputElement;
+        qftTempSlider.addEventListener('input', () => {
+            const v = Number(qftTempSlider.value);
+            document.getElementById('qftTempValue')!.textContent = v.toFixed(2);
+            this.sim?.setQftTemperature(v);
+        });
+        document.getElementById('randomizeQftTransformBtn')!.addEventListener('click', () => {
+            this.sim?.randomizeQftTransforms();
+            this.qftEditCell = null;
+            this.buildQftTransformMatrix();
+        });
+        document.getElementById('clearQftTransformBtn')!.addEventListener('click', () => {
+            this.sim?.clearQftTransforms();
+            this.qftEditCell = null;
+            this.buildQftTransformMatrix();
+        });
+        const qftMaxSlider = document.getElementById('qftMaxSlider') as HTMLInputElement;
+        qftMaxSlider.addEventListener('input', () => {
+            const v = parseFloat(qftMaxSlider.value);
+            document.getElementById('qftMaxValue')!.textContent = v.toFixed(2);
+            this.sim?.setMaxTransformRate(v);
+        });
+        const dnfMaxSlider = document.getElementById('dnfMaxSlider') as HTMLInputElement;
+        dnfMaxSlider.addEventListener('input', () => {
+            const v = parseFloat(dnfMaxSlider.value);
+            document.getElementById('dnfMaxValue')!.textContent = v.toFixed(2);
+            this.sim?.setMaxTransformRate(v);
+            // Keep the Transform-mode slider in sync (same global rate).
+            const ot = document.getElementById('maxTransformSlider') as HTMLInputElement | null;
+            if (ot) { ot.value = String(v); document.getElementById('maxTransformValue')!.textContent = v.toFixed(2); }
+        });
+
         // Randomize poles
         document.getElementById('randomizePolesBtn')!.addEventListener('click', () => {
             this.sim?.randomizePoles();
             this.buildPolePanel();
+        });
+
+        // Pole reference frame (velocity vs world) for 3+ poles
+        document.getElementById('poleFrameVelBtn')!.addEventListener('click', () => {
+            this.sim?.setPoleFrame(false);
+            this.syncPoleFrameButtons();
+        });
+        document.getElementById('poleFrameWorldBtn')!.addEventListener('click', () => {
+            this.sim?.setPoleFrame(true);
+            this.syncPoleFrameButtons();
         });
 
         // World size (physics space only — canvas pixel resolution stays fixed)
@@ -302,12 +486,14 @@ class ParticleLifeApp {
             this.sim?.setAdditiveStrength(v);
         });
 
-        // Friction
+        // Friction. The slider reads as drag intuition (0 = frictionless,
+        // 1 = stops fast); internally friction is a per-tick velocity multiplier,
+        // so the stored value is the inverse of the slider.
         const frictionSlider = document.getElementById('frictionSlider') as HTMLInputElement;
         frictionSlider.addEventListener('input', () => {
             const v = parseFloat(frictionSlider.value);
             document.getElementById('frictionValue')!.textContent = v.toFixed(2);
-            this.sim?.setFriction(v);
+            this.sim?.setFriction(1 - v);
         });
 
         // Max transform rate
@@ -316,6 +502,30 @@ class ParticleLifeApp {
             const v = parseFloat(maxTransformSlider.value);
             document.getElementById('maxTransformValue')!.textContent = v.toFixed(2);
             this.sim?.setMaxTransformRate(v);
+        });
+
+        // Photo export (PNG)
+        document.getElementById('exportFullBtn')!.addEventListener('click', () => {
+            if (this.sim?.getEdgeMode() === 1) return;  // disabled in open mode
+            this.exportFullCanvas();
+        });
+        document.getElementById('exportSelBtn')!.addEventListener('click', () => this.togglePhotoSelect('png'));
+
+        // Video export (WebM). While busy, the buttons cancel the current job.
+        document.getElementById('recordFullBtn')!.addEventListener('click', () => {
+            if (this.isRenderingVideo) { this.renderCancel = true; }
+            else if (this.isRecording) { this.stopRecording(); }
+            else this.recordFullVideo();
+        });
+        document.getElementById('recordSelBtn')!.addEventListener('click', () => {
+            if (this.isRenderingVideo) { this.renderCancel = true; return; }
+            if (this.isRecording) return;
+            this.togglePhotoSelect('video');
+        });
+        const durEl = document.getElementById('videoDurSlider') as HTMLInputElement;
+        durEl.addEventListener('input', () => {
+            this.videoDurationSec = Math.max(5, Math.min(30, Math.round(Number(durEl.value) / 5) * 5));
+            document.getElementById('videoDurValue')!.textContent = `${this.videoDurationSec}s`;
         });
 
         // Export / Import
@@ -333,6 +543,9 @@ class ParticleLifeApp {
             if (e.key === 'Escape') {
                 this.closeForceEditor(); this.closeTransformEditor();
                 if (this.trackMode === 'selecting') { this.trackMode = 'idle'; this.syncTrackButton(); }
+                if (this.photoSelMode) this.exitPhotoSelect();
+                if (this.isRenderingVideo) this.renderCancel = true;   // cancel & discard offline render
+                else if (this.isRecording) this.stopRecording();       // end real-time capture (saves what's captured)
             }
             if (e.key === ' ' && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
                 e.preventDefault();
@@ -351,14 +564,10 @@ class ParticleLifeApp {
             btn.innerHTML  = this.panelCollapsed ? '&#9654;' : '&#9664;';
         });
 
-        // Bottom bar
-        document.getElementById('btmPauseBtn')!.addEventListener('click', () => {
-            if (!this.sim) return;
-            this.sim.togglePause();
-            this.syncPauseButton();
-        });
+        // Bottom dock
         document.getElementById('btmTrackBtn')!.addEventListener('click', () => this.handleTrackButton());
         document.getElementById('btmInspectBtn')!.addEventListener('click', () => {
+            if (this.photoSelMode) this.exitPhotoSelect();
             this.inspectMode = !this.inspectMode;
             if (!this.inspectMode) this.stopInspect();
             this.syncInspectButton();
@@ -371,22 +580,65 @@ class ParticleLifeApp {
     private syncPauseButton(): void {
         const paused = this.sim?.isPaused_() ?? false;
         const btn = document.getElementById('pauseBtn')!;
-        btn.textContent = paused ? 'Resume' : 'Pause';
+        btn.innerHTML = paused ? '&#9654; Resume' : '&#9646;&#9646; Pause';
         btn.classList.toggle('active', paused);
-        const btm = document.getElementById('btmPauseBtn')!;
-        btm.textContent = paused ? '&#9654; Resume' : '&#9646;&#9646; Pause';
-        btm.innerHTML   = paused ? '&#9654; Resume' : '&#9646;&#9646; Pause';
-        btm.classList.toggle('active', paused);
     }
 
-    private setSimMode(mode: 0 | 1 | 2): void {
+    private setSimMode(mode: 0 | 1 | 2 | 3 | 4 | 5 | 6): void {
         this.sim?.setSimMode(mode);
-        document.getElementById('mode0-btn')!.classList.toggle('selected', mode === 0);
-        document.getElementById('mode1-btn')!.classList.toggle('selected', mode === 1);
-        document.getElementById('mode2-btn')!.classList.toggle('selected', mode === 2);
-        document.getElementById('transform-panel')!.classList.toggle('visible', mode === 1 || mode === 2);
+        for (let m = 0; m <= 6; m++) {
+            document.getElementById(`mode${m}-btn`)!.classList.toggle('selected', mode === m);
+        }
+        // Transform rules apply in modes 1 (Transform), 2 (Mass) and 4 (Patchy+T).
+        const hasTransform = mode === 1 || mode === 2 || mode === 4;
+        // DNF rules apply only in mode 5.
+        const hasDnf = mode === 5;
+        // QFT charge fields apply only in mode 6.
+        const hasQft = mode === 6;
+        document.getElementById('qft-panel')!.classList.toggle('visible', hasQft);
+        if (hasQft) this.refreshQftPanel();
+        const dnfBond = this.sim?.getDnfBonding() ?? false;
+        // Patch controls: always in modes 3/4; in mode 5 only when bonding is on.
+        const showPatch = mode === 3 || mode === 4 || (mode === 5 && dnfBond);
+        document.getElementById('transform-panel')!.classList.toggle('visible', hasTransform);
         document.getElementById('mode2-panel')!.classList.toggle('visible', mode === 2);
+        document.getElementById('mode3-panel')!.classList.toggle('visible', showPatch);
+        document.getElementById('dnf-panel')!.classList.toggle('visible', hasDnf);
         if (mode === 2) this.refreshMassTable();
+        if (mode === 3 || mode === 4) {
+            // First time in a patchy mode with no valences set: seed some so the
+            // directional behaviour is visible immediately.
+            if (this.sim && this.sim.getPatchCount().every(v => v === 0)) {
+                this.sim.randomizePatches();
+            }
+            this.refreshPatchUI();
+        }
+        if (hasDnf) {
+            // First entry with no rules: seed some so transforms are visible at once.
+            if (this.sim && this.sim.getDnfTypes().every(dt => dt.conditions.length === 0 && dt.rules.length === 0)) {
+                this.sim.randomizeDnfRules();
+            }
+            this.syncDnfBondingButtons();
+            if (showPatch) this.refreshPatchUI();
+            this.refreshDnfPanel();
+        }
+    }
+
+    // Reflect the Mode-5 directional-bonding toggle and show/hide the patch panel.
+    private syncDnfBondingButtons(): void {
+        const on = this.sim?.getDnfBonding() ?? false;
+        document.getElementById('dnfBondOnBtn')!.classList.toggle('selected', on);
+        document.getElementById('dnfBondOffBtn')!.classList.toggle('selected', !on);
+    }
+
+    private setDnfBonding(on: boolean): void {
+        if (!this.sim) return;
+        this.sim.setDnfBonding(on);
+        // Turning bonding on with no valences set: seed some so bonds are visible.
+        if (on && this.sim.getPatchCount().every(v => v === 0)) this.sim.randomizePatches();
+        document.getElementById('mode3-panel')!.classList.toggle('visible', on);
+        if (on) this.refreshPatchUI();
+        this.syncDnfBondingButtons();
     }
 
     private setEdgeMode(mode: 0 | 1): void {
@@ -395,6 +647,7 @@ class ParticleLifeApp {
         document.getElementById('edgeLoopBtn')!.classList.toggle('selected', mode === 0);
         document.getElementById('edgeOpenBtn')!.classList.toggle('selected', mode === 1);
         this.updateZoomDisplay();
+        this.syncExportButtons();
     }
 
     private setBlendMode(mode: 0 | 1): void {
@@ -411,18 +664,49 @@ class ParticleLifeApp {
 
     // ── Entity tracking helpers ───────────────────────────────────────────────
 
+    // Half-extents (world units) visible from the view centre to each viewport edge.
+    // Mirrors the isotropic "contain" projection in the render vertex shader.
+    private viewSpans(): { spanX: number; spanY: number } {
+        const p = this.sim!.getParams();
+        const v = this.sim!.getView();
+        const aspect = this.canvas.width / this.canvas.height;
+        const worldAspect = p.worldWidth / p.worldHeight;
+        if (aspect > worldAspect) {
+            const spanY = (p.worldHeight * 0.5) / v.zoom;
+            return { spanX: spanY * aspect, spanY };
+        }
+        const spanX = (p.worldWidth * 0.5) / v.zoom;
+        return { spanX, spanY: spanX / aspect };
+    }
+
     private screenToWorld(sx: number, sy: number): { wx: number; wy: number } {
         if (!this.sim) return { wx: 0, wy: 0 };
-        const rect   = this.canvas.getBoundingClientRect();
-        const params = this.sim.getParams();
-        const view   = this.sim.getView();
+        const rect = this.canvas.getBoundingClientRect();
+        const view = this.sim.getView();
+        const { spanX, spanY } = this.viewSpans();
+        const fx = (sx - rect.left - rect.width  / 2) / (rect.width  / 2);  // -1..1
+        const fy = (sy - rect.top  - rect.height / 2) / (rect.height / 2);  // -1..1 (down +)
+        return { wx: view.cx + fx * spanX, wy: view.cy + fy * spanY };
+    }
+
+    // Screen (client) pixels per world unit — isotropic under the contain camera.
+    private pxPerWorld(): number {
+        const rect = this.canvas.getBoundingClientRect();
+        return (rect.width / 2) / this.viewSpans().spanX;
+    }
+
+    private worldToScreen(wx: number, wy: number): { sx: number; sy: number } {
+        const rect = this.canvas.getBoundingClientRect();
+        const v = this.sim!.getView();
+        const s = this.pxPerWorld();
         return {
-            wx: view.cx + (sx - rect.left - rect.width  / 2) * params.worldWidth  / (rect.width  * view.zoom),
-            wy: view.cy + (sy - rect.top  - rect.height / 2) * params.worldHeight / (rect.height * view.zoom),
+            sx: rect.left + rect.width  / 2 + (wx - v.cx) * s,
+            sy: rect.top  + rect.height / 2 + (wy - v.cy) * s,
         };
     }
 
     private handleTrackButton(): void {
+        if (this.photoSelMode) this.exitPhotoSelect();
         if (this.trackMode === 'tracking') {
             this.sim?.stopTracking();
             this.trackMode = 'idle';
@@ -465,10 +749,7 @@ class ParticleLifeApp {
         // Brush circle for cursor tools (suppressed during inspect/track override)
         if (this.activeCursorTool !== 'none' && !this.inspectMode && this.trackMode === 'idle'
                 && this.cursorMouseX > -9000 && this.sim) {
-            const rect   = this.canvas.getBoundingClientRect();
-            const params = this.sim.getParams();
-            const view   = this.sim.getView();
-            const sr = this.brushWorldRadius * view.zoom * rect.width / params.worldWidth;
+            const sr = this.brushWorldRadius * this.pxPerWorld();
             const pressing = this.cursorMouseButtons !== 0;
             const tool = this.activeCursorTool;
             const idleColor  = tool === 'paint' ? 'rgba(0,255,100,0.4)'  : tool === 'erase' ? 'rgba(255,80,80,0.4)'  : 'rgba(255,255,255,0.4)';
@@ -504,12 +785,8 @@ class ParticleLifeApp {
         if (this.trackMode === 'tracking' && this.sim) {
             const info = this.sim.getTrackingInfo();
             if (!info) { this.trackMode = 'idle'; this.syncTrackButton(); return; }
-            const rect   = this.canvas.getBoundingClientRect();
-            const params = this.sim.getParams();
-            const view   = this.sim.getView();
-            const sx = rect.left + rect.width  / 2 + (info.comX - view.cx) * view.zoom * rect.width  / params.worldWidth;
-            const sy = rect.top  + rect.height / 2 + (info.comY - view.cy) * view.zoom * rect.height / params.worldHeight;
-            const sr = info.radius * view.zoom * rect.width / params.worldWidth;
+            const { sx, sy } = this.worldToScreen(info.comX, info.comY);
+            const sr = info.radius * this.pxPerWorld();
 
             const drift = (performance.now() * 0.02) % 20;
             ctx.save();
@@ -534,13 +811,8 @@ class ParticleLifeApp {
         // Selected particle: highlight ring + velocity arrow
         const diagData = this.sim?.diagData;
         if (diagData && this.sim) {
-            const rect   = this.canvas.getBoundingClientRect();
-            const params = this.sim.getParams();
-            const view   = this.sim.getView();
-            const scaleX = view.zoom * rect.width  / params.worldWidth;
-            const scaleY = view.zoom * rect.height / params.worldHeight;
-            const sx = rect.left + rect.width  / 2 + (diagData.pos[0] - view.cx) * scaleX;
-            const sy = rect.top  + rect.height / 2 + (diagData.pos[1] - view.cy) * scaleY;
+            const { sx, sy } = this.worldToScreen(diagData.pos[0], diagData.pos[1]);
+            const scaleY = this.pxPerWorld();
 
             // Highlight ring around selected particle
             ctx.save();
@@ -575,6 +847,33 @@ class ParticleLifeApp {
                 ctx.closePath();
                 ctx.fill();
             }
+            ctx.restore();
+        }
+
+        // Photo export selection rectangle + output pixel dimensions
+        if (this.photoSelMode && this.photoSelBox) {
+            const b  = this.photoSelBox;
+            const x  = Math.min(b.sx0, b.sx1), y = Math.min(b.sy0, b.sy1);
+            const bw = Math.abs(b.sx1 - b.sx0), bh = Math.abs(b.sy1 - b.sy0);
+            ctx.save();
+            ctx.strokeStyle = '#ff3df0';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([6, 4]);
+            ctx.strokeRect(x, y, bw, bh);
+            ctx.setLineDash([]);
+
+            const dim   = this.clientBoxToCanvasRect(b);
+            const label = `${dim.w} × ${dim.h} px`;
+            ctx.font = '12px monospace';
+            const tw = ctx.measureText(label).width;
+            // Place label just outside the rectangle (above-left; below if no room above)
+            const lx = x;
+            let   ly = y - 7;
+            if (ly < 14) ly = y + bh + 16;
+            ctx.fillStyle = 'rgba(0,0,0,0.65)';
+            ctx.fillRect(lx - 3, ly - 12, tw + 6, 16);
+            ctx.fillStyle = '#ff3df0';
+            ctx.fillText(label, lx, ly);
             ctx.restore();
         }
     }
@@ -680,6 +979,13 @@ class ParticleLifeApp {
                 this.canvas.style.cursor = 'grabbing';
                 return;
             }
+            // Photo export selection overrides everything else
+            if (e.button === 0 && this.photoSelMode) {
+                e.preventDefault();
+                this.photoSelDragging = true;
+                this.photoSelBox = { sx0: e.clientX, sy0: e.clientY, sx1: e.clientX, sy1: e.clientY };
+                return;
+            }
             // Track / Inspect override cursor tools — check first
             if (e.button === 0 && this.trackMode === 'selecting') {
                 e.preventDefault();
@@ -714,12 +1020,11 @@ class ParticleLifeApp {
         window.addEventListener('mousemove', (e) => {
             if (panning && this.sim) {
                 const dx = e.clientX - lastX, dy = e.clientY - lastY;
-                const rect   = this.canvas.getBoundingClientRect();
-                const params = this.sim.getParams();
-                const view   = this.sim.getView();
+                const view = this.sim.getView();
+                const wpp  = 1 / this.pxPerWorld();   // world units per screen pixel
                 this.sim.setView(
-                    view.cx - dx * params.worldWidth  / (rect.width  * view.zoom),
-                    view.cy - dy * params.worldHeight / (rect.height * view.zoom),
+                    view.cx - dx * wpp,
+                    view.cy - dy * wpp,
                     view.zoom
                 );
                 lastX = e.clientX; lastY = e.clientY;
@@ -730,11 +1035,33 @@ class ParticleLifeApp {
                 this.selBox.sx1 = e.clientX;
                 this.selBox.sy1 = e.clientY;
             }
+            if (this.photoSelDragging && this.photoSelBox) {
+                this.photoSelBox.sx1 = e.clientX;
+                this.photoSelBox.sy1 = e.clientY;
+            }
         });
 
         window.addEventListener('mouseup', (e) => {
             if (e.button === 1 || (e.button === 0 && this.activeCursorTool === 'grab')) {
                 panning = false;
+            }
+            if (e.button === 0 && this.photoSelDragging) {
+                this.photoSelDragging = false;
+                const box = this.photoSelBox;
+                const target = this.photoSelTarget;
+                let rect: { x: number; y: number; w: number; h: number } | null = null;
+                if (box && this.sim) {
+                    const r = this.clientBoxToCanvasRect(box);
+                    if (r.w >= 1 && r.h >= 1) {
+                        if (target === 'png') this.exportSelection(box);
+                        else rect = r;
+                    }
+                }
+                // Selecting auto-ends the selection (and resumes the sim unless it was
+                // already paused before entering select mode).
+                this.exitPhotoSelect();
+                // Video records the live sim, so start only after resuming.
+                if (target === 'video' && rect) this.startVideoExport(rect);
             }
             if (e.button === 0 && this.selBoxActive && this.trackMode === 'selecting') {
                 this.selBoxActive = false;
@@ -761,15 +1088,16 @@ class ParticleLifeApp {
             e.preventDefault();
             if (!this.sim) return;
             const rect   = this.canvas.getBoundingClientRect();
-            const params = this.sim.getParams();
             const view   = this.sim.getView();
             const oldZ   = view.zoom;
             const newZ   = Math.max(0.05, Math.min(200, oldZ * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
-            const sx     = (e.clientX - rect.left)  - rect.width  / 2;
-            const sy     = (e.clientY - rect.top)   - rect.height / 2;
+            // Keep the world point under the cursor fixed (spans scale as 1/zoom).
+            const fx = (e.clientX - rect.left - rect.width  / 2) / (rect.width  / 2);
+            const fy = (e.clientY - rect.top  - rect.height / 2) / (rect.height / 2);
+            const s  = this.viewSpans();   // spans at oldZ
             this.sim.setView(
-                view.cx + sx * params.worldWidth  / rect.width  * (1 / oldZ - 1 / newZ),
-                view.cy + sy * params.worldHeight / rect.height * (1 / oldZ - 1 / newZ),
+                view.cx + fx * s.spanX * (1 - oldZ / newZ),
+                view.cy + fy * s.spanY * (1 - oldZ / newZ),
                 newZ
             );
             this.updateZoomDisplay();
@@ -817,13 +1145,8 @@ class ParticleLifeApp {
             paintRateVal.textContent = String(this.paintRate);
         });
 
-        document.getElementById('cursorCollapseBtn')!.addEventListener('click', () => {
-            this.cursorPanelCollapsed = !this.cursorPanelCollapsed;
-            document.getElementById('cursor-panel')!.classList.toggle('collapsed', this.cursorPanelCollapsed);
-            document.body.classList.toggle('cursor-panel-collapsed', this.cursorPanelCollapsed);
-            const btn = document.getElementById('cursorCollapseBtn')!;
-            btn.innerHTML = this.cursorPanelCollapsed ? '&#9664;' : '&#9654;';
-        });
+        // Reposition the contextual tool popover above its dock button on resize
+        window.addEventListener('resize', () => this.updateToolPopover());
 
         window.addEventListener('mousemove', (e) => {
             this.cursorMouseX = e.clientX;
@@ -838,6 +1161,7 @@ class ParticleLifeApp {
     }
 
     private setActiveCursorTool(tool: 'grab' | 'force' | 'paint' | 'erase'): void {
+        if (this.photoSelMode) this.exitPhotoSelect();
         this.activeCursorTool = (this.activeCursorTool === tool) ? 'none' : tool;
         document.getElementById('ctool-grab')!.classList.toggle('active',  this.activeCursorTool === 'grab');
         document.getElementById('ctool-force')!.classList.toggle('active', this.activeCursorTool === 'force');
@@ -849,7 +1173,92 @@ class ParticleLifeApp {
         const showRate = this.activeCursorTool === 'paint' || this.activeCursorTool === 'erase';
         document.getElementById('paint-rate-section')!.style.display = showRate ? '' : 'none';
         if (this.activeCursorTool === 'paint') this.refreshPaintTypePicker();
+        this.updateToolPopover();
         this.syncCanvasCursor();
+    }
+
+    // Show the contextual tool settings popover above the active tool's dock button.
+    // Only the brush-using tools (force/paint/erase) have settings; grab has none.
+    private updateToolPopover(): void {
+        const pop = document.getElementById('tool-popover');
+        if (!pop) return;
+        const tool = this.activeCursorTool;
+        const show = tool === 'force' || tool === 'paint' || tool === 'erase';
+        pop.classList.toggle('visible', show);
+        if (!show) return;
+        const anchor = document.getElementById(`ctool-${tool}`);
+        if (!anchor) return;
+        const a = anchor.getBoundingClientRect();
+        const popW = pop.offsetWidth || 196;
+        let left = a.left + a.width / 2 - popW / 2;
+        left = Math.max(8, Math.min(window.innerWidth - popW - 8, left));
+        pop.style.left   = `${left}px`;
+        pop.style.bottom = `${window.innerHeight - a.top + 8}px`;
+    }
+
+    // ── Master randomize ──────────────────────────────────────────────────────
+
+    private toggleRandomizeMenu(show?: boolean): void {
+        const pop = document.getElementById('randomize-popover');
+        const caret = document.getElementById('randomizeMenuBtn');
+        if (!pop) return;
+        const visible = show ?? !pop.classList.contains('visible');
+        if (visible) this.buildRandomizeMenu();
+        pop.classList.toggle('visible', visible);
+        caret?.classList.toggle('active', visible);
+        if (visible) {
+            const anchor = document.getElementById('randomizeNowBtn');
+            if (anchor) {
+                const a = anchor.getBoundingClientRect();
+                const popW = pop.offsetWidth || 180;
+                let left = a.left + a.width / 2 - popW / 2;
+                left = Math.max(8, Math.min(window.innerWidth - popW - 8, left));
+                pop.style.left   = `${left}px`;
+                pop.style.bottom = `${window.innerHeight - a.top + 8}px`;
+            }
+        }
+    }
+
+    // Rebuild the checklist showing only categories relevant to the current mode.
+    private buildRandomizeMenu(): void {
+        const list = document.getElementById('randomize-list');
+        if (!list) return;
+        list.innerHTML = '';
+        const mode = this.sim?.getSimMode() ?? 0;
+        for (const cat of this.randomizeCats) {
+            if (cat.modes !== null && !cat.modes.includes(mode)) continue;
+            const row = document.createElement('label');
+            row.className = 'rnd-row';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = this.randomizeSel[cat.key];
+            cb.addEventListener('change', () => { this.randomizeSel[cat.key] = cb.checked; });
+            row.appendChild(cb);
+            row.appendChild(document.createTextNode(cat.label));
+            list.appendChild(row);
+        }
+    }
+
+    // Run every selected category that applies to the current mode, then refresh
+    // the panels that changed.
+    private runMasterRandomize(): void {
+        if (!this.sim) return;
+        const mode = this.sim.getSimMode();
+        const refreshes = new Set<string>();
+        for (const cat of this.randomizeCats) {
+            if (cat.modes !== null && !cat.modes.includes(mode)) continue;
+            if (!this.randomizeSel[cat.key]) continue;
+            cat.run();
+            refreshes.add(cat.refresh);
+        }
+        if (refreshes.has('forces'))    this.refreshForceMatrices();
+        if (refreshes.has('transform')) this.refreshTransformMatrix();  // also rebuilds poles
+        if (refreshes.has('poles'))     this.buildPolePanel();
+        if (refreshes.has('masses'))    this.refreshMassTable();
+        if (refreshes.has('valences'))  this.refreshPatchTable();
+        if (refreshes.has('bonding'))   this.refreshPatchUI();
+        if (refreshes.has('dnf'))       this.refreshDnfPanel();
+        if (refreshes.has('charges'))   this.refreshQftPanel();
     }
 
     private refreshPaintTypePicker(): void {
@@ -872,6 +1281,7 @@ class ParticleLifeApp {
     }
 
     private syncCanvasCursor(): void {
+        if (this.photoSelMode) { this.canvas.style.cursor = 'crosshair'; return; }
         // Inspect/track override: clear inline style so CSS body-class cursor takes effect
         if (this.inspectMode || this.trackMode !== 'idle') {
             this.canvas.style.cursor = '';
@@ -883,6 +1293,354 @@ class ParticleLifeApp {
             this.canvas.style.cursor = 'crosshair';
         } else {
             this.canvas.style.cursor = '';
+        }
+    }
+
+    // ── Photo export ───────────────────────────────────────────────────────────
+
+    private togglePhotoSelect(target: 'png' | 'video' = 'png'): void {
+        // Clicking the same tool again cancels; switching target re-arms.
+        if (this.photoSelMode && this.photoSelTarget === target) { this.exitPhotoSelect(); return; }
+        if (this.isRecording) return;
+        this.photoSelTarget = target;
+        if (this.photoSelMode) { this.syncPhotoSelButton(); return; }
+        // Turn off any conflicting interaction modes
+        if (this.activeCursorTool !== 'none') this.setActiveCursorTool(this.activeCursorTool);  // toggles off
+        if (this.trackMode === 'selecting') {
+            this.trackMode = 'idle';
+            document.body.classList.remove('track-selecting');
+            this.syncTrackButton();
+        }
+        if (this.inspectMode) this.stopInspect();
+        this.photoSelMode = true;
+        this.photoSelBox  = null;
+        // Freeze the frame so the user can compose a selection; remember if it was
+        // already paused so we don't resume something they paused themselves.
+        this.photoSelDidPause = false;
+        if (this.sim && !this.sim.isPaused_()) {
+            this.sim.togglePause();
+            this.photoSelDidPause = true;
+            this.syncPauseButton();
+        }
+        this.syncPhotoSelButton();
+        this.syncCanvasCursor();
+    }
+
+    private exitPhotoSelect(): void {
+        this.photoSelMode     = false;
+        this.photoSelDragging = false;
+        this.photoSelBox      = null;
+        this.resumeAfterPhotoPause();
+        this.syncPhotoSelButton();
+        this.syncCanvasCursor();
+    }
+
+    // Resume the sim only if entering select mode is what paused it.
+    private resumeAfterPhotoPause(): void {
+        if (this.photoSelDidPause && this.sim?.isPaused_()) {
+            this.sim.togglePause();
+            this.syncPauseButton();
+        }
+        this.photoSelDidPause = false;
+    }
+
+    private syncPhotoSelButton(): void {
+        const png = document.getElementById('exportSelBtn');
+        const vid = document.getElementById('recordSelBtn');
+        const pngActive = this.photoSelMode && this.photoSelTarget === 'png';
+        const vidActive = this.photoSelMode && this.photoSelTarget === 'video';
+        if (png) {
+            png.classList.toggle('active', pngActive);
+            png.innerHTML = pngActive ? '&#9645; Drag a box · Esc to cancel' : '&#9645; Select &amp; Export PNG';
+        }
+        if (vid) {
+            vid.classList.toggle('active', vidActive);
+            vid.innerHTML = vidActive ? '&#9645; Drag a box · Esc to cancel' : '&#9210; Select &amp; Record Video';
+        }
+    }
+
+    // Grey out full-canvas export in open edge mode (its framing isn't a complete image)
+    private syncExportButtons(): void {
+        const btn = document.getElementById('exportFullBtn') as HTMLButtonElement | null;
+        if (!btn) return;
+        const open = this.sim?.getEdgeMode() === 1;
+        btn.classList.toggle('disabled-look', open);
+        btn.title = open
+            ? 'Full-canvas export is only available in closed (Loop) edge mode — use Select & Export instead.'
+            : 'Export the entire canvas as a lossless PNG';
+    }
+
+    // Map a client-space drag box to integer canvas-pixel coordinates (the export resolution)
+    private clientBoxToCanvasRect(box: { sx0: number; sy0: number; sx1: number; sy1: number }):
+            { x: number; y: number; w: number; h: number } {
+        const rect = this.canvas.getBoundingClientRect();
+        const cw = this.canvas.width, ch = this.canvas.height;
+        const toX = (cx: number) => Math.round((cx - rect.left) / rect.width  * cw);
+        const toY = (cy: number) => Math.round((cy - rect.top)  / rect.height * ch);
+        const x0 = Math.max(0, Math.min(cw, toX(Math.min(box.sx0, box.sx1))));
+        const y0 = Math.max(0, Math.min(ch, toY(Math.min(box.sy0, box.sy1))));
+        const x1 = Math.max(0, Math.min(cw, toX(Math.max(box.sx0, box.sx1))));
+        const y1 = Math.max(0, Math.min(ch, toY(Math.max(box.sy0, box.sy1))));
+        return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    }
+
+    private async exportFullCanvas(): Promise<void> {
+        if (!this.sim) return;
+        // Export exactly the physics-simmed world area at full resolution, ignoring
+        // the live camera framing (full export is only offered in loop edge mode).
+        const cap = await this.sim.captureRGBA({ fullWorld: true });
+        if (!cap) return;
+        const blob = await this.rgbaToPngBlob(cap.data, cap.width, cap.height);
+        if (blob) this.downloadBlob(blob, this.exportFilename(`${cap.width}x${cap.height}`));
+    }
+
+    private async exportSelection(box: { sx0: number; sy0: number; sx1: number; sy1: number }): Promise<void> {
+        if (!this.sim) return;
+        const r = this.clientBoxToCanvasRect(box);
+        if (r.w < 1 || r.h < 1) return;
+        const cap = await this.sim.captureRGBA();
+        if (!cap) return;
+        // Crop the requested region out of the full-resolution capture
+        const cropped = new Uint8ClampedArray(r.w * r.h * 4);
+        for (let row = 0; row < r.h; row++) {
+            const srcStart = ((r.y + row) * cap.width + r.x) * 4;
+            cropped.set(cap.data.subarray(srcStart, srcStart + r.w * 4), row * r.w * 4);
+        }
+        const blob = await this.rgbaToPngBlob(cropped, r.w, r.h);
+        if (blob) this.downloadBlob(blob, this.exportFilename(`${r.w}x${r.h}`));
+    }
+
+    private rgbaToPngBlob(data: Uint8ClampedArray, w: number, h: number): Promise<Blob | null> {
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        const ctx = c.getContext('2d');
+        if (!ctx) return Promise.resolve(null);
+        ctx.putImageData(new ImageData(data as Uint8ClampedArray<ArrayBuffer>, w, h), 0, 0);
+        return new Promise(resolve => c.toBlob(b => resolve(b), 'image/png'));
+    }
+
+    private downloadBlob(blob: Blob, name: string): void {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    private exportFilename(tag: string, ext = 'png'): string {
+        const d = new Date();
+        const p = (n: number) => String(n).padStart(2, '0');
+        const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+        return `particle-life-${stamp}-${tag}.${ext}`;
+    }
+
+    // ── Video export ─────────────────────────────────────────────────────────
+    private recordFullVideo(): void {
+        if (this.isRecording || this.isRenderingVideo || !this.sim) return;
+        this.startVideoExport({ x: 0, y: 0, w: this.canvas.width, h: this.canvas.height });
+    }
+
+    // Prefer the deterministic offline renderer (WebCodecs): it steps the sim
+    // frame-by-frame and encodes a fixed-60fps clip however long the compute takes,
+    // so heavy sims don't slow/stutter the output. Falls back to real-time capture.
+    private startVideoExport(rect: { x: number; y: number; w: number; h: number }): void {
+        const hasWebCodecs = typeof (window as any).VideoEncoder !== 'undefined'
+            && typeof (window as any).VideoFrame !== 'undefined';
+        if (hasWebCodecs) this.renderVideoOffline(rect);
+        else this.startRecording(rect);
+    }
+
+    private async renderVideoOffline(rect: { x: number; y: number; w: number; h: number }): Promise<void> {
+        if (this.isRecording || this.isRenderingVideo || !this.sim) return;
+        const VE: any = (window as any).VideoEncoder;
+        const fps = 60;
+        const total = Math.round(this.videoDurationSec * fps);
+        // Downscale the output so encoding stays fast (full window res is overkill
+        // for a clip). Longest side is capped; aspect preserved; dims forced even.
+        const MAX_DIM = 1280;
+        const scale = Math.min(1, MAX_DIM / Math.max(rect.w, rect.h));
+        let w = Math.max(2, Math.round(rect.w * scale)); w -= w % 2;
+        let h = Math.max(2, Math.round(rect.h * scale)); h -= h % 2;
+        const bitrate = Math.min(40_000_000, Math.max(6_000_000, Math.round(w * h * fps * 0.12)));
+
+        // Pick a supported codec (VP9 preferred, then VP8).
+        let codecStr = '', muxCodec = 'V_VP9';
+        for (const [c, m] of [['vp09.00.10.08', 'V_VP9'], ['vp8', 'V_VP8']] as const) {
+            try {
+                const sup = await VE.isConfigSupported({ codec: c, width: w, height: h, bitrate, framerate: fps });
+                if (sup && sup.supported) { codecStr = c; muxCodec = m; break; }
+            } catch { /* try next */ }
+        }
+        if (!codecStr) { this.startRecording(rect); return; }   // fall back to real-time
+
+        const target = new ArrayBufferTarget();
+        const muxer = new Muxer({ target, video: { codec: muxCodec, width: w, height: h, frameRate: fps } });
+        let encErr: any = null;
+        const encoder = new VE({
+            output: (chunk: any, meta: any) => muxer.addVideoChunk(chunk, meta),
+            error:  (e: any) => { encErr = e; },
+        });
+        encoder.configure({ codec: codecStr, width: w, height: h, bitrate, framerate: fps, latencyMode: 'realtime' });
+
+        // Capture target: downscaled (and cropped) copy of the live canvas. Drawing
+        // from the canvas on the GPU avoids a per-frame readback + CPU pixel copy.
+        const tcanvas = document.createElement('canvas');
+        tcanvas.width = w; tcanvas.height = h;
+        const tctx = tcanvas.getContext('2d');
+        if (!tctx) { try { encoder.close(); } catch {} this.startRecording(rect); return; }
+
+        const VF: any = (window as any).VideoFrame;
+        this.isRecording = true;
+        this.isRenderingVideo = true;
+        this.renderCancel = false;
+        const savedAutoPause = this.autoPause;
+        this.autoPause = false;
+
+        let ok = false;
+        try {
+            for (let i = 0; i < total; i++) {
+                if (this.renderCancel || encErr) break;
+                await this.sim.stepAndAwait();   // deterministic physics step + on-screen render
+                // Blit (downscale + crop) the freshly-rendered canvas into the target,
+                // then hand it straight to the encoder — no readback, no CPU copy.
+                tctx.drawImage(this.canvas, rect.x, rect.y, rect.w, rect.h, 0, 0, w, h);
+                const frame = new VF(tcanvas, {
+                    timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps),
+                });
+                encoder.encode(frame, { keyFrame: i % 60 === 0 });
+                frame.close();
+                this.syncRenderProgress(i + 1, total);
+                // Drain encoder backpressure and yield so the UI stays responsive
+                // (progress repaint + cancel clicks) and GPU memory doesn't pile up.
+                while (encoder.encodeQueueSize > 6 && !this.renderCancel) {
+                    await new Promise(r => setTimeout(r, 0));
+                }
+                // Yield to the UI occasionally (repaint progress + allow cancel)
+                // without paying a full frame-wait every step.
+                if (i % 8 === 0) await new Promise(r => requestAnimationFrame(() => r(null)));
+            }
+            if (!this.renderCancel && !encErr) {
+                await encoder.flush();
+                muxer.finalize();
+                const blob = new Blob([target.buffer], { type: 'video/webm' });
+                if (blob.size) this.downloadBlob(blob, this.exportFilename(`${w}x${h}-${this.videoDurationSec}s`, 'webm'));
+                ok = true;
+            }
+        } catch (e) {
+            console.error('Video render failed:', e);
+        } finally {
+            try { encoder.close(); } catch { /* already closed */ }
+            this.autoPause = savedAutoPause;
+            this.isRecording = false;
+            this.isRenderingVideo = false;
+            this.renderCancel = false;
+            this.syncRecordButtons(0);
+            if (encErr && !ok) alert('Video render failed (encoder error). See console.');
+        }
+    }
+
+    private syncRenderProgress(done: number, total: number): void {
+        const pct = Math.round(done / total * 100);
+        const full = document.getElementById('recordFullBtn');
+        if (full) full.innerHTML = `&#9209; Rendering ${pct}% · cancel`;
+        const sel = document.getElementById('recordSelBtn');
+        if (sel) { sel.classList.add('disabled-look'); sel.innerHTML = '&#9209; cancel'; }
+    }
+
+    private pickVideoMime(): string {
+        const cands = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4'];
+        for (const c of cands) {
+            if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(c)) return c;
+        }
+        return '';
+    }
+
+    // Record the live simulation over the given canvas-pixel rect for the chosen
+    // duration. A 2D record canvas is blitted from the WebGPU canvas each frame
+    // (so we can crop to a sub-region) and captured via MediaRecorder.
+    private startRecording(rect: { x: number; y: number; w: number; h: number }): void {
+        if (this.isRecording || !this.sim) return;
+        if (typeof MediaRecorder === 'undefined') { alert('Video recording is not supported in this browser.'); return; }
+        const mime = this.pickVideoMime();
+        const w = Math.max(2, Math.round(rect.w)), h = Math.max(2, Math.round(rect.h));
+        const fps = 30;
+
+        // Whole canvas → capture its stream directly (most reliable). A sub-region →
+        // blit the crop into a 2D record canvas each frame and capture that.
+        const fullCanvas = rect.x === 0 && rect.y === 0 && w === this.canvas.width && h === this.canvas.height;
+        let stream: MediaStream;
+        let perFrame: (() => void) | null = null;
+        if (fullCanvas) {
+            stream = this.canvas.captureStream(fps);
+        } else {
+            const rc = document.createElement('canvas');
+            rc.width = w; rc.height = h;
+            const rctx = rc.getContext('2d');
+            if (!rctx) return;
+            const bg = this.sim.getBackgroundColor();
+            rctx.fillStyle = `rgb(${Math.round(bg.r * 255)},${Math.round(bg.g * 255)},${Math.round(bg.b * 255)})`;
+            rctx.fillRect(0, 0, w, h);
+            stream = rc.captureStream(fps);
+            perFrame = () => { try { rctx.drawImage(this.canvas, rect.x, rect.y, w, h, 0, 0, w, h); } catch { /* frame not ready */ } };
+        }
+        // Bitrate scaled to area, capped — high enough to keep particle detail crisp.
+        const bitrate = Math.min(40_000_000, Math.max(6_000_000, Math.round(w * h * fps * 0.15)));
+        let rec: MediaRecorder;
+        try {
+            rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: bitrate } : { videoBitsPerSecond: bitrate });
+        } catch {
+            alert('Could not start video recording.');
+            return;
+        }
+        const chunks: BlobPart[] = [];
+        rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+        rec.onstop = () => {
+            const type = rec.mimeType || mime || 'video/webm';
+            const ext  = type.includes('mp4') ? 'mp4' : 'webm';
+            const blob = new Blob(chunks, { type });
+            if (blob.size) this.downloadBlob(blob, this.exportFilename(`${w}x${h}-${this.videoDurationSec}s`, ext));
+            stream.getTracks().forEach(t => t.stop());
+        };
+
+        // Per-frame blit (sub-region only): runs in the animation loop after render.
+        this.recordCopy = perFrame;
+
+        rec.start();
+        this.isRecording = true;
+        this.recorder = rec;
+        const endAt = performance.now() + this.videoDurationSec * 1000;
+        this.recordStopTimer = window.setTimeout(() => this.stopRecording(), this.videoDurationSec * 1000);
+        this.recordCountdownTimer = window.setInterval(() => {
+            const left = Math.max(0, Math.ceil((endAt - performance.now()) / 1000));
+            this.syncRecordButtons(left);
+        }, 250);
+        this.syncRecordButtons(this.videoDurationSec);
+    }
+
+    private stopRecording(): void {
+        if (!this.isRecording) return;
+        window.clearTimeout(this.recordStopTimer);
+        window.clearInterval(this.recordCountdownTimer);
+        this.recordCopy = null;
+        try { this.recorder?.stop(); } catch { /* already stopped */ }
+        this.recorder = null;
+        this.isRecording = false;
+        this.syncRecordButtons(0);
+    }
+
+    private syncRecordButtons(secondsLeft: number): void {
+        const full = document.getElementById('recordFullBtn');
+        const sel  = document.getElementById('recordSelBtn');
+        const rec  = this.isRecording;
+        if (full) {
+            full.classList.toggle('active', rec);
+            full.innerHTML = rec ? `&#9209; Recording… ${secondsLeft}s` : '&#9210; Record Full Video';
+        }
+        if (sel && !(this.photoSelMode && this.photoSelTarget === 'video')) {
+            sel.classList.toggle('disabled-look', rec);
+            sel.innerHTML = rec ? '&#9210; Recording…' : '&#9210; Select &amp; Record Video';
         }
     }
 
@@ -973,6 +1731,13 @@ class ParticleLifeApp {
     private refreshTransformMatrix(): void {
         this.buildTransformMatrix();
         this.buildPolePanel();
+        this.syncPoleFrameButtons();
+    }
+
+    private syncPoleFrameButtons(): void {
+        const world = this.sim?.getPoleFrame() ?? false;
+        document.getElementById('poleFrameVelBtn')?.classList.toggle('selected', !world);
+        document.getElementById('poleFrameWorldBtn')?.classList.toggle('selected', world);
     }
 
     private refreshMassTable(): void {
@@ -1011,6 +1776,486 @@ class ParticleLifeApp {
             hintCell.textContent    = `mass ${masses[t] ?? 1}`;
             inp.addEventListener('change', () => { hintCell.textContent = `mass ${inp.value}`; });
         }
+    }
+
+    private patchHint(v: number): string {
+        switch (v) {
+            case 0:  return 'isotropic';
+            case 2:  return 'chains';
+            case 3:  return 'sheets';
+            case 4:  return 'lattice';
+            case 5:  return 'cluster';
+            case 6:  return 'hex';
+            default: return '';
+        }
+    }
+
+    // Push the simulation's current bonding params back into the patchy sliders
+    // (after import or a Randomize-bonding action).
+    private syncPatchSliders(): void {
+        if (!this.sim) return;
+        const pp = this.sim.getPatchParams();
+        const setSlider = (id: string, valId: string, v: number, txt: string) => {
+            (document.getElementById(id) as HTMLInputElement).value = String(v);
+            document.getElementById(valId)!.textContent = txt;
+        };
+        setSlider('patchRangeSlider',    'patchRangeValue',    pp.bondRange,    String(Math.round(pp.bondRange)));
+        setSlider('patchWidthSlider',    'patchWidthValue',    pp.patchWidth,   String(Math.round(pp.patchWidth)));
+        setSlider('patchIsoSlider',      'patchIsoValue',      pp.isoScale,     pp.isoScale.toFixed(2));
+        setSlider('patchAngSlider',      'patchAngValue',      pp.angStiffness, pp.angStiffness.toFixed(2));
+        const spinDamp = 1 - pp.angFriction;  // slider = 1 - stored multiplier
+        setSlider('patchAngFricSlider',  'patchAngFricValue',  spinDamp, spinDamp.toFixed(2));
+    }
+
+    // Refresh everything in the patchy panel (sliders, per-type table, affinity grid).
+    private refreshPatchUI(): void {
+        this.syncPatchSliders();
+        this.refreshPatchTable();
+        this.buildAffinityMatrix();
+    }
+
+    private refreshPatchTable(): void {
+        const tbl = document.getElementById('patch-table') as HTMLTableElement;
+        if (!tbl || !this.sim) return;
+        tbl.innerHTML = '';
+        const n       = this.sim.getNumTypes();
+        const patches = this.sim.getPatchCount();
+        const strs    = this.sim.getPatchTypeBondStr();
+        const dists   = this.sim.getPatchTypeBondDist();
+
+        const hdr = tbl.insertRow();
+        ['', 'type', 'valence', 'strength', 'rest'].forEach(h => {
+            const th = document.createElement('th');
+            th.textContent = h;
+            th.style.cssText = 'font-size:9px;color:#666;text-align:left;font-weight:normal;padding:0 4px 2px';
+            hdr.appendChild(th);
+        });
+
+        const numInput = (val: number, min: number, max: number, step: number, onset: (v: number) => void) => {
+            const inp = document.createElement('input');
+            inp.type = 'number';
+            inp.min = String(min); inp.max = String(max); inp.step = String(step);
+            inp.value = String(val);
+            inp.addEventListener('change', () => {
+                const v = Math.max(min, Math.min(max, Number(inp.value)));
+                inp.value = String(v);
+                onset(v);
+            });
+            return inp;
+        };
+
+        for (let t = 0; t < n; t++) {
+            const row    = tbl.insertRow();
+            const swCell = row.insertCell();
+            const swatch = document.createElement('span');
+            swatch.className = 'mass-swatch';
+            swatch.style.background = TYPE_HEX[t];
+            swCell.appendChild(swatch);
+
+            const labelCell = row.insertCell();
+            labelCell.textContent = TYPE_LABELS[t];
+            labelCell.style.color = TYPE_HEX[t];
+
+            // Valence
+            const vInp = numInput(patches[t] ?? 0, 0, 6, 1, v => {
+                let nv = Math.round(v);
+                if (nv === 1) nv = 2;  // single patch is degenerate
+                vInp.value = String(nv);
+                this.sim?.setPatchCount(t, nv);
+            });
+            row.insertCell().appendChild(vInp);
+
+            // Per-type bond strength
+            row.insertCell().appendChild(
+                numInput(Math.round((strs[t] ?? 0) * 100) / 100, 0, 2, 0.05, v => this.sim?.setPatchTypeBond(t, v, undefined)));
+
+            // Per-type rest length
+            row.insertCell().appendChild(
+                numInput(Math.round(dists[t] ?? 26), 2, 150, 1, v => this.sim?.setPatchTypeBond(t, undefined, v)));
+        }
+    }
+
+    // Bond-affinity matrix: who bonds whom. Click a cell to cycle 0 -> 0.5 -> 1.
+    private buildAffinityMatrix(): void {
+        const table = document.getElementById('affinity-table') as HTMLTableElement;
+        if (!table || !this.sim) return;
+        table.innerHTML = '';
+        const n = this.sim.getNumTypes();
+
+        const hdr = document.createElement('tr');
+        hdr.innerHTML = '<th></th>' + TYPE_LABELS.slice(0, n).map((lbl, i) =>
+            `<th><span class="type-pip" style="background:${TYPE_HEX[i]}"></span>${lbl}</th>`).join('');
+        table.appendChild(hdr);
+
+        const paint = (td: HTMLTableCellElement, v: number) => {
+            td.textContent = v > 0 ? v.toFixed(1) : '';
+            const a = Math.min(1, v);
+            td.style.background = v > 0 ? `rgba(120,200,140,${0.15 + 0.5 * a})` : 'rgba(255,255,255,0.03)';
+        };
+
+        for (let from = 0; from < n; from++) {
+            const row = document.createElement('tr');
+            row.innerHTML = `<th class="row-header"><span class="type-pip" style="background:${TYPE_HEX[from]}"></span>${TYPE_LABELS[from]}</th>`;
+            for (let to = 0; to < n; to++) {
+                const td = document.createElement('td');
+                td.className = 'mcell';
+                paint(td, this.sim.getAffinity(from, to));
+                td.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const cur = this.sim!.getAffinity(from, to);
+                    const next = cur <= 0 ? 0.5 : (cur < 1 ? 1 : 0);  // cycle 0 -> .5 -> 1 -> 0
+                    this.sim!.setAffinity(from, to, next);
+                    paint(td, next);
+                });
+                row.appendChild(td);
+            }
+            table.appendChild(row);
+        }
+    }
+
+    // ── QFT panel (mode 6) ──────────────────────────────────────────────────────
+    private refreshQftPanel(): void {
+        if (!this.sim) return;
+        (document.getElementById('qftFieldCount') as HTMLInputElement).value = String(this.sim.getNumFields());
+        const temp = this.sim.getQftTemperature();
+        (document.getElementById('qftTempSlider') as HTMLInputElement).value = String(temp);
+        document.getElementById('qftTempValue')!.textContent = temp.toFixed(2);
+        const rate = this.sim.getMaxTransformRate();
+        (document.getElementById('qftMaxSlider') as HTMLInputElement).value = String(rate);
+        document.getElementById('qftMaxValue')!.textContent = rate.toFixed(2);
+        this.buildQftFieldTable();
+        this.buildQftMatrix('qft-charge-table', this.sim.getCharges(), (t, f, v) => this.sim?.setCharge(t, f, v));
+        this.buildQftMatrix('qft-susc-table',   this.sim.getSusc(),    (t, f, v) => this.sim?.setSusc(t, f, v));
+        this.buildQftTransformMatrix();
+    }
+
+    // Type × field grid of transform rules; a cell is tinted if it has a rule.
+    private buildQftTransformMatrix(): void {
+        const table = document.getElementById('qft-transform-table') as HTMLTableElement;
+        if (!table || !this.sim) return;
+        table.innerHTML = '';
+        const n = this.sim.getNumTypes();
+        const fields = this.sim.getFields();
+        const rules = this.sim.getQftTransform();
+        
+        const hdr = document.createElement('tr');
+        // Skip field 0 (exc) — never a transform trigger.
+        hdr.innerHTML = '<th></th>' + fields.slice(1).map(fd => `<th>${fd.name}</th>`).join('');
+        table.appendChild(hdr);
+
+        for (let t = 0; t < n; t++) {
+            const row = document.createElement('tr');
+            const th = document.createElement('th');
+            th.className = 'row-header';
+            th.innerHTML = `<span class="type-pip" style="background:${TYPE_HEX[t]}"></span>${TYPE_LABELS[t]}`;
+            row.appendChild(th);
+            for (let f = 1; f < fields.length; f++) {
+                const r = rules[t * MAX_FIELDS + f];
+                const td = document.createElement('td');
+                td.className = 'mcell';
+                const up = r?.upperEnabled, lo = r?.lowerEnabled;
+                td.textContent = up && lo ? '↕' : up ? '↑' : lo ? '↓' : '';
+                td.style.background = (up || lo) ? 'rgba(120,200,140,0.4)' : 'rgba(255,255,255,0.03)';
+                td.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.qftEditCell = (this.qftEditCell && this.qftEditCell.type === t && this.qftEditCell.field === f) ? null : { type: t, field: f };
+                    this.buildQftTransformEditor();
+                });
+                row.appendChild(td);
+            }
+            table.appendChild(row);
+        }
+        this.buildQftTransformEditor();
+    }
+
+    private buildQftTransformEditor(): void {
+        const host = document.getElementById('qft-transform-editor');
+        if (!host || !this.sim) return;
+        host.innerHTML = '';
+        const cell = this.qftEditCell;
+        if (!cell) return;
+                const n = this.sim.getNumTypes();
+        const fields = this.sim.getFields();
+        const rule = { ...this.sim.getQftTransform()[cell.type * MAX_FIELDS + cell.field] };
+        const commit = () => this.sim!.setQftTransform(cell.type, cell.field, rule);
+
+        const wrap = document.createElement('div');
+        wrap.className = 'dnf-edit';
+        const title = document.createElement('div');
+        title.className = 'dnf-section';
+        title.innerHTML = `<span style="color:${TYPE_HEX[cell.type]}">${TYPE_LABELS[cell.type]}</span> · force in field <strong>${fields[cell.field]?.name ?? cell.field}</strong>`;
+        wrap.appendChild(title);
+
+        const targetSel = (val: number, onset: (v: number) => void) => {
+            const sel = document.createElement('select');
+            for (let i = 0; i < n; i++) {
+                const o = document.createElement('option');
+                o.value = String(i); o.textContent = TYPE_LABELS[i];
+                if (i === val) o.selected = true;
+                sel.appendChild(o);
+            }
+            sel.addEventListener('change', () => { onset(Number(sel.value)); commit(); this.buildQftTransformMatrix(); });
+            return sel;
+        };
+        const numIn = (val: number, onset: (v: number) => void) => {
+            const inp = document.createElement('input');
+            inp.type = 'number'; inp.step = '0.5'; inp.min = '-50'; inp.max = '50'; inp.value = String(val);
+            inp.addEventListener('change', () => { onset(Number(inp.value) || 0); commit(); });
+            return inp;
+        };
+        const half = (label: string, enabled: boolean, thr: number, tgt: number,
+                      setEn: (b: boolean) => void, setThr: (v: number) => void, setTgt: (v: number) => void) => {
+            const line = document.createElement('div');
+            line.className = 'dnf-line';
+            const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = enabled;
+            cb.addEventListener('change', () => { setEn(cb.checked); commit(); this.buildQftTransformMatrix(); });
+            line.appendChild(cb);
+            line.appendChild(document.createTextNode(label));
+            line.appendChild(numIn(thr, setThr));
+            line.appendChild(document.createTextNode('→'));
+            line.appendChild(targetSel(tgt, setTgt));
+            wrap.appendChild(line);
+        };
+        half('force >', rule.upperEnabled, rule.upperThreshold, rule.upperTarget,
+             b => rule.upperEnabled = b, v => rule.upperThreshold = v, v => rule.upperTarget = v);
+        half('force <', rule.lowerEnabled, rule.lowerThreshold, rule.lowerTarget,
+             b => rule.lowerEnabled = b, v => rule.lowerThreshold = v, v => rule.lowerTarget = v);
+        host.appendChild(wrap);
+    }
+
+    private buildQftFieldTable(): void {
+        const tbl = document.getElementById('qft-field-table') as HTMLTableElement;
+        if (!tbl || !this.sim) return;
+        tbl.innerHTML = '';
+        const fields = this.sim.getFields();
+        const hdr = tbl.insertRow();
+        ['field', 'range', 'strength'].forEach(h => {
+            const th = document.createElement('th');
+            th.textContent = h;
+            th.style.cssText = 'font-size:9px;color:#666;text-align:left;font-weight:normal;padding:0 4px 2px';
+            hdr.appendChild(th);
+        });
+        const numInput = (val: number, step: number, onset: (v: number) => void) => {
+            const inp = document.createElement('input');
+            inp.type = 'number'; inp.step = String(step); inp.value = String(val);
+            inp.addEventListener('change', () => onset(Number(inp.value) || 0));
+            return inp;
+        };
+        fields.forEach((fd, f) => {
+            const row = tbl.insertRow();
+            const nameCell = row.insertCell();
+            nameCell.textContent = fd.name;
+            nameCell.style.cssText = f === 0 ? 'color:#e88;font-weight:bold' : 'color:#9bd';
+            row.insertCell().appendChild(numInput(Math.round(fd.range), 1, v => this.sim?.setFieldParam(f, Math.max(0, v), undefined)));
+            row.insertCell().appendChild(numInput(Math.round(fd.strength * 100) / 100, 0.1, v => this.sim?.setFieldParam(f, undefined, v)));
+        });
+    }
+
+    private buildQftMatrix(tableId: string, data: number[][], onset: (t: number, f: number, v: number) => void): void {
+        const table = document.getElementById(tableId) as HTMLTableElement;
+        if (!table || !this.sim) return;
+        table.innerHTML = '';
+        const n = this.sim.getNumTypes();
+        const fields = this.sim.getFields();
+
+        const hdr = document.createElement('tr');
+        hdr.innerHTML = '<th></th>' + fields.map(fd => `<th>${fd.name}</th>`).join('');
+        table.appendChild(hdr);
+
+        for (let t = 0; t < n; t++) {
+            const row = document.createElement('tr');
+            const th = document.createElement('th');
+            th.className = 'row-header';
+            th.innerHTML = `<span class="type-pip" style="background:${TYPE_HEX[t]}"></span>${TYPE_LABELS[t]}`;
+            row.appendChild(th);
+            for (let f = 0; f < fields.length; f++) {
+                const td = document.createElement('td');
+                const inp = document.createElement('input');
+                inp.type = 'number'; inp.step = '0.1';
+                inp.value = String(Math.round((data[t]?.[f] ?? 0) * 100) / 100);
+                inp.style.cssText = 'width:42px;font-size:9px;background:#1a1a1a;color:#ddd;border:1px solid #333;border-radius:3px;';
+                inp.addEventListener('change', () => onset(t, f, Number(inp.value) || 0));
+                td.appendChild(inp);
+                row.appendChild(td);
+            }
+            table.appendChild(row);
+        }
+    }
+
+    // ── DNF rules panel (mode 5 / Transform #2) ─────────────────────────────────
+    private refreshDnfPanel(): void {
+        if (!this.sim) return;
+        const rate = this.sim.getMaxTransformRate();
+        const slider = document.getElementById('dnfMaxSlider') as HTMLInputElement | null;
+        if (slider) { slider.value = String(rate); document.getElementById('dnfMaxValue')!.textContent = rate.toFixed(2); }
+        this.buildDnfList();
+    }
+
+    // Human-readable "C1: G>0.25  C2: B>1  →  P if (C1 and C2)" for one type.
+    private dnfSummary(dt: { conditions: DnfCondition[]; rules: DnfRule[] }): string {
+        if (!dt.conditions.length && !dt.rules.length) return '<span class="empty">(no rules — never transforms)</span>';
+        const conds = dt.conditions.map((c, i) =>
+            `<span class="dnf-cref">C${i + 1}</span>:<span style="color:${TYPE_HEX[c.trigger]}">${TYPE_LABELS[c.trigger]}</span>${DNF_OPSYM[c.op]}${c.threshold}`).join('  ');
+        const rules = dt.rules.length
+            ? dt.rules.map(r => `→<span style="color:${TYPE_HEX[r.target]}">${TYPE_LABELS[r.target]}</span> if <code>${r.expr || '∅'}</code>`).join('  ')
+            : '<span class="empty">(no transform)</span>';
+        return `${conds}${conds ? '  ' : ''}${rules}`;
+    }
+
+    private buildDnfList(): void {
+        const list = document.getElementById('dnf-list');
+        if (!list || !this.sim) return;
+        list.innerHTML = '';
+        const n = this.sim.getNumTypes();
+        const types = this.sim.getDnfTypes();
+
+        for (let t = 0; t < n; t++) {
+            const row = document.createElement('div');
+            row.className = 'dnf-row';
+            row.innerHTML =
+                `<span class="dnf-src" style="color:${TYPE_HEX[t]}">${TYPE_LABELS[t]}</span>` +
+                `<span class="dnf-summary">${this.dnfSummary(types[t] ?? { conditions: [], rules: [] })}</span>`;
+            row.addEventListener('click', () => {
+                this.dnfEditType = this.dnfEditType === t ? null : t;
+                this.buildDnfList();
+            });
+            list.appendChild(row);
+
+            if (this.dnfEditType === t) {
+                const editor = this.buildDnfEditor(t);
+                editor.addEventListener('click', (e) => e.stopPropagation());
+                list.appendChild(editor);
+            }
+        }
+    }
+
+    private dnfTypeSelect(val: number, onset: (v: number) => void): HTMLSelectElement {
+        const n = this.sim!.getNumTypes();
+        const sel = document.createElement('select');
+        for (let i = 0; i < n; i++) {
+            const o = document.createElement('option');
+            o.value = String(i); o.textContent = TYPE_LABELS[i];
+            if (i === val) o.selected = true;
+            sel.appendChild(o);
+        }
+        sel.addEventListener('change', () => onset(Number(sel.value)));
+        return sel;
+    }
+
+    // Inline editor for one source type: a list of force conditions plus a list of
+    // transform rules (target + boolean expression over the conditions). Mutates a
+    // working copy and commits to the sim on every change.
+    private buildDnfEditor(t: number): HTMLElement {
+        const dt = this.sim!.getDnfTypes()[t] ?? { conditions: [], rules: [] };
+        const conditions: DnfCondition[] = dt.conditions.map(c => ({ ...c }));
+        const rules: DnfRule[] = dt.rules.map(r => ({ target: r.target, expr: r.expr, rpn: r.rpn.slice() }));
+        const commit = () => this.sim!.setDnfType(t, conditions, rules);
+        const rebuild = () => { commit(); const fresh = this.buildDnfEditor(t); wrap.replaceWith(fresh); fresh.addEventListener('click', e => e.stopPropagation()); };
+
+        const wrap = document.createElement('div');
+        wrap.className = 'dnf-edit';
+
+        // ── Conditions ───────────────────────────────────────────────────────
+        const cHead = document.createElement('div');
+        cHead.className = 'dnf-section'; cHead.textContent = 'Conditions (force from a type vs threshold)';
+        wrap.appendChild(cHead);
+
+        conditions.forEach((cd, ci) => {
+            const line = document.createElement('div');
+            line.className = 'dnf-line';
+            const tag = document.createElement('span');
+            tag.className = 'dnf-cref'; tag.textContent = `C${ci + 1}`;
+            line.appendChild(tag);
+            line.appendChild(document.createTextNode('force of'));
+            line.appendChild(this.dnfTypeSelect(cd.trigger, v => { cd.trigger = v; commit(); }));
+
+            const opSel = document.createElement('select');
+            DNF_OPSYM.forEach((sym, v) => {
+                const o = document.createElement('option');
+                o.value = String(v); o.textContent = sym;
+                if (v === cd.op) o.selected = true;
+                opSel.appendChild(o);
+            });
+            opSel.addEventListener('change', () => { cd.op = Number(opSel.value) as 0 | 1 | 2 | 3; commit(); });
+            line.appendChild(opSel);
+
+            const thr = document.createElement('input');
+            thr.type = 'number'; thr.step = '0.05'; thr.min = '-50'; thr.max = '50'; thr.value = String(cd.threshold);
+            thr.addEventListener('change', () => { cd.threshold = Number(thr.value) || 0; thr.value = String(cd.threshold); commit(); });
+            line.appendChild(thr);
+
+            const del = document.createElement('button');
+            del.textContent = '✕'; del.title = 'remove condition';
+            del.addEventListener('click', () => { conditions.splice(ci, 1); rebuild(); });
+            line.appendChild(del);
+            wrap.appendChild(line);
+        });
+
+        if (conditions.length < MAX_DNF_CONDITIONS) {
+            const add = document.createElement('button');
+            add.textContent = '+ condition';
+            add.style.alignSelf = 'flex-start';
+            add.addEventListener('click', () => { conditions.push({ trigger: 0, op: 0, threshold: 0.25 }); rebuild(); });
+            wrap.appendChild(add);
+        }
+
+        // ── Transform rules ──────────────────────────────────────────────────
+        const rHead = document.createElement('div');
+        rHead.className = 'dnf-section'; rHead.textContent = 'Transforms (first true rule wins)';
+        wrap.appendChild(rHead);
+
+        rules.forEach((ru, ri) => {
+            const line = document.createElement('div');
+            line.className = 'dnf-line';
+            line.appendChild(document.createTextNode('become'));
+            line.appendChild(this.dnfTypeSelect(ru.target, v => { ru.target = v; commit(); }));
+            line.appendChild(document.createTextNode('if'));
+
+            const expr = document.createElement('input');
+            expr.type = 'text'; expr.className = 'dnf-expr';
+            expr.placeholder = 'e.g. (C1 and C2) or C3';
+            expr.value = ru.expr;
+            const status = document.createElement('span');
+            status.className = 'dnf-status';
+            const validate = () => {
+                const res = compileBoolExpr(expr.value, conditions.length);
+                ru.expr = expr.value;
+                ru.rpn = res.rpn;
+                if (res.error) { status.textContent = '✗ ' + res.error; status.style.color = '#e66'; }
+                else if (!expr.value.trim()) { status.textContent = ''; }
+                else { status.textContent = '✓'; status.style.color = '#6c6'; }
+                commit();
+            };
+            expr.addEventListener('input', validate);
+            line.appendChild(expr);
+
+            const del = document.createElement('button');
+            del.textContent = '✕'; del.title = 'remove transform';
+            del.addEventListener('click', () => { rules.splice(ri, 1); rebuild(); });
+            line.appendChild(del);
+            wrap.appendChild(line);
+
+            const statusLine = document.createElement('div');
+            statusLine.className = 'dnf-line';
+            statusLine.style.minHeight = '12px';
+            statusLine.appendChild(status);
+            wrap.appendChild(statusLine);
+            validate();
+        });
+
+        if (rules.length < MAX_DNF_RULES) {
+            const n = this.sim!.getNumTypes();
+            const add = document.createElement('button');
+            add.textContent = '+ transform';
+            add.style.alignSelf = 'flex-start';
+            add.addEventListener('click', () => {
+                rules.push({ target: (t + 1) % Math.max(1, n), expr: conditions.length ? 'C1' : '', rpn: [] });
+                rebuild();
+            });
+            wrap.appendChild(add);
+        }
+
+        return wrap;
     }
 
     private buildPolePanel(): void {
@@ -1106,7 +2351,7 @@ class ParticleLifeApp {
         title.innerHTML = `${pip(from)}${TYPE_LABELS[from]} → ${pip(to)}${TYPE_LABELS[to]} <span style="color:#888">${kindLabel}</span>`;
 
         if (kind === 'strength') {
-            Object.assign(slider, { min: '-1', max: '1', step: '0.01' });
+            Object.assign(slider, { min: '-5', max: '5', step: '0.05' });
             display.textContent = cur.toFixed(2);
             row2.style.display = 'none';
         } else if (kind === 'radius') {
@@ -1330,10 +2575,10 @@ class ParticleLifeApp {
         this.closeForceEditor();
         this.closeTransformEditor();
 
-        // Apply world size to canvas before handing off to sim
+        // The world size is applied to the sim (below); the canvas just fills the window.
         const w = Number(state.worldWidth)  || 1600;
         const h = Number(state.worldHeight) || 900;
-        this.setCanvasSize(w, h);
+        this.fitCanvas();
 
         this.sim.importState(state);
 
@@ -1347,7 +2592,7 @@ class ParticleLifeApp {
         document.getElementById('speedValue')!.textContent = `${this.sim.getParams().simulationSpeed.toFixed(1)}×`;
         document.getElementById('particleCountDisplay')!.textContent = String(this.sim.getParams().particleCount);
 
-        const simMode  = this.sim.getSimMode()  as 0 | 1 | 2;
+        const simMode  = this.sim.getSimMode()  as 0 | 1 | 2 | 3 | 4 | 5 | 6;
         const edgeMode = this.sim.getEdgeMode() as 0 | 1;
         this.setSimMode(simMode);
         document.getElementById('edgeLoopBtn')!.classList.toggle('selected', edgeMode === 0);
@@ -1376,13 +2621,18 @@ class ParticleLifeApp {
         this.setBlendMode(this.sim.getBlendMode() as 0 | 1);
         this.setShapeMode(this.sim.getShapeMode() as 0 | 1);
 
-        const friction = this.sim.getFriction();
-        (document.getElementById('frictionSlider') as HTMLInputElement).value = String(friction);
-        document.getElementById('frictionValue')!.textContent = friction.toFixed(2);
+        // Slider shows drag = 1 - stored multiplier (see input handler).
+        const drag = 1 - this.sim.getFriction();
+        (document.getElementById('frictionSlider') as HTMLInputElement).value = String(drag);
+        document.getElementById('frictionValue')!.textContent = drag.toFixed(2);
 
         const maxTransform = this.sim.getMaxTransformRate();
         (document.getElementById('maxTransformSlider') as HTMLInputElement).value = String(maxTransform);
         document.getElementById('maxTransformValue')!.textContent = maxTransform.toFixed(2);
+
+        this.refreshPatchUI();
+        this.refreshDnfPanel();
+        this.refreshQftPanel();
 
         this.refreshForceMatrices();
         this.refreshTransformMatrix();  // also calls buildPolePanel()
@@ -1443,9 +2693,13 @@ class ParticleLifeApp {
                     this.sim.eraseParticlesInBrush(wx, wy, this.brushWorldRadius, 1.0, -1);
                 }
             }
-            this.sim?.update();
+            // During an offline render the render loop drives the sim itself; skip
+            // the normal step so we don't advance/capture frames twice.
+            if (!this.isRenderingVideo) this.sim?.update();
             this.updateStats();
             this.drawOverlay();
+            // Blit the freshly-rendered frame into the video record canvas, if active.
+            this.recordCopy?.();
             this.animId = requestAnimationFrame(tick);
         };
         this.animId = requestAnimationFrame(tick);
@@ -1456,11 +2710,12 @@ class ParticleLifeApp {
     async initialize(): Promise<void> {
         const worldW = parseInt((document.getElementById('worldW') as HTMLInputElement).value) || 4800;
         const worldH = parseInt((document.getElementById('worldH') as HTMLInputElement).value) || 2700;
-        this.setCanvasSize(worldW, worldH);
+        this.fitCanvas();   // canvas (viewport) fills the window
 
         this.sim = new ParticleSimulation(this.canvas);
         try {
             await this.sim.initialize();
+            this.sim.setWorldSize(worldW, worldH);   // world is independent of the viewport
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             document.body.innerHTML = `<div style="color:#f44;padding:40px;font-family:monospace;font-size:14px;">
@@ -1480,6 +2735,8 @@ class ParticleLifeApp {
         this.buildTransformMatrix();
         this.buildPolePanel();
         this.refreshPaintTypePicker();
+        this.syncExportButtons();
+        this.syncPoleFrameButtons();
 
         this.startLoop();
     }

@@ -5,9 +5,39 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Particle Life Simulator</title>
     <style>
+        :root {
+            --accent:        #8ab4d6;                    /* desaturated steel blue — reads as UI, not particle */
+            --accent-bright: #c2dcf0;
+            --accent-tint:   rgba(138,180,214,0.16);
+            --accent-line:   rgba(138,180,214,0.55);
+
+            --panel:         rgba(15,17,23,0.62);        /* translucent glass */
+            --panel-strong:  rgba(15,17,23,0.86);
+            --elev:          rgba(255,255,255,0.045);    /* input / button surface */
+            --elev-hi:       rgba(255,255,255,0.09);
+            --border:        rgba(255,255,255,0.09);
+            --border-hi:     rgba(255,255,255,0.20);
+
+            --text:          #d4d9e1;
+            --text-dim:      #8b94a3;
+            --text-faint:    #5a6472;
+
+            --danger:        #e0696b;
+            --good:          #5cc8a0;
+
+            --r-panel: 14px;
+            --r-ctrl:  7px;
+            --blur: blur(16px) saturate(108%);
+        }
+
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-        body { background: #111; font-family: Arial, sans-serif; overflow: hidden; }
+        body {
+            background: #0a0b0e;
+            font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+            overflow: hidden;
+            color: var(--text);
+        }
 
         canvas {
             position: fixed; top: 50%; left: 50%;
@@ -15,73 +45,112 @@
             display: block; background: #000;
         }
 
-        /* ── Side panel ─────────────────────────────────────────────────────── */
+        ::-webkit-scrollbar { width: 9px; height: 9px; }
+        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 6px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.22); }
+        ::-webkit-scrollbar-track { background: transparent; }
+
+        /* ── Left panel ─────────────────────────────────────────────────────── */
         #ui {
             position: fixed; top: 0; left: 0;
             width: 340px; height: 100vh;
-            background: rgba(10,10,14,0.96);
-            color: #ddd; display: flex; flex-direction: column;
+            background: var(--panel);
+            -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+            color: var(--text); display: flex; flex-direction: column;
             font-size: 12px; z-index: 200;
-            border-right: 1px solid #333;
+            border-right: 1px solid var(--border);
+            transition: transform 0.22s ease;
         }
+        #ui.collapsed { transform: translateX(-340px); }
 
-        #ui-header { padding: 10px 14px 8px; border-bottom: 1px solid #333; flex-shrink: 0; }
-        #ui-header h3 { font-size: 13px; color: #0af; margin-bottom: 6px; }
+        #ui-header { padding: 14px 16px 10px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+        #ui-header h3 {
+            font-size: 12px; color: var(--text); margin-bottom: 8px;
+            font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase;
+        }
+        #ui-header h3 .dot {
+            display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+            background: var(--accent); margin-right: 7px; vertical-align: middle;
+            box-shadow: 0 0 8px var(--accent-line);
+        }
         #stats-bar {
-            color: #0f0; font-family: monospace; font-size: 11px;
-            display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+            font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px;
+            display: flex; gap: 11px; flex-wrap: wrap; align-items: center;
+            color: var(--text-faint);
         }
+        #stats-bar b { color: var(--text); font-weight: 600; }
         #stats-bar .ap-label {
-            display: flex; align-items: center; gap: 3px;
-            color: #666; font-size: 10px; cursor: pointer;
+            display: flex; align-items: center; gap: 4px;
+            color: var(--text-faint); cursor: pointer;
         }
-        #stats-bar .ap-label:hover { color: #aaa; }
-        #fps-warn { color: #f84; font-size: 10px; display: none; }
+        #stats-bar .ap-label:hover { color: var(--text-dim); }
+        #stats-bar input[type="checkbox"] { accent-color: var(--accent); }
+        #fps-warn { color: #e0a35a; display: none; }
 
-        /* ── Controls ────────────────────────────────────────────────────────── */
+        /* ── Top controls ──────────────────────────────────────────────────── */
         #ui-controls {
-            padding: 10px 14px; border-bottom: 1px solid #333;
-            flex-shrink: 0; display: flex; flex-direction: column; gap: 8px;
+            padding: 12px 16px; border-bottom: 1px solid var(--border);
+            flex-shrink: 0; display: flex; flex-direction: column; gap: 9px;
         }
-        .ctrl-row { display: flex; align-items: center; gap: 8px; }
-        .ctrl-row label { width: 52px; font-size: 11px; color: #aaa; flex-shrink: 0; }
+        .ctrl-row { display: flex; align-items: center; gap: 10px; }
+        .ctrl-row label { width: 50px; font-size: 11px; color: var(--text-dim); flex-shrink: 0; }
         .ctrl-row input[type="number"] {
-            flex: 1; padding: 3px 6px; background: #1e1e24; color: #ddd;
-            border: 1px solid #444; border-radius: 3px; font-size: 11px;
+            flex: 1; padding: 4px 7px; background: var(--elev); color: var(--text);
+            border: 1px solid var(--border); border-radius: var(--r-ctrl); font-size: 11px;
         }
-        .ctrl-row input[type="range"] { flex: 1; accent-color: #0af; }
-        .ctrl-row .val { font-size: 10px; color: #0af; width: 32px; text-align: right; }
-        .btn-row { display: flex; gap: 6px; }
+        .ctrl-row input[type="number"]:focus { border-color: var(--accent-line); outline: none; }
+        .ctrl-row input[type="range"] { flex: 1; accent-color: var(--accent); }
+        .ctrl-row .val { font-size: 10px; color: var(--accent); width: 34px; text-align: right; font-family: ui-monospace, monospace; }
+        .btn-row { display: flex; gap: 7px; }
 
+        /* ── Buttons (quiet) ───────────────────────────────────────────────── */
         button {
-            flex: 1; padding: 5px 8px; background: #1a2a3a; color: #0af;
-            border: 1px solid #0af; border-radius: 3px; font-size: 11px;
-            cursor: pointer; transition: background 0.15s;
+            flex: 1; padding: 6px 9px; background: var(--elev); color: var(--text);
+            border: 1px solid var(--border); border-radius: var(--r-ctrl); font-size: 11px;
+            cursor: pointer; font-family: inherit;
+            transition: background 0.13s, border-color 0.13s, color 0.13s;
         }
-        button:hover { background: #0af; color: #000; }
-        button.active { background: #0af; color: #000; }
+        button:hover { background: var(--elev-hi); border-color: var(--border-hi); }
+        button.active, button.selected {
+            background: var(--accent-tint); border-color: var(--accent-line); color: var(--accent-bright);
+        }
+        button.disabled-look { opacity: 0.4; cursor: not-allowed; }
+        button.disabled-look:hover { background: var(--elev); border-color: var(--border); }
 
-        /* ── Tabs ────────────────────────────────────────────────────────────── */
-        #tab-bar { display: flex; border-bottom: 1px solid #333; flex-shrink: 0; }
+        /* ── Tabs ──────────────────────────────────────────────────────────── */
+        #tab-bar { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; padding: 0 6px; }
         .tab-btn {
-            flex: 1; padding: 7px 2px; background: transparent; color: #888;
+            flex: 1; padding: 9px 2px; background: transparent; color: var(--text-faint);
             border: none; border-bottom: 2px solid transparent; border-radius: 0;
-            font-size: 10px; cursor: pointer; transition: color 0.15s, border-color 0.15s;
+            font-size: 11px; cursor: pointer; letter-spacing: 0.02em;
+            transition: color 0.15s, border-color 0.15s;
         }
-        .tab-btn:hover { color: #ccc; background: transparent; }
-        .tab-btn.active { color: #0af; border-bottom-color: #0af; background: transparent; }
+        .tab-btn:hover { color: var(--text-dim); background: transparent; }
+        .tab-btn.active { color: var(--accent-bright); border-bottom-color: var(--accent); background: transparent; }
 
-        #tab-content { flex: 1; overflow-y: auto; overflow-x: auto; padding: 10px; }
+        #tab-content { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 14px; }
         .tab-pane { display: none; }
         .tab-pane.active { display: block; }
 
-        /* ── Matrix table ────────────────────────────────────────────────────── */
-        .matrix-wrap { overflow-x: auto; }
-        .matrix-label { font-size: 10px; color: #666; margin-bottom: 6px; }
-        table.matrix { border-collapse: collapse; font-size: 9px; }
+        /* Section heading used inside panes */
+        .pane-head {
+            font-size: 11px; color: var(--text); font-weight: 600;
+            letter-spacing: 0.05em; margin-bottom: 8px;
+            display: flex; align-items: baseline; gap: 8px;
+        }
+        .pane-head span { font-weight: 400; font-size: 9.5px; color: var(--text-faint); letter-spacing: 0; }
+
+        /* ── Matrix tables ─────────────────────────────────────────────────── */
+        /* Wide matrices (up to 20 types) scroll horizontally inside the fixed-width
+           panel. max-width pins the wrap to the panel so the table can't push the
+           layout wider with no way to reach the right-hand columns; padding-bottom
+           leaves room for the horizontal scrollbar so it's always visible. */
+        .matrix-wrap { overflow: auto; max-width: 100%; max-height: 58vh; padding-bottom: 4px; }
+        .matrix-label { font-size: 10px; color: var(--text-faint); margin-bottom: 6px; }
+        table.matrix { border-collapse: collapse; font-size: 9px; width: max-content; }
         table.matrix th {
             padding: 2px 3px; text-align: center; font-weight: normal;
-            color: #aaa; white-space: nowrap;
+            color: var(--text-dim); white-space: nowrap;
         }
         table.matrix th.row-header { text-align: right; padding-right: 5px; }
         .type-pip {
@@ -90,322 +159,299 @@
         }
         table.matrix td.mcell {
             width: 28px; height: 22px; text-align: center; vertical-align: middle;
-            cursor: pointer; border: 1px solid #0001; font-size: 8px;
+            cursor: pointer; border: 1px solid rgba(0,0,0,0.25); font-size: 8px;
             color: rgba(255,255,255,0.85); user-select: none; transition: filter 0.1s;
         }
-        table.matrix td.mcell:hover { filter: brightness(1.5); border-color: #fff4; }
+        table.matrix td.mcell:hover { filter: brightness(1.5); border-color: var(--border-hi); }
+        table.matrix td.tcell {
+            width: 28px; height: 22px; text-align: center; vertical-align: middle;
+            cursor: pointer; border: 1px solid rgba(0,0,0,0.25); font-size: 7.5px; font-weight: bold;
+            user-select: none; transition: filter 0.1s; letter-spacing: -0.5px; line-height: 1.1;
+        }
+        table.matrix td.tcell:hover { filter: brightness(1.5); border-color: var(--border-hi); }
 
-        /* ── Force cell editor popup ─────────────────────────────────────────── */
+        /* ── Force cell editor popup ───────────────────────────────────────── */
         #cell-editor {
-            position: fixed; background: #1a1a22; border: 1px solid #0af;
-            border-radius: 5px; padding: 8px 10px; z-index: 500;
+            position: fixed; background: var(--panel-strong);
+            -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+            border: 1px solid var(--border-hi);
+            border-radius: 8px; padding: 9px 11px; z-index: 500;
             display: none; flex-direction: column; gap: 6px;
-            min-width: 160px; box-shadow: 0 4px 16px #0009;
+            min-width: 164px; box-shadow: 0 8px 28px rgba(0,0,0,0.55);
         }
         #cell-editor.visible { display: flex; }
-        #cell-editor-title { font-size: 10px; color: #0af; }
+        #cell-editor-title { font-size: 10px; color: var(--accent-bright); }
         #cell-editor-row, #cell-editor-row2 { display: flex; align-items: center; gap: 8px; }
-        #cell-slider, #cell-slider2 { flex: 1; accent-color: #0af; }
+        #cell-slider, #cell-slider2 { flex: 1; accent-color: var(--accent); }
         #cell-editor-row2 { display: none; }
-        #cell-editor-label2 { font-size: 9px; color: #888; width: 24px; flex-shrink: 0; }
+        #cell-editor-label2 { font-size: 9px; color: var(--text-dim); width: 24px; flex-shrink: 0; }
         #cell-value-display, #cell-value-display2 {
-            font-size: 11px; color: #fff; width: 38px; text-align: right; font-family: monospace;
+            font-size: 11px; color: #fff; width: 38px; text-align: right; font-family: ui-monospace, monospace;
         }
 
-        /* ── Transform mode tab ─────────────────────────────────────────────── */
-        .mode-toggle-row {
-            display: flex; gap: 6px; margin-bottom: 10px;
-        }
-        .mode-btn {
-            flex: 1; padding: 6px 4px; font-size: 11px;
-        }
-        .mode-btn.selected { background: #0af; color: #000; border-color: #0af; }
+        /* ── Mode / behavior ───────────────────────────────────────────────── */
+        .mode-toggle-row { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
+        .mode-btn { flex: 1 1 auto; min-width: 54px; padding: 7px 4px; font-size: 11px; }
 
-        #transform-panel { display: none; }
-        #transform-panel.visible { display: block; }
+        #transform-panel, #mode2-panel, #mode3-panel, #dnf-panel, #qft-panel { display: none; }
+        #transform-panel.visible, #mode2-panel.visible, #mode3-panel.visible, #dnf-panel.visible, #qft-panel.visible { display: block; }
+        #dnf-list { display: flex; flex-direction: column; gap: 4px; }
+        .dnf-row { display: flex; align-items: flex-start; gap: 6px; padding: 5px 6px; border-radius: 4px;
+                   background: rgba(255,255,255,0.03); cursor: pointer; font-size: 11px; line-height: 1.5; }
+        .dnf-row:hover { background: rgba(255,255,255,0.06); }
+        .dnf-row .dnf-src { font-weight: bold; flex-shrink: 0; width: 16px; }
+        .dnf-row .dnf-summary { flex: 1; color: #bbb; }
+        .dnf-row .dnf-summary .empty { color: #666; font-style: italic; }
+        .dnf-edit { background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.08); border-radius: 4px;
+                    padding: 6px; margin-top: 2px; display: flex; flex-direction: column; gap: 6px; }
+        .dnf-clause { border-left: 2px solid rgba(120,170,255,0.5); padding: 4px 6px; display: flex;
+                      flex-direction: column; gap: 4px; background: rgba(255,255,255,0.02); }
+        .dnf-line { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 11px; }
+        .dnf-edit select, .dnf-edit input[type=number] { font-size: 11px; padding: 1px 2px; background: #1a1a1a;
+                      color: #ddd; border: 1px solid #333; border-radius: 3px; }
+        .dnf-edit input[type=number] { width: 42px; }
+        .dnf-edit button { font-size: 10px; padding: 2px 6px; }
+        .dnf-or { text-align: center; color: #789; font-size: 9px; letter-spacing: 1px; }
+        .dnf-section { color: #8af; font-size: 10px; font-weight: bold; margin-top: 4px; opacity: 0.85; }
+        .dnf-cref { background: rgba(120,170,255,0.18); color: #bcd; border-radius: 3px; padding: 0 3px; font-weight: bold; }
+        .dnf-row code, .dnf-summary code { background: rgba(255,255,255,0.06); padding: 0 3px; border-radius: 3px; color: #ddd; }
+        .dnf-expr { flex: 1; min-width: 120px; font-family: monospace; }
+        .dnf-status { font-size: 10px; }
 
-        #mode2-panel { display: none; }
-        #mode2-panel.visible { display: block; }
-
-        /* ── Mass per-type table ─────────────────────────────────────────────── */
         .mass-table { width: 100%; border-collapse: collapse; margin-top: 6px; }
         .mass-table td { padding: 2px 4px; font-size: 10px; vertical-align: middle; }
         .mass-table .mass-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
         .mass-table input[type=number] {
-            width: 40px; background: #1e1e28; border: 1px solid #333; color: #fff;
-            font-size: 10px; padding: 2px 4px; border-radius: 3px; text-align: center;
+            width: 40px; background: var(--elev); border: 1px solid var(--border); color: #fff;
+            font-size: 10px; padding: 2px 4px; border-radius: 4px; text-align: center;
         }
-        .mass-table input[type=number]:focus { border-color: #0af; outline: none; }
+        .mass-table input[type=number]:focus { border-color: var(--accent-line); outline: none; }
 
-        .tr-hint {
-            font-size: 10px; color: #555; margin-bottom: 8px; line-height: 1.4;
-        }
+        .tr-hint { font-size: 10px; color: var(--text-faint); margin-bottom: 8px; line-height: 1.45; }
 
-        table.matrix td.tcell {
-            width: 28px; height: 22px; text-align: center; vertical-align: middle;
-            cursor: pointer; border: 1px solid #0001; font-size: 7.5px; font-weight: bold;
-            user-select: none; transition: filter 0.1s; letter-spacing: -0.5px;
-            line-height: 1.1;
-        }
-        table.matrix td.tcell:hover { filter: brightness(1.5); border-color: #fff4; }
-
-        /* ── Transform rule popup ────────────────────────────────────────────── */
+        /* ── Transform rule popup ──────────────────────────────────────────── */
         #transform-editor {
-            position: fixed; background: #14141e; border: 1px solid #0af;
-            border-radius: 6px; padding: 10px 12px; z-index: 500;
+            position: fixed; background: var(--panel-strong);
+            -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+            border: 1px solid var(--border-hi);
+            border-radius: 10px; padding: 11px 13px; z-index: 500;
             display: none; flex-direction: column; gap: 8px;
-            min-width: 220px; box-shadow: 0 4px 20px #000c;
+            min-width: 222px; box-shadow: 0 8px 32px rgba(0,0,0,0.6);
         }
         #transform-editor.visible { display: flex; }
-
-        #te-title { font-size: 10px; color: #0af; margin-bottom: 2px; }
-
+        #te-title { font-size: 10px; color: var(--accent-bright); margin-bottom: 2px; }
         .te-rule {
-            background: #1e1e28; border-radius: 4px; padding: 7px 8px;
+            background: var(--elev); border-radius: 6px; padding: 7px 9px;
             display: flex; flex-direction: column; gap: 5px;
         }
-        .te-rule-header {
-            display: flex; align-items: center; gap: 6px; font-size: 10px; color: #ccc;
-        }
-        .te-rule-header input[type="checkbox"] { accent-color: #0af; width: 13px; height: 13px; }
+        .te-rule-header { display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--text); }
+        .te-rule-header input[type="checkbox"] { accent-color: var(--accent); width: 13px; height: 13px; }
         .te-rule-header label { cursor: pointer; }
         .te-op-toggle { display: flex; gap: 2px; margin-left: 2px; }
         .te-op {
-            padding: 1px 4px; font-size: 9px; font-family: monospace;
-            background: #0e0e18; color: #666; border: 1px solid #333;
-            border-radius: 3px; cursor: pointer; line-height: 1.4;
+            padding: 1px 5px; font-size: 9px; font-family: ui-monospace, monospace;
+            background: rgba(0,0,0,0.3); color: var(--text-dim); border: 1px solid var(--border);
+            border-radius: 4px; cursor: pointer; line-height: 1.4; flex: none;
         }
-        .te-op.selected { background: #0a2535; color: #0af; border-color: #0af; }
+        .te-op.selected { background: var(--accent-tint); color: var(--accent-bright); border-color: var(--accent-line); }
         .te-threshold-row {
-            display: flex; align-items: center; gap: 6px; font-size: 10px; color: #888;
+            display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--text-dim);
             padding-left: 18px;
         }
         .te-threshold-row input[type="number"] {
-            width: 60px; padding: 2px 5px; background: #0e0e18; color: #ddd;
-            border: 1px solid #444; border-radius: 3px; font-size: 10px;
+            width: 60px; padding: 2px 5px; background: rgba(0,0,0,0.3); color: var(--text);
+            border: 1px solid var(--border); border-radius: 4px; font-size: 10px;
         }
-        .te-target-row {
-            display: flex; align-items: center; gap: 5px; padding-left: 18px; flex-wrap: wrap;
-        }
-        .te-target-row span { font-size: 10px; color: #888; flex-shrink: 0; }
+        .te-target-row { display: flex; align-items: center; gap: 5px; padding-left: 18px; flex-wrap: wrap; }
+        .te-target-row span { font-size: 10px; color: var(--text-dim); flex-shrink: 0; }
         .type-dot-btn {
             width: 16px; height: 16px; border-radius: 50%; border: 2px solid transparent;
-            cursor: pointer; flex-shrink: 0; transition: border-color 0.1s;
+            cursor: pointer; flex-shrink: 0; transition: border-color 0.1s; padding: 0;
         }
         .type-dot-btn.selected { border-color: #fff; }
-        .type-dot-btn:hover { border-color: #aaa; }
+        .type-dot-btn:hover { border-color: #bbb; }
 
-        /* ── Settings tab ────────────────────────────────────────────────────── */
-        .settings-section { margin-bottom: 14px; }
+        /* ── Settings sections ─────────────────────────────────────────────── */
+        .settings-section { margin-bottom: 16px; }
         .settings-section h4 {
-            font-size: 11px; color: #0af; margin-bottom: 8px;
-            border-bottom: 1px solid #333; padding-bottom: 4px;
+            font-size: 10px; color: var(--text-dim); margin-bottom: 9px;
+            border-bottom: 1px solid var(--border); padding-bottom: 5px;
+            letter-spacing: 0.08em; text-transform: uppercase; font-weight: 600;
         }
-        .settings-row {
-            display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 11px;
-        }
-        .settings-row label { color: #aaa; width: 80px; flex-shrink: 0; }
+        .settings-row { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; font-size: 11px; }
+        .settings-row label { color: var(--text-dim); width: 80px; flex-shrink: 0; }
         .settings-row input[type="number"] {
-            width: 70px; padding: 3px 5px; background: #1e1e24; color: #ddd;
-            border: 1px solid #444; border-radius: 3px; font-size: 11px;
+            width: 70px; padding: 4px 6px; background: var(--elev); color: var(--text);
+            border: 1px solid var(--border); border-radius: var(--r-ctrl); font-size: 11px;
         }
-        .settings-row input[type="range"] { flex: 1; accent-color: #0af; }
+        .settings-row input[type="number"]:focus { border-color: var(--accent-line); outline: none; }
+        .settings-row input[type="range"] { flex: 1; accent-color: var(--accent); }
         .settings-row input[type="color"] {
-            width: 46px; height: 26px; border: 1px solid #444; border-radius: 3px;
+            width: 46px; height: 26px; border: 1px solid var(--border); border-radius: var(--r-ctrl);
             background: none; cursor: pointer; padding: 1px;
         }
-        .settings-row .sep { color: #555; }
-        .settings-row .val { font-size: 10px; color: #0af; width: 32px; text-align: right; }
+        .settings-row .sep { color: var(--text-faint); }
+        .settings-row .val { font-size: 10px; color: var(--accent); width: 34px; text-align: right; font-family: ui-monospace, monospace; }
 
-        .edge-toggle-row { display: flex; gap: 6px; }
-        .edge-btn { flex: 1; padding: 5px 4px; font-size: 11px; }
-        .edge-btn.selected { background: #0af; color: #000; border-color: #0af; }
+        .edge-toggle-row { display: flex; gap: 7px; }
+        .edge-btn { flex: 1; padding: 6px 4px; font-size: 11px; }
 
-        .hint { font-size: 10px; color: #555; margin-top: 6px; line-height: 1.4; }
+        .hint { font-size: 10px; color: var(--text-faint); margin-top: 7px; line-height: 1.45; }
+        .hint strong { color: var(--text-dim); }
 
-        /* ── Panel collapse ──────────────────────────────────────────────────── */
-        #ui { transition: transform 0.2s ease; }
-        #ui.collapsed { transform: translateX(-340px); }
-
+        /* ── Left collapse handle ──────────────────────────────────────────── */
         #collapseBtn {
             position: fixed; top: 50%; left: 340px;
             transform: translateY(-50%);
-            flex: none; width: 16px; height: 48px;
-            padding: 0; border-radius: 0 5px 5px 0;
+            flex: none; width: 16px; height: 52px;
+            padding: 0; border-radius: 0 7px 7px 0;
             border-left: none; font-size: 10px;
             cursor: pointer; z-index: 201;
-            transition: left 0.2s ease;
-            background: rgba(10,10,14,0.96); color: #0af;
-            border: 1px solid #333;
+            transition: left 0.22s ease;
+            background: var(--panel); -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+            color: var(--text-dim); border: 1px solid var(--border);
         }
-        #collapseBtn:hover { background: #0af; color: #000; }
+        #collapseBtn:hover { background: var(--elev-hi); color: var(--text); }
 
-        /* ── Bottom bar ──────────────────────────────────────────────────────── */
+        /* ── Bottom tool dock ──────────────────────────────────────────────── */
         #bottom-bar {
-            position: fixed; bottom: 14px; left: 50%;
+            position: fixed; bottom: 16px; left: 50%;
             transform: translateX(-50%);
-            display: flex; gap: 8px; align-items: center;
-            background: rgba(8,8,12,0.88); border: 1px solid #333;
-            border-radius: 8px; padding: 6px 12px;
-            z-index: 100; backdrop-filter: blur(6px);
+            display: flex; gap: 4px; align-items: stretch;
+            background: var(--panel); border: 1px solid var(--border);
+            border-radius: 13px; padding: 6px;
+            z-index: 100; -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+            box-shadow: 0 8px 30px rgba(0,0,0,0.45);
         }
-        #bottom-bar button {
-            flex: none; width: auto; padding: 6px 16px;
-            font-size: 12px; border-radius: 5px;
+        .dock-btn {
+            flex: none; display: inline-flex; align-items: center; gap: 6px;
+            padding: 7px 12px; font-size: 11px; border-radius: 8px;
+            background: transparent; border: 1px solid transparent; color: var(--text-dim);
+            white-space: nowrap;
         }
-        #bottom-bar button.danger { border-color: #f55; color: #f55; }
-        #bottom-bar button.danger:hover { background: #f55; color: #000; }
+        .dock-btn:hover { background: var(--elev-hi); border-color: var(--border); color: var(--text); }
+        .dock-btn.active { background: var(--accent-tint); border-color: var(--accent-line); color: var(--accent-bright); }
+        .dock-btn.danger { color: var(--danger); }
+        .dock-btn.danger:hover { background: rgba(224,105,107,0.14); border-color: rgba(224,105,107,0.5); color: #ff9092; }
+        .dock-ico { font-size: 13px; line-height: 1; }
+        .dock-sep { width: 1px; background: var(--border); margin: 4px 4px; flex: none; }
 
-        /* ── Overlay canvas ──────────────────────────────────────────────────── */
+        /* ── Contextual tool settings popover ──────────────────────────────── */
+        #tool-popover {
+            position: fixed; z-index: 120; display: none; flex-direction: column;
+            width: 196px; padding: 10px 12px; gap: 10px;
+            background: var(--panel-strong); border: 1px solid var(--border-hi);
+            border-radius: 11px; box-shadow: 0 8px 30px rgba(0,0,0,0.55);
+            -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+        }
+        #tool-popover.visible { display: flex; }
+
+        /* Split control: "Randomize" action + caret that opens the checklist */
+        .dock-split { display: inline-flex; align-items: stretch; gap: 0; }
+        .dock-split #randomizeNowBtn  { border-top-right-radius: 0; border-bottom-right-radius: 0; padding-right: 8px; }
+        .dock-split #randomizeMenuBtn { border-top-left-radius: 0; border-bottom-left-radius: 0; padding: 7px 7px; font-size: 9px; }
+        .dock-caret.active { background: var(--accent-tint); border-color: var(--accent-line); color: var(--accent-bright); }
+
+        #randomize-popover {
+            position: fixed; z-index: 130; display: none; flex-direction: column;
+            min-width: 168px; padding: 10px 12px; gap: 8px;
+            background: var(--panel-strong); border: 1px solid var(--border-hi);
+            border-radius: 11px; box-shadow: 0 8px 30px rgba(0,0,0,0.55);
+            -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+        }
+        #randomize-popover.visible { display: flex; }
+        #randomize-list { display: flex; flex-direction: column; gap: 2px; }
+        .rnd-row {
+            display: flex; align-items: center; gap: 8px; cursor: pointer;
+            font-size: 11px; color: var(--text-dim); padding: 4px 5px; border-radius: 6px;
+        }
+        .rnd-row:hover { background: var(--elev-hi); color: var(--text); }
+        .rnd-row input { accent-color: var(--accent); cursor: pointer; }
+
+        .cpanel-section { display: flex; flex-direction: column; gap: 6px; }
+        .cpanel-label { font-size: 9px; color: var(--text-faint); font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; }
+        .cpanel-slider { width: 100%; accent-color: var(--accent); }
+        .cpanel-val { font-size: 10px; color: var(--text-dim); font-family: ui-monospace, monospace; }
+        .cpanel-hint { font-size: 9px; color: var(--text-faint); line-height: 1.5; }
+
+        /* ── Overlay canvas ────────────────────────────────────────────────── */
         #overlay {
             position: fixed; top: 0; left: 0;
             width: 100vw; height: 100vh;
             pointer-events: none; z-index: 50;
-            background: transparent;
-            transform: none;
+            background: transparent; transform: none;
         }
         body.track-selecting #sim-canvas { cursor: crosshair; }
         body.inspect-mode #sim-canvas { cursor: cell; }
 
-        /* ── Pole panel ──────────────────────────────────────────────────────── */
+        /* ── Poles ─────────────────────────────────────────────────────────── */
         .pole-row { display: flex; align-items: center; gap: 5px; margin-bottom: 5px; flex-wrap: wrap; }
         .pole-count-btns { display: flex; gap: 2px; }
         .pole-count-btn {
-            padding: 2px 4px; font-size: 10px; min-width: 18px; flex: none;
-            background: #1a2030; color: #aaa; border-color: #444;
+            padding: 2px 5px; font-size: 10px; min-width: 18px; flex: none;
+            background: var(--elev); color: var(--text-dim); border-color: var(--border);
         }
-        .pole-count-btn.selected { background: #0af; color: #000; border-color: #0af; }
+        .pole-count-btn.selected { background: var(--accent-tint); color: var(--accent-bright); border-color: var(--accent-line); }
         .pole-signs { display: flex; gap: 2px; }
         .pole-sign-btn {
-            width: 18px; height: 18px; border-radius: 3px; font-size: 11px;
-            padding: 0; flex: none; font-weight: bold; line-height: 1;
-            background: #1a1a24;
+            width: 18px; height: 18px; border-radius: 4px; font-size: 11px;
+            padding: 0; flex: none; font-weight: bold; line-height: 1; background: var(--elev);
         }
-        .pole-sign-pos { color: #0f8; border-color: #0f8; }
-        .pole-sign-neg { color: #f55; border-color: #f55; }
+        .pole-sign-pos { color: var(--good); border-color: rgba(92,200,160,0.5); }
+        .pole-sign-neg { color: var(--danger); border-color: rgba(224,105,107,0.5); }
 
-        /* ── Cursor tools panel ──────────────────────────────────────────────── */
-        #cursor-panel {
-            position: fixed; top: 0; right: 0; width: 150px; height: 100vh;
-            background: rgba(10,10,14,0.96); border-left: 1px solid #1a1a28;
-            z-index: 190; display: flex; flex-direction: column;
-            font-size: 11px; overflow-y: auto;
-            transition: transform 0.2s ease;
-        }
-        #cursor-panel.collapsed { transform: translateX(150px); }
-        #cursor-panel .cpanel-header {
-            font-size: 9px; font-weight: bold; letter-spacing: 0.08em;
-            color: #555; padding: 10px 10px 8px;
-            border-bottom: 1px solid #1a1a28; text-transform: uppercase;
-        }
-        .ctool-btn {
-            width: 100%; text-align: left; padding: 9px 10px;
-            font-size: 11px; background: transparent;
-            border: none; border-bottom: 1px solid #111;
-            color: #777; cursor: pointer; transition: background 0.1s, color 0.1s;
-        }
-        .ctool-btn:hover { background: #1a1a28; color: #ccc; }
-        .ctool-btn.active { background: #0a1f30; color: #0af; border-left: 2px solid #0af; }
-        .cpanel-section {
-            padding: 10px; border-bottom: 1px solid #1a1a28;
-            display: flex; flex-direction: column; gap: 5px;
-        }
-        .cpanel-label {
-            font-size: 9px; color: #555; font-weight: bold;
-            letter-spacing: 0.06em; text-transform: uppercase;
-        }
-        .cpanel-slider { width: 100%; accent-color: #0af; }
-        .cpanel-val { font-size: 10px; color: #888; font-family: monospace; }
-        .cpanel-hint { font-size: 9px; color: #444; line-height: 1.5; }
-
-        #cursorCollapseBtn {
-            position: fixed; top: 50%; right: 150px;
-            transform: translateY(-50%);
-            width: 16px; height: 48px; padding: 0; margin: 0;
-            border: 1px solid #333; border-right: none;
-            border-radius: 4px 0 0 4px;
-            background: rgba(10,10,14,0.96); color: #0af;
-            cursor: pointer; font-size: 10px; text-align: center;
-            z-index: 191; transition: right 0.2s ease;
-            line-height: 48px;
-        }
-        body.cursor-panel-collapsed #cursorCollapseBtn { right: 0; }
-        #cursorCollapseBtn:hover { background: #0af; color: #000; }
-
-        /* Shift inspector left of cursor panel when both visible */
-        body:not(.cursor-panel-collapsed) #diag-panel { right: 150px; }
-
-        /* ── Diagnostic / inspector panel ───────────────────────────────────── */
+        /* ── Inspector panel ───────────────────────────────────────────────── */
         #diag-panel {
             position: fixed; top: 0; right: 0;
-            width: 260px; height: 100vh;
-            background: rgba(10,10,14,0.96);
-            color: #ddd; display: none; flex-direction: column;
+            width: 264px; height: 100vh;
+            background: var(--panel);
+            -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+            color: var(--text); display: none; flex-direction: column;
             font-size: 11px; z-index: 200;
-            border-left: 1px solid #333;
+            border-left: 1px solid var(--border);
         }
         #diag-panel.visible { display: flex; }
         #diag-header {
             display: flex; align-items: center; justify-content: space-between;
-            padding: 8px 10px; border-bottom: 1px solid #333;
-            font-size: 10px; color: #0af; font-weight: bold;
+            padding: 11px 12px; border-bottom: 1px solid var(--border);
+            font-size: 10px; color: var(--text); font-weight: 600; letter-spacing: 0.08em;
             flex-shrink: 0;
         }
-        #diag-close {
-            flex: none; width: 20px; height: 20px; padding: 0;
-            font-size: 12px; border-radius: 3px; line-height: 1;
-        }
-        #diag-body { flex: 1; overflow-y: auto; padding: 8px 10px; display: flex; flex-direction: column; gap: 4px; }
+        #diag-close { flex: none; width: 22px; height: 22px; padding: 0; font-size: 12px; border-radius: 5px; line-height: 1; }
+        #diag-body { flex: 1; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; }
         .diag-kv { display: flex; align-items: baseline; gap: 6px; font-size: 11px; }
-        .diag-key { color: #666; flex-shrink: 0; width: 70px; }
-        .diag-val { color: #ddd; font-family: monospace; }
-        .diag-type-swatch {
-            display: inline-block; width: 9px; height: 9px;
-            border-radius: 50%; margin-right: 4px; vertical-align: middle;
-        }
+        .diag-key { color: var(--text-faint); flex-shrink: 0; width: 70px; }
+        .diag-val { color: var(--text); font-family: ui-monospace, monospace; }
+        .diag-type-swatch { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
         .diag-section {
-            margin-top: 8px; margin-bottom: 3px;
-            font-size: 9px; color: #555; letter-spacing: 0.06em;
-            border-top: 1px solid #222; padding-top: 6px;
+            margin-top: 9px; margin-bottom: 3px;
+            font-size: 9px; color: var(--text-faint); letter-spacing: 0.07em; text-transform: uppercase;
+            border-top: 1px solid var(--border); padding-top: 7px;
         }
-        .diag-force-row {
-            display: flex; align-items: center; gap: 5px; font-size: 10px; margin-bottom: 2px;
-        }
-        .diag-force-pip {
-            display: inline-block; width: 7px; height: 7px;
-            border-radius: 50%; flex-shrink: 0;
-        }
-        .diag-force-bar-wrap {
-            flex: 1; height: 6px; background: #1a1a22; border-radius: 2px;
-            position: relative; overflow: hidden;
-        }
-        .diag-force-bar {
-            position: absolute; top: 0; height: 100%; border-radius: 2px;
-        }
-        .diag-force-val { font-family: monospace; width: 42px; text-align: right; color: #aaa; }
-        .diag-prob-row {
-            display: flex; align-items: center; gap: 5px; font-size: 10px; margin-bottom: 2px;
-        }
-        .diag-prob-bar-wrap {
-            flex: 1; height: 6px; background: #1a1a22; border-radius: 2px; overflow: hidden;
-        }
-        .diag-prob-bar { height: 100%; background: #fa0; border-radius: 2px; }
-        .diag-prob-val { font-family: monospace; width: 36px; text-align: right; color: #fa0; }
+        .diag-force-row { display: flex; align-items: center; gap: 5px; font-size: 10px; margin-bottom: 2px; }
+        .diag-force-pip { display: inline-block; width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+        .diag-force-bar-wrap { flex: 1; height: 6px; background: rgba(255,255,255,0.06); border-radius: 3px; position: relative; overflow: hidden; }
+        .diag-force-bar { position: absolute; top: 0; height: 100%; border-radius: 3px; }
+        .diag-force-val { font-family: ui-monospace, monospace; width: 42px; text-align: right; color: var(--text-dim); }
+        .diag-prob-row { display: flex; align-items: center; gap: 5px; font-size: 10px; margin-bottom: 2px; }
+        .diag-prob-bar-wrap { flex: 1; height: 6px; background: rgba(255,255,255,0.06); border-radius: 3px; overflow: hidden; }
+        .diag-prob-bar { height: 100%; background: var(--accent); border-radius: 3px; }
+        .diag-prob-val { font-family: ui-monospace, monospace; width: 36px; text-align: right; color: var(--accent); }
     </style>
 </head>
 <body>
     <div id="ui">
         <div id="ui-header">
-            <h3>Particle Life</h3>
+            <h3><span class="dot"></span>Particle Life</h3>
             <div id="stats-bar">
-                <span>FPS: <span id="fps">0</span></span>
-                <label class="ap-label" title="Auto-pause when FPS drops below threshold (set in Settings)">
+                <span>FPS <b id="fps">0</b></span>
+                <label class="ap-label" title="Auto-pause when FPS drops below threshold (set in World ▸ Performance)">
                     <input type="checkbox" id="autoPauseChk" checked> AP
                 </label>
                 <span id="fps-warn">⚠ low FPS</span>
-                <span>N: <span id="particleCountDisplay">0</span></span>
-                <span>Z: <span id="zoomDisplay">1.00×</span></span>
-                <span>T: <span id="time">0.0s</span></span>
+                <span>N <b id="particleCountDisplay">0</b></span>
+                <span>Z <b id="zoomDisplay">1.00×</b></span>
+                <span>T <b id="time">0.0s</b></span>
             </div>
         </div>
 
@@ -416,57 +462,208 @@
             </div>
             <div class="ctrl-row">
                 <label>Types</label>
-                <input type="number" id="typeCount" min="1" max="20" value="10" step="1">
+                <input type="number" id="typeCount" min="1" max="50" value="10" step="1">
             </div>
             <div class="ctrl-row">
                 <label>Speed</label>
                 <input type="range" id="speed" min="0.1" max="5" value="1" step="0.1">
                 <span class="val" id="speedValue">1.0×</span>
             </div>
-            <div class="btn-row">
-                <button id="resetBtn">Reset</button>
-                <button id="pauseBtn">Pause</button>
-            </div>
         </div>
 
         <div id="tab-bar">
-            <button class="tab-btn active" data-tab="strength">Strength</button>
-            <button class="tab-btn"        data-tab="radius">Radius</button>
-            <button class="tab-btn"        data-tab="mode">Mode</button>
-            <button class="tab-btn"        data-tab="settings">Settings</button>
+            <button class="tab-btn active" data-tab="forces">Forces</button>
+            <button class="tab-btn"        data-tab="behavior">Behavior</button>
+            <button class="tab-btn"        data-tab="look">Look</button>
+            <button class="tab-btn"        data-tab="world">World</button>
         </div>
 
         <div id="tab-content">
-            <!-- Strength matrix -->
-            <div id="pane-strength" class="tab-pane active">
-                <div class="btn-row" style="margin-bottom:6px">
-                    <button id="randomizeStrengthBtn">Randomize</button>
+            <!-- ── Forces ──────────────────────────────────────────────── -->
+            <div id="pane-forces" class="tab-pane active">
+                <div class="pane-head">Strength <span>row = from · col = to · click a cell</span></div>
+                <div class="btn-row" style="margin-bottom:8px">
+                    <button id="randomizeStrengthBtn">Randomize strength</button>
                 </div>
-                <p class="matrix-label">Row = from · Col = to · Click cell to edit</p>
                 <div class="matrix-wrap"><table class="matrix" id="strength-table"></table></div>
-            </div>
 
-            <!-- Radius matrix -->
-            <div id="pane-radius" class="tab-pane">
-                <p class="matrix-label">Max interaction radius per type pair (world units)</p>
-                <div class="btn-row" style="margin-bottom:6px">
-                    <button id="randomizeMaxRadiusBtn">Randomize Max</button>
+                <div class="pane-head" style="margin-top:18px">Max radius <span>interaction range (world units)</span></div>
+                <div class="btn-row" style="margin-bottom:8px">
+                    <button id="randomizeMaxRadiusBtn">Randomize max</button>
                 </div>
                 <div class="matrix-wrap"><table class="matrix" id="radius-table"></table></div>
-                <p class="matrix-label" style="margin-top:10px">Min radius — inner dead zone (no interaction below this distance)</p>
-                <div class="btn-row" style="margin-bottom:6px">
-                    <button id="randomizeMinRadiusBtn">Randomize Min</button>
-                    <button id="zeroMinRadiusBtn">All Zero</button>
+
+                <div class="pane-head" style="margin-top:18px">Min radius <span>inner dead zone</span></div>
+                <div class="btn-row" style="margin-bottom:8px">
+                    <button id="randomizeMinRadiusBtn">Randomize min</button>
+                    <button id="zeroMinRadiusBtn">All zero</button>
                 </div>
                 <div class="matrix-wrap"><table class="matrix" id="min-radius-table"></table></div>
             </div>
 
-            <!-- Mode tab -->
-            <div id="pane-mode" class="tab-pane">
+            <!-- ── Behavior ────────────────────────────────────────────── -->
+            <div id="pane-behavior" class="tab-pane">
                 <div class="mode-toggle-row">
-                    <button class="mode-btn selected" id="mode0-btn">0 · Classic</button>
-                    <button class="mode-btn"          id="mode1-btn">1 · Transform</button>
-                    <button class="mode-btn"          id="mode2-btn">2 · Mass</button>
+                    <button class="mode-btn selected" id="mode0-btn">Classic</button>
+                    <button class="mode-btn"          id="mode1-btn">Transform</button>
+                    <button class="mode-btn"          id="mode2-btn">Mass</button>
+                    <button class="mode-btn"          id="mode3-btn">Patchy</button>
+                    <button class="mode-btn"          id="mode4-btn">Patchy+T</button>
+                    <button class="mode-btn"          id="mode5-btn">Patchy+DNF</button>
+                    <button class="mode-btn"          id="mode6-btn">QFT</button>
+                </div>
+
+                <div id="mode3-panel">
+                    <p class="tr-hint">
+                        Patchy particles carry an orientation and a <strong>valence</strong> — a number of
+                        bond <em>patches</em> spaced evenly around them. Two particles bond when a patch on
+                        each points at the other: a spring pulls them to the bond distance while a torque
+                        rotates each so its patch locks onto the axis. Valence 2 builds chains, 3 sheets,
+                        4 square lattices, 6 hex. Valence 0 stays isotropic. The classic force matrix still
+                        applies underneath as background attraction/repulsion.
+                    </p>
+                    <div class="btn-row" style="margin-bottom:8px;">
+                        <button id="randomizePatchesBtn">Randomize valences</button>
+                        <button id="randomizeBondingBtn">Randomize bonding</button>
+                    </div>
+                    <p class="matrix-label">Per type: valence · bond strength · rest length</p>
+                    <table class="mass-table" id="patch-table"></table>
+
+                    <p class="matrix-label" style="margin-top:14px">Bond affinity · row bonds column (click to cycle)</p>
+                    <div class="matrix-wrap"><table class="matrix" id="affinity-table"></table></div>
+
+                    <div class="settings-section" style="margin-top:14px;">
+                        <h4>Bonding</h4>
+                        <div class="settings-row">
+                            <label>Bond Range</label>
+                            <input type="range" id="patchRangeSlider" min="10" max="200" step="1" value="60">
+                            <span class="val" id="patchRangeValue">60</span>
+                        </div>
+                        <div class="settings-row">
+                            <label>Patch Width</label>
+                            <input type="range" id="patchWidthSlider" min="1" max="20" step="0.5" value="6">
+                            <span class="val" id="patchWidthValue">6</span>
+                        </div>
+                        <div class="settings-row">
+                            <label>Align Torque</label>
+                            <input type="range" id="patchAngSlider" min="0" max="2" step="0.05" value="0.3">
+                            <span class="val" id="patchAngValue">0.30</span>
+                        </div>
+                        <div class="settings-row">
+                            <label>Spin Damping</label>
+                            <input type="range" id="patchAngFricSlider" min="0" max="1" step="0.01" value="0.2">
+                            <span class="val" id="patchAngFricValue">0.20</span>
+                        </div>
+                        <div class="settings-row">
+                            <label>Isotropic Force</label>
+                            <input type="range" id="patchIsoSlider" min="0" max="1" step="0.05" value="1">
+                            <span class="val" id="patchIsoValue">1.00</span>
+                        </div>
+                        <p class="hint">
+                            Bond strength &amp; rest length are <strong>per type</strong> (table above);
+                            the <strong>affinity grid</strong> sets who-bonds-whom (it can be asymmetric —
+                            A binds B without B binding A, which makes self-propelled "ships"). For dynamic
+                            movers keep <strong>Isotropic Force high</strong> and per-type bond strengths
+                            low; for static crystals/sheets do the opposite.
+                        </p>
+                    </div>
+                </div>
+
+                <div id="dnf-panel">
+                    <p class="tr-hint">
+                        <strong>Transform #2 — rule logic.</strong> Each source type defines force
+                        <em>conditions</em> (C1, C2…), each comparing the accumulated force from a trigger
+                        type against a threshold. Transform rules then combine those conditions with a
+                        boolean expression (e.g. <code>(C1 and C2) or C3</code>); the first rule whose
+                        expression is true wins its dice roll and transforms the particle. Prefer
+                        <code>and</code>/<code>or</code>: <code>not</code>/<code>nand</code>/<code>nor</code>
+                        are true whenever forces are <em>below</em> threshold (the common case), so they fire
+                        almost every tick and particles never settle. This drives composition-based
+                        "metabolism". Patchy bonding (above) still applies when enabled.
+                    </p>
+                    <div class="settings-row">
+                        <label>Max Transform</label>
+                        <input type="range" id="dnfMaxSlider" min="0.01" max="1.0" step="0.01" value="0.5">
+                        <span class="val" id="dnfMaxValue">0.50</span>
+                    </div>
+                    <div class="settings-row">
+                        <label>Directional bonding</label>
+                        <div class="edge-toggle-row" style="flex:1">
+                            <button class="edge-btn selected" id="dnfBondOffBtn">Off</button>
+                            <button class="edge-btn"          id="dnfBondOnBtn">On</button>
+                        </div>
+                    </div>
+                    <p class="tr-hint" style="margin-top:2px;">
+                        Off = transforms on a plain isotropic-force substrate (no patches).
+                        On = bring back patchy bonding (valence/affinity controls appear above).
+                    </p>
+                    <div class="btn-row" style="margin:8px 0;">
+                        <button id="randomizeDnfBtn">Randomize rules</button>
+                        <button id="clearDnfBtn">Clear all</button>
+                    </div>
+                    <p class="matrix-label">Rules per source type (click a row to edit)</p>
+                    <div id="dnf-list"></div>
+                </div>
+
+                <div id="qft-panel">
+                    <p class="tr-hint">
+                        <strong>QFT.</strong> Instead of per-type force rules, particles carry a signed
+                        <em>charge</em> in each <em>field</em>. For a pair, each field contributes a force ∝
+                        charge×charge — <strong>like charges repel, opposite attract</strong> — acting within
+                        <code>range = field range × |charge×charge|</code>. Charge 0 = no interaction in that
+                        field. Field <strong>exc</strong> is a universal short-range repulsion (Pauli-style)
+                        that keeps particles from piling — all types carry it by default.
+                    </p>
+                    <div class="settings-row">
+                        <label>Fields</label>
+                        <input type="number" id="qftFieldCount" min="1" max="12" value="3" step="1">
+                    </div>
+                    <div class="settings-row">
+                        <label>Temperature</label>
+                        <input type="range" id="qftTempSlider" min="0" max="3" step="0.05" value="0.3">
+                        <span class="val" id="qftTempValue">0.30</span>
+                    </div>
+                    <p class="tr-hint" style="margin-top:2px;">
+                        Charge forces are conservative (like real physics), so they settle into a static
+                        packing. Temperature adds a random kick each tick — kinetic energy that keeps things
+                        moving and structures forming/breaking. 0 = freeze into equilibrium.
+                    </p>
+                    <div class="btn-row" style="margin:8px 0;">
+                        <button id="randomizeChargesBtn">Randomize charges</button>
+                    </div>
+                    <p class="matrix-label">Per field: range · strength</p>
+                    <table class="mass-table" id="qft-field-table"></table>
+                    <p class="matrix-label" style="margin-top:12px">Charge (sources field) · row = type, col = field</p>
+                    <div class="matrix-wrap"><table class="matrix" id="qft-charge-table"></table></div>
+                    <p class="matrix-label" style="margin-top:12px">Susceptibility (responds to field) · row = type, col = field</p>
+                    <div class="matrix-wrap"><table class="matrix" id="qft-susc-table"></table></div>
+                    <p class="tr-hint" style="margin-top:4px;">
+                        Force a particle feels = field strength × <strong>its susceptibility</strong> ×
+                        <strong>the other's charge</strong>. When these differ between two types the force is
+                        non-reciprocal (A chases B while B flees A) — that asymmetry is what makes motion and
+                        chasing behaviours emerge. Set susceptibility to 0 for "ignores this field".
+                    </p>
+
+                    <div class="settings-section" style="margin-top:14px;">
+                        <h4>Transforms</h4>
+                        <p class="tr-hint">
+                            Each tick a particle measures the net force it feels in each field; if that crosses
+                            a threshold (above and/or below) it probabilistically becomes a target type. The
+                            exclusion field is never a trigger. Click a cell to edit its rule.
+                        </p>
+                        <div class="settings-row">
+                            <label>Max Transform</label>
+                            <input type="range" id="qftMaxSlider" min="0.01" max="1.0" step="0.01" value="0.5">
+                            <span class="val" id="qftMaxValue">0.50</span>
+                        </div>
+                        <div class="btn-row" style="margin:8px 0;">
+                            <button id="randomizeQftTransformBtn">Randomize transforms</button>
+                            <button id="clearQftTransformBtn">Clear</button>
+                        </div>
+                        <p class="matrix-label">Row = type · Col = field (force trigger)</p>
+                        <div class="matrix-wrap"><table class="matrix" id="qft-transform-table"></table></div>
+                        <div id="qft-transform-editor"></div>
+                    </div>
                 </div>
 
                 <div id="mode2-panel">
@@ -477,7 +674,7 @@
                         neighbors within range.
                     </p>
                     <div class="btn-row" style="margin-bottom:8px;">
-                        <button id="randomizeMassBtn">Randomize Masses</button>
+                        <button id="randomizeMassBtn">Randomize masses</button>
                     </div>
                     <p class="matrix-label">Mass per type</p>
                     <table class="mass-table" id="mass-table"></table>
@@ -487,10 +684,15 @@
                     <p class="tr-hint">
                         Each tick a particle accumulates force from each trigger type. If it exceeds the
                         threshold the particle probabilistically transforms — the further past the threshold,
-                        the higher the chance (up to 50%/tick at 3× threshold). First match wins.
+                        the higher the chance (up to Max Transform per tick at 3× threshold). First match wins.
                     </p>
-                    <div class="btn-row" style="margin-bottom:8px;">
-                        <button id="randomizeTransformBtn">Randomize Rules</button>
+                    <div class="settings-row">
+                        <label>Max Transform</label>
+                        <input type="range" id="maxTransformSlider" min="0.01" max="1.0" step="0.01" value="0.5">
+                        <span class="val" id="maxTransformValue">0.50</span>
+                    </div>
+                    <div class="btn-row" style="margin:8px 0;">
+                        <button id="randomizeTransformBtn">Randomize rules</button>
                     </div>
                     <p class="matrix-label">Row = source type · Col = trigger type</p>
                     <div class="matrix-wrap"><table class="matrix" id="transform-table"></table></div>
@@ -498,8 +700,21 @@
                     <div id="pole-panel" style="margin-top:14px;">
                         <p class="matrix-label">Polar field per type</p>
                         <div id="pole-list"></div>
+                        <div class="settings-row" style="margin-top:8px;">
+                            <label style="width:auto">Frame</label>
+                            <div class="edge-toggle-row" style="flex:1">
+                                <button class="edge-btn selected" id="poleFrameVelBtn">Velocity</button>
+                                <button class="edge-btn"          id="poleFrameWorldBtn">World</button>
+                            </div>
+                        </div>
+                        <p class="tr-hint" style="margin-top:4px;">
+                            For 3+ poles: <strong>Velocity</strong> aligns lobes to each particle's heading,
+                            so which lobe is positive changes the effect's angle relative to motion.
+                            <strong>World</strong> fixes lobes to a global axis, so flipping which lobe is positive
+                            only rotates the pattern (behaves the same). Dipoles stay velocity-aligned either way.
+                        </p>
                         <div class="btn-row" style="margin-top:6px;">
-                            <button id="randomizePolesBtn">Randomize Poles</button>
+                            <button id="randomizePolesBtn">Randomize poles</button>
                         </div>
                         <p class="tr-hint" style="margin-top:6px;">
                             M = monopole (uniform). 2 = dipole (front+/back−, velocity-aligned).
@@ -508,35 +723,30 @@
                         </p>
                     </div>
                 </div>
+
             </div>
 
-            <!-- Settings tab -->
-            <div id="pane-settings" class="tab-pane">
+            <!-- ── Look (photo + visuals) ──────────────────────────────── -->
+            <div id="pane-look" class="tab-pane">
                 <div class="settings-section">
-                    <h4>Simulation Area</h4>
-                    <div class="settings-row">
-                        <label>World size</label>
-                        <input type="number" id="worldW" min="200" max="20000" step="100" value="4800">
-                        <span class="sep">×</span>
-                        <input type="number" id="worldH" min="200" max="20000" step="100" value="2700">
+                    <h4>Photo / Video Export</h4>
+                    <div class="btn-row">
+                        <button id="exportFullBtn">&#11015; Full Canvas PNG</button>
+                        <button id="recordFullBtn">&#9210; Record Full Video</button>
                     </div>
-                    <div class="settings-row">
-                        <label></label>
-                        <button id="applyWorldSize" style="flex:none;padding:4px 12px;">Apply &amp; Reset</button>
+                    <div class="btn-row" style="margin-top:7px">
+                        <button id="exportSelBtn">&#9645; Select &amp; Export PNG</button>
+                        <button id="recordSelBtn">&#9210; Select &amp; Record Video</button>
                     </div>
-                    <p class="hint">World size sets the physics space; rendering resolution stays fixed at the canvas pixel size. Large worlds require zooming in to see particles. Scroll to zoom, middle-drag to pan, double-click to reset view.</p>
-                </div>
-
-                <div class="settings-section">
-                    <h4>Edge Behavior</h4>
-                    <div class="edge-toggle-row">
-                        <button class="edge-btn selected" id="edgeLoopBtn">Loop</button>
-                        <button class="edge-btn"          id="edgeOpenBtn">Open</button>
+                    <div class="settings-row" style="margin-top:7px">
+                        <label>Video length</label>
+                        <input type="range" id="videoDurSlider" min="5" max="30" step="5" value="10">
+                        <span class="val" id="videoDurValue">10s</span>
                     </div>
-                    <p class="hint">
-                        <strong style="color:#888">Loop</strong> — edges wrap toroidally.<br>
-                        <strong style="color:#888">Open</strong> — particles spawn in the configured area
-                        but the physics world is 5× larger with solid walls.
+                    <p class="hint" style="margin-top:7px">
+                        <strong>Full Canvas</strong> saves the whole canvas as a lossless PNG (closed/Loop edge mode only).<br>
+                        <strong>Select &amp; Export</strong> — drag a rectangle on the canvas; release to save just that region (sim pauses while you compose). The box shows its output pixel size.<br>
+                        <strong>Record Video</strong> renders the simulation (full canvas or a dragged region) to a smooth 60 fps WebM of the chosen length. It computes frame-by-frame as fast as the GPU allows — slower than real time for heavy sims, but the output always plays back at full speed. Click the button again (or Esc) to cancel and discard.
                     </p>
                 </div>
 
@@ -580,26 +790,49 @@
                         <input type="range" id="addStrSlider" min="0" max="1" step="0.05" value="0.7">
                         <span class="val" id="addStrValue">0.70</span>
                     </div>
-                    <p class="hint" style="margin-top:4px">
-                        Glow 0 = hard solid circles. Glow 1 = wide soft orbs that bloom where they overlap.<br>
+                    <p class="hint">
+                        Glow 0 = hard solid circles. Glow 1 = wide soft orbs that bloom where they overlap.
                         Add. Strength scales per-particle light in additive mode — lower = less bloom.
                     </p>
                 </div>
+            </div>
 
+            <!-- ── World ───────────────────────────────────────────────── -->
+            <div id="pane-world" class="tab-pane">
                 <div class="settings-section">
                     <h4>Physics</h4>
                     <div class="settings-row">
                         <label>Friction</label>
-                        <input type="range" id="frictionSlider" min="0" max="0.99" step="0.01" value="0.85">
-                        <span class="val" id="frictionValue">0.85</span>
+                        <input type="range" id="frictionSlider" min="0" max="1" step="0.01" value="0.15">
+                        <span class="val" id="frictionValue">0.15</span>
+                    </div>
+                    <p class="hint">Friction: how quickly particles lose speed each tick. Higher = more drag (0 = frictionless, 1 = stops almost immediately).</p>
+                </div>
+
+                <div class="settings-section">
+                    <h4>Simulation Area</h4>
+                    <div class="settings-row">
+                        <label>World size</label>
+                        <input type="number" id="worldW" min="200" max="20000" step="100" value="4800">
+                        <span class="sep">×</span>
+                        <input type="number" id="worldH" min="200" max="20000" step="100" value="2700">
                     </div>
                     <div class="settings-row">
-                        <label>Max Transform</label>
-                        <input type="range" id="maxTransformSlider" min="0.01" max="1.0" step="0.01" value="0.5">
-                        <span class="val" id="maxTransformValue">0.50</span>
+                        <label></label>
+                        <button id="applyWorldSize" style="flex:none;padding:5px 14px;">Apply &amp; Reset</button>
                     </div>
-                    <p class="hint" style="margin-top:4px">
-                        Friction: velocity multiplier per tick (lower = more drag). Max Transform: peak chance per tick to change type at threshold.
+                    <p class="hint">World size sets the physics space. The viewport fills the window and shows the world centred (with background margins if the aspect ratios differ — no letterbox). Scroll to zoom, middle-drag to pan, double-click to reset view.</p>
+                </div>
+
+                <div class="settings-section">
+                    <h4>Edge Behavior</h4>
+                    <div class="edge-toggle-row">
+                        <button class="edge-btn selected" id="edgeLoopBtn">Loop</button>
+                        <button class="edge-btn"          id="edgeOpenBtn">Open</button>
+                    </div>
+                    <p class="hint">
+                        <strong>Loop</strong> — edges wrap toroidally.
+                        <strong>Open</strong> — particles spawn in the configured area but the physics world is 5× larger with solid walls.
                     </p>
                 </div>
 
@@ -610,7 +843,7 @@
                         <input type="number" id="autoPauseMinFps" min="1" max="120" step="1" value="45" style="width:50px">
                         <span class="val">FPS</span>
                     </div>
-                    <p class="hint" style="margin-top:4px">
+                    <p class="hint">
                         Simulation pauses automatically when FPS stays below this threshold for 2 consecutive seconds. The AP checkbox in the header toggles this on/off.
                     </p>
                 </div>
@@ -685,19 +918,27 @@
     <canvas id="sim-canvas" oncontextmenu="return false" onmousedown="if(event.button===1)event.preventDefault()"></canvas>
     <canvas id="overlay"></canvas>
     <button id="collapseBtn" title="Toggle panel">&#9664;</button>
+
+    <!-- Bottom tool dock: transport + canvas tools -->
     <div id="bottom-bar">
-        <button id="btmPauseBtn">&#9646;&#9646; Pause</button>
-        <button id="btmTrackBtn">&#8982; Track Entity</button>
-        <button id="btmInspectBtn">&#128270; Inspect</button>
+        <button id="pauseBtn"     class="dock-btn" title="Pause / Resume (Space)">&#9646;&#9646; Pause</button>
+        <button id="resetBtn"     class="dock-btn" title="Reset particles to random positions"><span class="dock-ico">&#10227;</span> Reset</button>
+        <span class="dock-split">
+            <button id="randomizeNowBtn"  class="dock-btn" title="Randomize the selected settings"><span class="dock-ico">&#127922;</span> Randomize</button>
+            <button id="randomizeMenuBtn" class="dock-btn dock-caret" title="Choose what to randomize">&#9652;</button>
+        </span>
+        <span class="dock-sep"></span>
+        <button id="ctool-grab"   class="dock-btn" title="Grab — drag to pan the view"><span class="dock-ico">&#9995;</span> Grab</button>
+        <button id="ctool-force"  class="dock-btn" title="Force — push (left) / pull (right) particles"><span class="dock-ico">&#9889;</span> Force</button>
+        <button id="ctool-paint"  class="dock-btn" title="Paint — spawn (left) / destroy type (right)"><span class="dock-ico">&#9998;</span> Paint</button>
+        <button id="ctool-erase"  class="dock-btn" title="Erase — remove particles in the brush"><span class="dock-ico">&#9003;</span> Erase</button>
+        <span class="dock-sep"></span>
+        <button id="btmTrackBtn"  class="dock-btn" title="Track an entity by dragging a box">&#8982; Track</button>
+        <button id="btmInspectBtn" class="dock-btn" title="Inspect a single particle">&#128270; Inspect</button>
     </div>
 
-    <!-- Cursor tools panel (right side) -->
-    <div id="cursor-panel">
-        <div class="cpanel-header">Cursor Tools</div>
-        <button class="ctool-btn" id="ctool-grab">&#9995; Grab</button>
-        <button class="ctool-btn" id="ctool-force">&#9889; Force</button>
-        <button class="ctool-btn" id="ctool-paint">&#9998; Paint</button>
-        <button class="ctool-btn" id="ctool-erase">&#9003; Erase</button>
+    <!-- Contextual settings for the active cursor tool (positioned above the dock) -->
+    <div id="tool-popover">
         <div class="cpanel-section">
             <div class="cpanel-label">Brush Size</div>
             <input type="range" class="cpanel-slider" id="brushSizeSlider" min="20" max="800" step="10" value="150">
@@ -723,7 +964,13 @@
             <span class="cpanel-val" id="paintRateVal">10</span>
         </div>
     </div>
-    <button id="cursorCollapseBtn" title="Toggle cursor tools">&#9654;</button>
+
+    <!-- Master-randomize checklist (positioned above the dock button) -->
+    <div id="randomize-popover">
+        <div class="cpanel-label">Randomize which</div>
+        <div id="randomize-list"></div>
+        <div class="cpanel-hint">Only choices for the current behavior are shown.</div>
+    </div>
 
     <!-- Particle inspector panel (right side) -->
     <div id="diag-panel">

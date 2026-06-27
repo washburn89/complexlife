@@ -2,12 +2,12 @@
 
 ## Project Overview
 
-This is a WebGPU-based particle life simulator built with Babylon.js. It demonstrates GPU-accelerated physics simulation with support for 1M+ particles.
+This is a WebGPU-based particle life simulator written against the raw WebGPU API (no rendering framework). It demonstrates GPU-accelerated physics simulation with large particle counts.
 
 ## Technology Stack
 
-- **GPU API**: WebGPU with compute shaders
-- **Framework**: Babylon.js 6.40+
+- **GPU API**: raw WebGPU with WGSL compute + render shaders
+- **Framework**: none (hand-rolled engine)
 - **Language**: TypeScript
 - **Build Tool**: Webpack 5
 - **Target**: Modern browsers with WebGPU support
