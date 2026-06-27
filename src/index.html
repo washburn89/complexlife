@@ -755,8 +755,8 @@
                     <div class="settings-row">
                         <label>Blend</label>
                         <div class="edge-toggle-row" style="flex:1">
-                            <button class="edge-btn" id="blendStandardBtn">Standard</button>
-                            <button class="edge-btn selected" id="blendAdditiveBtn">Additive</button>
+                            <button class="edge-btn selected" id="blendStandardBtn">Standard</button>
+                            <button class="edge-btn" id="blendAdditiveBtn">Additive</button>
                         </div>
                     </div>
                     <div class="settings-row">
@@ -786,13 +786,15 @@
                         <span class="val" id="alphaValue">1.00</span>
                     </div>
                     <div class="settings-row">
-                        <label>Add. Strength</label>
-                        <input type="range" id="addStrSlider" min="0" max="1" step="0.05" value="0.7">
-                        <span class="val" id="addStrValue">0.70</span>
+                        <label>Dense Glow</label>
+                        <input type="range" id="addStrSlider" min="0" max="1" step="0.05" value="0.5">
+                        <span class="val" id="addStrValue">0.50</span>
                     </div>
                     <p class="hint">
-                        Glow 0 = hard solid circles. Glow 1 = wide soft orbs that bloom where they overlap.
-                        Add. Strength scales per-particle light in additive mode — lower = less bloom.
+                        Particles stay solid and bright on their own; crowded clusters glow.
+                        Glow scales the halo that dense regions get (lone particles stay crisp).
+                        Dense Glow adds additive build-up where particles overlap — 0 = fully solid.
+                        Additive blend mode makes everything fully additive (classic bloom).
                     </p>
                 </div>
             </div>

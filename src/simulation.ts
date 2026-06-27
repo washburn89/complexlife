@@ -290,11 +290,11 @@ export class ParticleSimulation {
 
     private backgroundColor = { r: 0.05, g: 0.05, b: 0.08 };
     private colorSaturation  = 1.0;
-    private particleGlow     = 0.0;  // 0 = hard solid circle, 1 = wide gaussian orb
+    private particleGlow     = 0.0;  // 0 = no halo; 1 = max density-driven glow halo
     private particleAlpha    = 1.0;  // 0 = fully transparent, 1 = fully opaque
-    private additiveStrength = 0.7;  // scales per-particle light contribution in additive mode
+    private additiveStrength = 0.5;  // 0 = pure solid (over); higher = more additive build-up where particles overlap densely
     private shapeMode        = 1;    // 0 = circles, 1 = procedural polygons
-    private blendMode        = 1;    // 0 = standard over, 1 = additive (bloom)
+    private blendMode        = 0;    // 0 = solid+dense-additive (default), 1 = full additive (bloom)
     private friction         = 0.85; // velocity multiplier per tick (1 = no drag, 0 = full stop)
     private maxTransformRate = 0.5;  // peak probability per tick for type conversion in mode 1
 
@@ -917,6 +917,8 @@ export class ParticleSimulation {
             { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
             { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } }, // orientation (Mode 3)
             { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },           // patchConfig (Mode 3)
+            { binding: 5, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } }, // cellCount (density glow)
+            { binding: 6, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },           // gridParams (density glow)
         ]});
         const renderPipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [renderLayout] });
         const renderModule = this.device.createShaderModule({ code: this.getRenderShaderCode() });
@@ -929,8 +931,13 @@ export class ParticleSimulation {
             layout: renderPipelineLayout, vertex: vertexState, primitive: { topology: 'triangle-list' },
             fragment: { module: renderModule, entryPoint: 'fragmentMain',
                 targets: [{ format: fmt, blend: {
-                    color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-                    alpha: { srcFactor: 'one',       dstFactor: 'zero',                operation: 'add' },
+                    // Premultiplied "over": the fragment outputs premultiplied light
+                    // (rgb already × coverage) and an occlusion alpha that can be lower
+                    // than the deposited light. occ=1 → ordinary solid over; occ<1 lets
+                    // overlapping particles deposit more light than they occlude, so
+                    // dense clusters build up additively while sparse ones stay solid.
+                    color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
                 } }] },
         });
         this.renderPipelineAdd = this.device.createRenderPipeline({
@@ -1118,6 +1125,8 @@ export class ParticleSimulation {
                 { binding: 2, resource: { buffer: this.viewBuffer        } },
                 { binding: 3, resource: { buffer: this.orientationBuffer! } },
                 { binding: 4, resource: { buffer: this.patchConfigBuffer! } },
+                { binding: 5, resource: { buffer: this.gridCellCountBuffer! } },
+                { binding: 6, resource: { buffer: this.gridParamsBuffer! } },
             ],
         });
 
@@ -1678,11 +1687,15 @@ export class ParticleSimulation {
                 patchCount: array<vec4u, ${TYPE_VEC4}>,
             }
 
+            struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
+
             @group(0) @binding(0) var<storage, read> particles: array<Particle>;
             @group(0) @binding(1) var<uniform>       params:    SimParams;
             @group(0) @binding(2) var<uniform>       view:      View;
             @group(0) @binding(3) var<storage, read> orientation: array<vec2f>;
             @group(0) @binding(4) var<uniform>       patchCfg:  PatchConfig;
+            @group(0) @binding(5) var<storage, read> cellCount: array<u32>;   // per-cell occupancy (local density)
+            @group(0) @binding(6) var<uniform>       grid:      GridParams;
 
             const COLORS = array<vec4f, ${MAX_TYPES}>(${colorsWGSL()});
 
@@ -1727,7 +1740,21 @@ export class ParticleSimulation {
                 // Particle tints toward white in its own hue; at max prob → 75% toward white.
                 let normProb  = clamp(p._pad * 2.0, 0.0, 1.0);  // 0→0, 0.5→1
                 let whiteness = normProb * 0.75;
-                let rWorld = 20.0 * (1.0 + view.glow * 3.5);
+
+                // Density-driven glow: lone particles stay crisp/solid; particles in
+                // crowded grid cells glow. cellCount holds per-cell occupancy after the
+                // scatter pass (cell ≈ interaction radius), a cheap local-density proxy.
+                // The global slider (view.glow) sets the maximum glow.
+                let cs   = grid.cellSize;
+                let cgx  = min(u32(max(p.pos.x, 0.0) / cs), grid.gridW - 1u);
+                let cgy  = min(u32(max(p.pos.y, 0.0) / cs), grid.gridH - 1u);
+                let occ  = cellCount[cgy * grid.gridW + cgx];
+                let dens = clamp((f32(occ) - 1.0) / 12.0, 0.0, 1.0);   // ~12 neighbours → full
+                let glowAmt = view.glow * dens;
+
+                // The quad grows with glow to leave room for the halo, but the solid
+                // core stays a constant world size (the fragment normalises by coreFrac).
+                let rWorld = 20.0 * (1.0 + glowAmt * 3.5);
                 let qx = rWorld / spanX;
                 let qy = rWorld / spanY;
                 var o: VOut;
@@ -1735,7 +1762,7 @@ export class ParticleSimulation {
                 o.uv     = quad;
                 let ownColor = COLORS[min(u32(p.typeId), ${MAX_TYPES - 1}u)];
                 o.color  = mix(ownColor, vec4f(1.0, 1.0, 1.0, 1.0), whiteness);
-                o.glow   = view.glow;
+                o.glow   = glowAmt;
                 o.typeId = p.typeId;
                 let tt   = u32(p.typeId);
                 o.spin   = select(0.0, orientation[inst].x, simMode3);
@@ -1790,24 +1817,36 @@ export class ParticleSimulation {
                     let c = cos(i.spin); let s = sin(i.spin);
                     uv = vec2f(c * i.uv.x - s * i.uv.y, s * i.uv.x + c * i.uv.y);
                 }
-                let d = select(length(uv), shapeDist(uv, u32(i.typeId)), view.shapeMode > 0.5);
+                let r = length(uv);
 
-                let solidBright = max(0.0, 1.0 - d * 0.3);
-                let solidAlpha  = select(0.0, solidBright, d < 1.0);
+                // The solid core is a constant world size even as the quad grows for the
+                // halo: coreFrac is the core's fraction of the (glow-expanded) quad.
+                let coreFrac = 1.0 / (1.0 + i.glow * 3.5);
+                let dShape   = select(r, shapeDist(uv, u32(i.typeId)), view.shapeMode > 0.5);
+                let dCore    = dShape / coreFrac;                       // 1 at the core edge
+                let solidBright = max(0.0, 1.0 - dCore * 0.3);
+                let solidAlpha  = select(0.0, solidBright, dCore < 1.0);
 
-                let k         = mix(12.0, 1.8, i.glow);
-                let glowAlpha = exp(-d * d * k);
+                // Soft halo, windowed so it reaches exactly 0 at the quad's inscribed
+                // edge (r = 1). Subtracting the edge value and renormalising removes the
+                // hard cutoff that used to show the quad as a bright square at high glow.
+                let w     = 0.5;
+                let gss   = exp(-(r * r) / (w * w));
+                let gEdge = exp(-1.0 / (w * w));
+                let halo  = clamp((gss - gEdge) / (1.0 - gEdge), 0.0, 1.0);
 
-                var alpha = mix(solidAlpha, glowAlpha, i.glow) * view.alpha;
+                // Halo only appears with glow (already density-scaled per particle); the
+                // solid core is always present so sparse particles stay crisp.
+                var alpha = max(solidAlpha, halo * i.glow) * view.alpha;
 
-                // Patch nubs: bright lobes at each valence direction near the rim.
+                // Patch nubs: bright lobes at each valence direction near the core rim.
                 var patchBoost = 0.0;
                 if (i.patchN > 0.5) {
                     let ang  = atan2(uv.y, uv.x);
                     let step = 6.28318530718 / i.patchN;
                     let pa   = round(ang / step) * step;
                     let nub  = pow(max(cos(ang - pa), 0.0), 16.0);
-                    let ring = smoothstep(0.45, 0.85, d) * (1.0 - smoothstep(1.0, 1.25, d));
+                    let ring = smoothstep(0.45, 0.85, dCore) * (1.0 - smoothstep(1.0, 1.25, dCore));
                     patchBoost = nub * ring;
                     alpha = max(alpha, patchBoost * 0.95 * view.alpha);
                 }
@@ -1815,7 +1854,13 @@ export class ParticleSimulation {
 
                 let lum = dot(i.color.rgb, vec3f(0.299, 0.587, 0.114));
                 let col = mix(vec3f(lum), i.color.rgb, view.sat) + vec3f(patchBoost) * 0.7;
-                return vec4f(col * alpha * view.additiveStr, alpha);
+
+                // Premultiplied output. We deposit full light (col * alpha) but write a
+                // lower occlusion alpha (× occK) so overlapping particles in dense regions
+                // build up additively while isolated ones still read as solid.
+                // additiveStr 0 → occK 1 (pure solid); higher → more additive build-up.
+                let occK = mix(1.0, 0.2, view.additiveStr);
+                return vec4f(col * alpha, alpha * occK);
             }
         `;
     }
