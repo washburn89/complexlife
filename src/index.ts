@@ -1411,9 +1411,13 @@ class ParticleLifeApp {
         const VE: any = (window as any).VideoEncoder;
         const fps = 60;
         const total = Math.round(this.videoDurationSec * fps);
-        let w = Math.max(2, Math.round(rect.w)); w -= w % 2;   // codecs want even dims
-        let h = Math.max(2, Math.round(rect.h)); h -= h % 2;
-        const bitrate = Math.min(60_000_000, Math.max(8_000_000, Math.round(w * h * fps * 0.12)));
+        // Downscale the output so encoding stays fast (full window res is overkill
+        // for a clip). Longest side is capped; aspect preserved; dims forced even.
+        const MAX_DIM = 1280;
+        const scale = Math.min(1, MAX_DIM / Math.max(rect.w, rect.h));
+        let w = Math.max(2, Math.round(rect.w * scale)); w -= w % 2;
+        let h = Math.max(2, Math.round(rect.h * scale)); h -= h % 2;
+        const bitrate = Math.min(40_000_000, Math.max(6_000_000, Math.round(w * h * fps * 0.12)));
 
         // Pick a supported codec (VP9 preferred, then VP8).
         let codecStr = '', muxCodec = 'V_VP9';
@@ -1432,7 +1436,14 @@ class ParticleLifeApp {
             output: (chunk: any, meta: any) => muxer.addVideoChunk(chunk, meta),
             error:  (e: any) => { encErr = e; },
         });
-        encoder.configure({ codec: codecStr, width: w, height: h, bitrate, framerate: fps, latencyMode: 'quality' });
+        encoder.configure({ codec: codecStr, width: w, height: h, bitrate, framerate: fps, latencyMode: 'realtime' });
+
+        // Capture target: downscaled (and cropped) copy of the live canvas. Drawing
+        // from the canvas on the GPU avoids a per-frame readback + CPU pixel copy.
+        const tcanvas = document.createElement('canvas');
+        tcanvas.width = w; tcanvas.height = h;
+        const tctx = tcanvas.getContext('2d');
+        if (!tctx) { try { encoder.close(); } catch {} this.startRecording(rect); return; }
 
         const VF: any = (window as any).VideoFrame;
         this.isRecording = true;
@@ -1445,21 +1456,14 @@ class ParticleLifeApp {
         try {
             for (let i = 0; i < total; i++) {
                 if (this.renderCancel || encErr) break;
-                await this.sim.stepAndAwait();   // deterministic physics step (+ on-screen render for feedback)
-                // Grab real pixels from an offscreen render (avoids canvas-present
-                // timing issues), cropped tightly to the target rect.
-                const cap = await this.sim.captureRGBA();
-                if (!cap) break;
-                const buf = new Uint8ClampedArray(w * h * 4);
-                for (let row = 0; row < h; row++) {
-                    const srcStart = ((rect.y + row) * cap.width + rect.x) * 4;
-                    buf.set(cap.data.subarray(srcStart, srcStart + w * 4), row * w * 4);
-                }
-                const frame = new VF(buf, {
-                    format: 'RGBA', codedWidth: w, codedHeight: h,
+                await this.sim.stepAndAwait();   // deterministic physics step + on-screen render
+                // Blit (downscale + crop) the freshly-rendered canvas into the target,
+                // then hand it straight to the encoder — no readback, no CPU copy.
+                tctx.drawImage(this.canvas, rect.x, rect.y, rect.w, rect.h, 0, 0, w, h);
+                const frame = new VF(tcanvas, {
                     timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps),
                 });
-                encoder.encode(frame, { keyFrame: i % fps === 0 });
+                encoder.encode(frame, { keyFrame: i % 60 === 0 });
                 frame.close();
                 this.syncRenderProgress(i + 1, total);
                 // Drain encoder backpressure and yield so the UI stays responsive
@@ -1467,7 +1471,9 @@ class ParticleLifeApp {
                 while (encoder.encodeQueueSize > 6 && !this.renderCancel) {
                     await new Promise(r => setTimeout(r, 0));
                 }
-                if (i % 2 === 0) await new Promise(r => requestAnimationFrame(() => r(null)));
+                // Yield to the UI occasionally (repaint progress + allow cancel)
+                // without paying a full frame-wait every step.
+                if (i % 8 === 0) await new Promise(r => requestAnimationFrame(() => r(null)));
             }
             if (!this.renderCancel && !encErr) {
                 await encoder.flush();
