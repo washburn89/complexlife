@@ -582,9 +582,9 @@
                         "metabolism". Patchy bonding (above) still applies when enabled.
                     </p>
                     <div class="settings-row">
-                        <label>Max Transform</label>
-                        <input type="range" id="dnfMaxSlider" min="0.01" max="1.0" step="0.01" value="0.5">
-                        <span class="val" id="dnfMaxValue">0.50</span>
+                        <label>Transform 1 in</label>
+                        <input type="number" id="dnfMaxSlider" min="1" step="1" value="2" style="width:7em" title="50% chance per tick">
+                        <span class="val" id="dnfMaxValue" title="50% chance per tick">50%</span>
                     </div>
                     <div class="settings-row">
                         <label>Directional bonding</label>
@@ -652,9 +652,9 @@
                             exclusion field is never a trigger. Click a cell to edit its rule.
                         </p>
                         <div class="settings-row">
-                            <label>Max Transform</label>
-                            <input type="range" id="qftMaxSlider" min="0.01" max="1.0" step="0.01" value="0.5">
-                            <span class="val" id="qftMaxValue">0.50</span>
+                            <label>Transform 1 in</label>
+                            <input type="number" id="qftMaxSlider" min="1" step="1" value="2" style="width:7em" title="50% chance per tick">
+                            <span class="val" id="qftMaxValue" title="50% chance per tick">50%</span>
                         </div>
                         <div class="btn-row" style="margin:8px 0;">
                             <button id="randomizeQftTransformBtn">Randomize transforms</button>
@@ -687,9 +687,9 @@
                         the higher the chance (up to Max Transform per tick at 3× threshold). First match wins.
                     </p>
                     <div class="settings-row">
-                        <label>Max Transform</label>
-                        <input type="range" id="maxTransformSlider" min="0.01" max="1.0" step="0.01" value="0.5">
-                        <span class="val" id="maxTransformValue">0.50</span>
+                        <label>Transform 1 in</label>
+                        <input type="number" id="maxTransformSlider" min="1" step="1" value="2" style="width:7em" title="50% chance per tick">
+                        <span class="val" id="maxTransformValue" title="50% chance per tick">50%</span>
                     </div>
                     <div class="btn-row" style="margin:8px 0;">
                         <button id="randomizeTransformBtn">Randomize rules</button>

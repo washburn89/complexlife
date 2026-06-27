@@ -3558,7 +3558,9 @@ export class ParticleSimulation {
     setFriction(v: number): void { this.friction = Math.max(0, Math.min(0.99,v)); }
     getFriction(): number { return this.friction; }
 
-    setMaxTransformRate(v: number): void { this.maxTransformRate = Math.max(0.01, Math.min(1.0, v)); }
+    // Stored as a per-tick probability; the UI feeds 1/X so very rare rates
+    // (e.g. 1 in 1,000,000 → 1e-6) must be allowed through, hence no 0.01 floor.
+    setMaxTransformRate(v: number): void { this.maxTransformRate = Math.max(0, Math.min(1.0, v)); }
     getMaxTransformRate(): number { return this.maxTransformRate; }
 
     setView(cx: number, cy: number, zoom: number): void { this.view = { cx, cy, zoom }; }
