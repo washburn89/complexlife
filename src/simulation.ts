@@ -2642,12 +2642,36 @@ export class ParticleSimulation {
                 var accel  = vec2f(0.0);
                 var fieldForce: array<f32, ${MAX_FIELDS}>;  // signed per-field force felt (transforms)
 
+                // Hoist self-only data out of the neighbour loop. Only fields this
+                // particle is actually susceptible to can produce force, so compact
+                // them into a dense active list once — neighbours then iterate just
+                // those, and the per-field susceptibility/range/strength are read
+                // once instead of once per neighbour per field.
+                var afIdx:   array<u32, ${MAX_FIELDS}>;   // real field index
+                var afSusc:  array<f32, ${MAX_FIELDS}>;   // my susceptibility
+                var afRange: array<f32, ${MAX_FIELDS}>;   // field range param
+                var afStr:   array<f32, ${MAX_FIELDS}>;   // field strength param
+                var nActive: u32 = 0u;
+                for (var fi: u32 = 0u; fi < numFields; fi++) {
+                    let s = susc[myBase + fi];
+                    if (s != 0.0 && fp.f[fi].x > 0.0) {
+                        afIdx[nActive]   = fi;
+                        afSusc[nActive]  = s;
+                        afRange[nActive] = fp.f[fi].x;
+                        afStr[nActive]   = fp.f[fi].y;
+                        nActive++;
+                    }
+                }
+
                 let gw = i32(gridParams.gridW);
                 let gh = i32(gridParams.gridH);
                 let cs = gridParams.cellSize;
                 let myGx = clamp(i32(p.pos.x / cs), 0, gw - 1);
                 let myGy = clamp(i32(p.pos.y / cs), 0, gh - 1);
+                let halfW = width  * 0.5;
+                let halfH = height * 0.5;
 
+                if (nActive > 0u) {
                 for (var goy = -1; goy <= 1; goy++) {
                     for (var gox = -1; gox <= 1; gox++) {
                         var ngx = myGx + gox;
@@ -2669,29 +2693,33 @@ export class ParticleSimulation {
                             var dx = other.pos.x - p.pos.x;
                             var dy = other.pos.y - p.pos.y;
                             if (edgeMode == 0u) {
-                                if (dx >  width  * 0.5) { dx -= width;  }
-                                if (dx < -width  * 0.5) { dx += width;  }
-                                if (dy >  height * 0.5) { dy -= height; }
-                                if (dy < -height * 0.5) { dy += height; }
+                                if (dx >  halfW) { dx -= width;  }
+                                if (dx < -halfW) { dx += width;  }
+                                if (dy >  halfH) { dy -= height; }
+                                if (dy < -halfH) { dy += height; }
                             }
-                            let dist = sqrt(dx * dx + dy * dy);
-                            if (dist < 0.1) { continue; }
+                            let d2 = dx * dx + dy * dy;
+                            if (d2 < 0.01) { continue; }
+                            let dist = sqrt(d2);
                             let dir = vec2f(dx, dy) / dist;
 
-                            // Force I feel in each field: my susceptibility × the other's
-                            // charge (non-reciprocal — i feeling j differs from j feeling i).
-                            for (var fi: u32 = 0u; fi < numFields; fi++) {
-                                let cpl = susc[myBase + fi] * charges[otherBase + fi];
+                            // Force I feel in each active field: my susceptibility × the
+                            // other's charge (non-reciprocal — i feeling j differs from
+                            // j feeling i).
+                            for (var a: u32 = 0u; a < nActive; a++) {
+                                let fi  = afIdx[a];
+                                let cpl = afSusc[a] * charges[otherBase + fi];
                                 if (cpl == 0.0) { continue; }
-                                let range = fp.f[fi].x * min(abs(cpl), 2.0);   // capped so outliers don't blow up the grid
-                                if (range <= 0.0 || dist >= range) { continue; }
+                                let range = afRange[a] * min(abs(cpl), 2.0);   // capped so outliers don't blow up the grid
+                                if (dist >= range) { continue; }
                                 let prof = 1.0 - dist / range;                 // 1 near → 0 at range
-                                let mag  = fp.f[fi].y * cpl * prof * 0.1;      // cpl>0 = repel
+                                let mag  = afStr[a] * cpl * prof * 0.1;        // cpl>0 = repel
                                 accel -= dir * mag;                            // repel pushes away
                                 fieldForce[fi] += mag;                         // signed force felt (transforms)
                             }
                         }
                     }
+                }
                 }
 
                 let fric = pow(params.friction, speed);
