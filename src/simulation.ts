@@ -163,8 +163,15 @@ const TFORM_STRIDE = 3;
 export const MAX_FIELDS = 12;
 
 const OPEN_MULT            = 8;
-const MAX_GRID_DIM         = 64;
-const MAX_CELLS            = MAX_GRID_DIM * MAX_GRID_DIM;  // 4096
+// Spatial-grid budget. The grid must cover the whole world (particles bounce at
+// the world edge), but neighbour search is only cheap when cellSize ≈ the
+// interaction radius. In open mode the world is OPEN_MULT× larger per axis, so a
+// small per-axis cap forced cells far bigger than the interaction radius —
+// every populated cell then held a huge particle count and the O(per-cell)
+// neighbour loop blew up. A 256-cap keeps cellSize ≈ maxRadius across the open
+// world; the extra (mostly empty) cells only cost a trivially cheap clear/scan.
+const MAX_GRID_DIM         = 256;
+const MAX_CELLS            = MAX_GRID_DIM * MAX_GRID_DIM;  // 65536; must stay a multiple of 256 (prefix-sum CHUNK)
 const MAX_PARTICLE_CAPACITY = 300_000;
 
 function hslToHex(h: number, s: number, l: number): string {
