@@ -1243,7 +1243,7 @@ export class ParticleSimulation {
                     const q = Math.abs(this.charges[t * MAX_FIELDS + f] ?? 0); if (q > mq) mq = q;
                     const s = Math.abs(this.susc[t * MAX_FIELDS + f]    ?? 0); if (s > ms) ms = s;
                 }
-                const r = (this.fieldRange[f] ?? 0) * mq * ms;  // range = R * |susc * charge|
+                const r = (this.fieldRange[f] ?? 0) * Math.min(mq * ms, 2);  // matches the kernel's range cap
                 if (r > maxRadius) maxRadius = r;
             }
         } else {
@@ -2683,7 +2683,7 @@ export class ParticleSimulation {
                             for (var fi: u32 = 0u; fi < numFields; fi++) {
                                 let cpl = susc[myBase + fi] * charges[otherBase + fi];
                                 if (cpl == 0.0) { continue; }
-                                let range = fp.f[fi].x * abs(cpl);
+                                let range = fp.f[fi].x * min(abs(cpl), 2.0);   // capped so outliers don't blow up the grid
                                 if (range <= 0.0 || dist >= range) { continue; }
                                 let prof = 1.0 - dist / range;                 // 1 near → 0 at range
                                 let mag  = fp.f[fi].y * cpl * prof * 0.1;      // cpl>0 = repel
@@ -3238,7 +3238,20 @@ export class ParticleSimulation {
     // — independent values make the forces non-reciprocal, which drives motion. The
     // exclusion field stays at 1/1 (universal symmetric repulsion).
     randomizeCharges(): void {
-        const rv = () => Math.random() < 0.4 ? 0 : Math.round((Math.random() * 2 - 1) * 100) / 100;
+        const sign = () => (Math.random() < 0.5 ? -1 : 1);
+        // Charge / susceptibility: ~35% none, mostly ~0.3–1.2, occasional outliers to ~3.5.
+        const rv = () => {
+            if (Math.random() < 0.35) return 0;
+            let m = 0.3 + Math.random() * 0.9;
+            if (Math.random() < 0.15) m = 1.2 + Math.pow(Math.random(), 2) * 2.3;
+            return Math.round(sign() * m * 100) / 100;
+        };
+        // Field strength: signed, mostly ~0.4–1.5, occasional strong outliers to ~6.
+        const rs = () => {
+            let m = 0.4 + Math.random() * 1.1;
+            if (Math.random() < 0.22) m = 1.5 + Math.pow(Math.random(), 2) * 4.5;
+            return Math.round(sign() * m * 100) / 100;
+        };
         for (let t = 0; t < MAX_TYPES; t++) {
             this.charges[t * MAX_FIELDS + 0] = 1;   // exclusion always on
             this.susc[t * MAX_FIELDS + 0]    = 1;
@@ -3247,12 +3260,22 @@ export class ParticleSimulation {
                 this.susc[t * MAX_FIELDS + f]    = rv();
             }
         }
-        // Randomize each interaction field's reach and strength too (exc untouched).
-        // Strength can be negative and mostly sits near ±1 with a tail to ±5.
         for (let f = 1; f < MAX_FIELDS; f++) {
             this.fieldRange[f]    = Math.round(triRand(40, 110, 240));
-            this.fieldStrength[f] = randStrength();   // signed, ~±1 typical, tail to ±5
+            this.fieldStrength[f] = rs();
         }
+        // Exclusion strength is kept a bit above the strongest interaction force, so
+        // the anti-pile repulsion always wins at contact even with force outliers.
+        let maxEff = 0;
+        for (let f = 1; f < this.numFields; f++) {
+            let mq = 0, ms = 0;
+            for (let t = 0; t < this.numTypes; t++) {
+                mq = Math.max(mq, Math.abs(this.charges[t * MAX_FIELDS + f]));
+                ms = Math.max(ms, Math.abs(this.susc[t * MAX_FIELDS + f]));
+            }
+            maxEff = Math.max(maxEff, Math.abs(this.fieldStrength[f]) * mq * ms);
+        }
+        this.fieldStrength[0] = Math.max(3, Math.round(maxEff * 1.3 * 100) / 100);
         this.qftDirty = true;
     }
 
