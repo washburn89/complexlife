@@ -14,9 +14,11 @@ const DNF_OPSYM = ['>', '≥', '<', '≤'];
 // ── Color helpers ─────────────────────────────────────────────────────────────
 
 function strengthToColor(v: number): string {
-    const c = Math.max(-1, Math.min(1, v));
-    if (c < 0) { const t = Math.round(-c * 180); return `rgb(${t},0,0)`; }
-    const t = Math.round(c * 180); return `rgb(0,${t},0)`;
+    // Perceptual ramp so the full ±5 range stays distinguishable (sqrt keeps small
+    // values visible; magnitudes past ±5 saturate).
+    const mag = Math.sqrt(Math.min(Math.abs(v), 5) / 5);
+    const t = Math.round(40 + mag * 190);
+    return v < 0 ? `rgb(${t},0,0)` : `rgb(0,${t},0)`;
 }
 
 function radiusToColor(v: number): string {
@@ -1931,7 +1933,7 @@ class ParticleLifeApp {
             line.appendChild(opSel);
 
             const thr = document.createElement('input');
-            thr.type = 'number'; thr.step = '0.05'; thr.min = '-3'; thr.max = '3'; thr.value = String(cd.threshold);
+            thr.type = 'number'; thr.step = '0.05'; thr.min = '-10'; thr.max = '10'; thr.value = String(cd.threshold);
             thr.addEventListener('change', () => { cd.threshold = Number(thr.value) || 0; thr.value = String(cd.threshold); commit(); });
             line.appendChild(thr);
 
@@ -2102,7 +2104,7 @@ class ParticleLifeApp {
         title.innerHTML = `${pip(from)}${TYPE_LABELS[from]} → ${pip(to)}${TYPE_LABELS[to]} <span style="color:#888">${kindLabel}</span>`;
 
         if (kind === 'strength') {
-            Object.assign(slider, { min: '-1', max: '1', step: '0.01' });
+            Object.assign(slider, { min: '-5', max: '5', step: '0.05' });
             display.textContent = cur.toFixed(2);
             row2.style.display = 'none';
         } else if (kind === 'radius') {

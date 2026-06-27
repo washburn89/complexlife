@@ -177,6 +177,23 @@ function triRand(a: number, c: number, b: number): number {
         : b - Math.sqrt((1 - u) * (b - a) * (b - c));
 }
 
+// Random force strength: signed, mostly within ±1 with a rare heavy tail out to
+// ±5 (probability falls off the further past 1 it goes).
+function randStrength(): number {
+    const sign = Math.random() < 0.5 ? -1 : 1;
+    let m = Math.random();                                            // core 0..1
+    if (Math.random() < 0.18) m = 1 + Math.pow(Math.random(), 2) * 4; // ~18%: tail 1..5, low-biased
+    return Math.round(sign * m * 1000) / 1000;
+}
+
+// Random transform-threshold magnitude: mostly 0.2..2 with a rare tail out to 10
+// (low-biased). Sign is applied by the caller (upper positive, lower negative).
+function randThreshMag(): number {
+    let m = 0.2 + Math.random() * 1.8;                               // core 0.2..2
+    if (Math.random() < 0.22) m = 2 + Math.pow(Math.random(), 2) * 8; // ~22%: tail 2..10, low-biased
+    return Math.round(m * 100) / 100;
+}
+
 export class ParticleSimulation {
     private canvas: HTMLCanvasElement;
     private adapter: GPUAdapter | null = null;
@@ -374,7 +391,7 @@ export class ParticleSimulation {
             this.params.forceMatrix[from] = {};
             for (let to = 0; to < MAX_TYPES; to++) {
                 this.params.forceMatrix[from][to] = {
-                    strength:  (Math.random() * 2 - 1) * 0.7,
+                    strength:  randStrength(),
                     radius:    70 + Math.random() * 40,
                     minRadius: 0,
                 };
@@ -395,11 +412,11 @@ export class ParticleSimulation {
             return {
                 upperEnabled:   Math.random() < 0.25,
                 upperInclusive: false,
-                upperThreshold: 0.3 + Math.random() * 0.5,
+                upperThreshold: randThreshMag(),
                 upperTarget:    randTarget(),
                 lowerEnabled:   Math.random() < 0.25,
                 lowerInclusive: false,
-                lowerThreshold: -(0.3 + Math.random() * 0.5),
+                lowerThreshold: -randThreshMag(),
                 lowerTarget:    randTarget(),
             };
         });
@@ -2714,7 +2731,7 @@ export class ParticleSimulation {
                 for (let other = 0; other < newN; other++) {
                     if (this.params.forceMatrix[t][other] == null) {
                         this.params.forceMatrix[t][other] = {
-                            strength:  (Math.random() * 2 - 1) * 0.7,
+                            strength:  randStrength(),
                             radius:    triRand(10, 100, 250),
                             minRadius: 0,
                         };
@@ -2722,7 +2739,7 @@ export class ParticleSimulation {
                     if (!this.params.forceMatrix[other]) this.params.forceMatrix[other] = {};
                     if (other !== t && this.params.forceMatrix[other][t] == null) {
                         this.params.forceMatrix[other][t] = {
-                            strength:  (Math.random() * 2 - 1) * 0.7,
+                            strength:  randStrength(),
                             radius:    triRand(10, 100, 250),
                             minRadius: 0,
                         };
@@ -3098,7 +3115,7 @@ export class ParticleSimulation {
         for (let from = 0; from < MAX_TYPES; from++)
             for (let to = 0; to < MAX_TYPES; to++) {
                 const c = this.params.forceMatrix[from]?.[to];
-                if (c) c.strength = (Math.random() * 2 - 1) * 0.7;
+                if (c) c.strength = randStrength();
             }
         this.forcesDirty = true;
     }
@@ -3193,7 +3210,13 @@ export class ParticleSimulation {
             while (t === exclude && n > 1) t = Math.floor(Math.random() * n);
             return t;
         };
-        const randThresh = () => Math.round((Math.random() * 1.4 - 0.4) * 100) / 100;  // ~ -0.4 .. 1.0
+        // Force thresholds scale with the (now larger) force range: mostly low, with
+        // a rare tail, so conditions still fire selectively rather than constantly.
+        const randThresh = () => {
+            let m = Math.random() * 2.5 - 0.4;                                 // core ~ -0.4 .. 2.1
+            if (Math.random() < 0.2) m = 2.1 + Math.pow(Math.random(), 2) * 5; // ~20%: tail to ~7
+            return Math.round(m * 100) / 100;
+        };
         const pick = <T,>(a: T[]) => a[Math.floor(Math.random() * a.length)];
 
         // A random boolean expression over conditions C1..C{nCond}. Only positive
