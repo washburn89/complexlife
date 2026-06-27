@@ -397,6 +397,7 @@ export class ParticleSimulation {
     // opposite → attract) and acts within range = fieldRange * |qi*qj|. Field 0 is
     // the universal exclusion field ("exc") — all types charge 1 by default.
     private numFields = 3;
+    private qftTemperature = 0.3;           // thermal agitation (random kick / tick)
     private fieldRange:    number[] = [];   // intrinsic max range per field
     private fieldStrength: number[] = [];   // force multiplier per field
     private fieldNames:    string[] = [];
@@ -517,7 +518,8 @@ export class ParticleSimulation {
             data[f * 4 + 0] = this.fieldRange[f]    ?? 0;
             data[f * 4 + 1] = this.fieldStrength[f] ?? 0;
         }
-        data[2] = this.numFields;   // f[0].z
+        data[2] = this.numFields;       // f[0].z
+        data[3] = this.qftTemperature;  // f[0].w
         return data as Float32Array<ArrayBuffer>;
     }
 
@@ -2549,6 +2551,9 @@ export class ParticleSimulation {
             @group(0) @binding(6) var<storage, read>       charges:         array<f32>;
             @group(0) @binding(7) var<uniform>             fp:              FieldParams;
 
+            fn uhash(v: u32) -> u32 { var x = v ^ (v >> 16u); x *= 0x45d9f3bu; x ^= x >> 16u; return x; }
+            fn rand01(seed: u32) -> f32 { return f32(uhash(seed)) / 4294967295.0; }
+
             @compute @workgroup_size(256)
             fn main(@builtin(global_invocation_id) id: vec3u) {
                 let idx = id.x;
@@ -2560,6 +2565,8 @@ export class ParticleSimulation {
                 let packed   = u32(params.packed);
                 let edgeMode = (packed >> 8u) & 0xFFu;
                 let numFields = u32(fp.f[0].z);
+                let temp      = fp.f[0].w;           // thermal agitation
+                let frame     = u32(params._p3);
 
                 var p = particles[idx];
                 if (p.typeId < 0.0) { return; }
@@ -2619,6 +2626,12 @@ export class ParticleSimulation {
 
                 let fric = pow(params.friction, speed);
                 p.vel = p.vel * fric + accel * speed;
+                // Thermal agitation: a random kick each tick so the system carries
+                // kinetic energy and doesn't freeze into a static lattice.
+                if (temp > 0.0) {
+                    let a = rand01(uhash(idx) ^ uhash(frame * 2654435761u)) * 6.28318530718;
+                    p.vel += vec2f(cos(a), sin(a)) * temp;
+                }
                 p.pos = p.pos + p.vel;
 
                 if (edgeMode == 0u) {
@@ -3089,6 +3102,8 @@ export class ParticleSimulation {
     setSimMode(mode: 0 | 1 | 2 | 3 | 4 | 5 | 6): void { this.simMode = mode; }
 
     // ── Mode 6 (QFT) controls ───────────────────────────────────────────────────
+    getQftTemperature(): number { return this.qftTemperature; }
+    setQftTemperature(v: number): void { this.qftTemperature = Math.max(0, v); this.qftDirty = true; }
     getNumFields(): number { return this.numFields; }
     setNumFields(n: number): void {
         this.numFields = Math.max(1, Math.min(MAX_FIELDS, Math.round(n)));
@@ -3691,6 +3706,7 @@ export class ParticleSimulation {
             dnfTypes:         this.getDnfTypes(),
             dnfBonding:       this.dnfBonding,
             numFields:        this.numFields,
+            qftTemperature:   this.qftTemperature,
             fieldRange:       this.fieldRange.slice(0, this.numFields),
             fieldStrength:    this.fieldStrength.slice(0, this.numFields),
             charges:          this.getCharges(),
@@ -3803,6 +3819,7 @@ export class ParticleSimulation {
         if (state.dnfBonding != null) this.dnfBonding = Boolean(state.dnfBonding);
 
         if (state.numFields != null) this.numFields = Math.max(1, Math.min(MAX_FIELDS, Number(state.numFields)));
+        if (state.qftTemperature != null) this.qftTemperature = Math.max(0, Number(state.qftTemperature));
         if (Array.isArray(state.fieldRange))    for (let f = 0; f < this.numFields; f++) if (state.fieldRange[f]    != null) this.fieldRange[f]    = Math.max(0, Number(state.fieldRange[f]));
         if (Array.isArray(state.fieldStrength)) for (let f = 0; f < this.numFields; f++) if (state.fieldStrength[f] != null) this.fieldStrength[f] = Number(state.fieldStrength[f]);
         if (Array.isArray(state.charges)) {

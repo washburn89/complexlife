@@ -375,6 +375,12 @@ class ParticleLifeApp {
             this.sim?.setNumFields(v);
             this.refreshQftPanel();
         });
+        const qftTempSlider = document.getElementById('qftTempSlider') as HTMLInputElement;
+        qftTempSlider.addEventListener('input', () => {
+            const v = Number(qftTempSlider.value);
+            document.getElementById('qftTempValue')!.textContent = v.toFixed(2);
+            this.sim?.setQftTemperature(v);
+        });
         const dnfMaxSlider = document.getElementById('dnfMaxSlider') as HTMLInputElement;
         dnfMaxSlider.addEventListener('input', () => {
             const v = parseFloat(dnfMaxSlider.value);
@@ -1891,6 +1897,9 @@ class ParticleLifeApp {
     private refreshQftPanel(): void {
         if (!this.sim) return;
         (document.getElementById('qftFieldCount') as HTMLInputElement).value = String(this.sim.getNumFields());
+        const temp = this.sim.getQftTemperature();
+        (document.getElementById('qftTempSlider') as HTMLInputElement).value = String(temp);
+        document.getElementById('qftTempValue')!.textContent = temp.toFixed(2);
         this.buildQftFieldTable();
         this.buildQftChargeMatrix();
     }
