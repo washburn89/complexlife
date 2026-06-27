@@ -404,7 +404,7 @@ export class ParticleSimulation {
     // opposite → attract) and acts within range = fieldRange * |qi*qj|. Field 0 is
     // the universal exclusion field ("exc") — all types charge 1 by default.
     private numFields = 3;
-    private qftTemperature = 0.3;           // thermal agitation (random kick / tick)
+    private temperature = 0.3;              // global thermal agitation (random kick / tick), all modes
     private fieldRange:    number[] = [];   // intrinsic max range per field
     private fieldStrength: number[] = [];   // force multiplier per field
     private fieldNames:    string[] = [];
@@ -565,8 +565,8 @@ export class ParticleSimulation {
             data[f * 4 + 0] = this.fieldRange[f]    ?? 0;
             data[f * 4 + 1] = this.fieldStrength[f] ?? 0;
         }
-        data[2] = this.numFields;       // f[0].z
-        data[3] = this.qftTemperature;  // f[0].w
+        data[2] = this.numFields;     // f[0].z
+        data[3] = this.temperature;   // f[0].w (legacy slot; QFT kernel now reads params.temp)
         return data as Float32Array<ArrayBuffer>;
     }
 
@@ -741,9 +741,10 @@ export class ParticleSimulation {
         return data;
     }
 
-    // params: two vec4f (32 bytes).
+    // params: three vec4f (48 bytes).
     // [0] speed, worldW, worldH, packed(simMode|edgeMode|numTypes|poleWorldFrame as float)
-    // [1] friction, maxTransformRate, dnfBonding(0/1), 0
+    // [1] friction, maxTransformRate, dnfBonding(0/1), frameCounter
+    // [2] temperature (global thermal kick, all modes), 0, 0, 0
     private paramsArray(): Float32Array<ArrayBuffer> {
         const packed = (this.poleWorldFrame ? (1 << 24) : 0)
                      | (this.numTypes << 16) | (this.edgeMode << 8) | this.simMode;
@@ -756,6 +757,8 @@ export class ParticleSimulation {
             this.maxTransformRate,
             this.dnfBonding ? 1 : 0,
             this.frameCounter,
+            this.temperature,
+            0, 0, 0,
         ]) as Float32Array<ArrayBuffer>;
     }
 
@@ -1422,7 +1425,8 @@ export class ParticleSimulation {
             }
             struct GridParams  { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
             struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
-                                friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+                                friction: f32, maxRate: f32, _p2: f32, _p3: f32,
+                                temp: f32, _p5: f32, _p6: f32, _p7: f32 }
 
             struct TypeMasses { m: array<vec4u, ${TYPE_VEC4}> }
 
@@ -1607,6 +1611,11 @@ export class ParticleSimulation {
                 } else {
                     p.vel = p.vel * fric + accel * speed;
                 }
+                // Global temperature: random thermal kick each tick (all modes).
+                if (params.temp > 0.0) {
+                    let ta = rand01(uhash(idx) ^ uhash(u32(params._p3) * 2654435761u)) * 6.28318530718;
+                    p.vel += vec2f(cos(ta), sin(ta)) * params.temp;
+                }
                 p.pos = p.pos + p.vel;
 
                 if (edgeMode == 0u) {
@@ -1679,7 +1688,8 @@ export class ParticleSimulation {
                           canvasW:f32, canvasH:f32, additiveStr:f32, shapeMode:f32, simTime:f32, _p3:f32 }
 
             struct SimParams { speed: f32, worldW: f32, worldH: f32, packed: f32,
-                              friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+                              friction: f32, maxRate: f32, _p2: f32, _p3: f32,
+                                temp: f32, _p5: f32, _p6: f32, _p7: f32 }
 
             struct PatchConfig {
                 bondStrength: f32, bondRange: f32, bondDist: f32, angStiffness: f32,
@@ -1910,7 +1920,8 @@ export class ParticleSimulation {
                                 lEnabled: f32, lThresh: f32, lTarget: f32 }
             struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
             struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
-                                friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+                                friction: f32, maxRate: f32, _p2: f32, _p3: f32,
+                                temp: f32, _p5: f32, _p6: f32, _p7: f32 }
             struct DiagParams { selectedIdx: u32, _p1: u32, _p2: u32, _p3: u32 }
             struct DiagOutput {
                 pos:           vec2f,
@@ -2257,7 +2268,8 @@ export class ParticleSimulation {
             }
             struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
             struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
-                                friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+                                friction: f32, maxRate: f32, _p2: f32, _p3: f32,
+                                temp: f32, _p5: f32, _p6: f32, _p7: f32 }
             struct PatchConfig {
                 _bs: f32, bondRange: f32, _bd: f32, angStiffness: f32,
                 angFriction: f32, patchWidth: f32, isoScale: f32, coreStrength: f32,
@@ -2504,6 +2516,11 @@ export class ParticleSimulation {
 
                 let fric = pow(params.friction, speed);
                 p.vel = p.vel * fric + accel * speed;
+                // Global temperature: random thermal kick each tick (all modes).
+                if (params.temp > 0.0) {
+                    let ta = rand01(uhash(idx) ^ uhash(u32(params._p3) * 2654435761u)) * 6.28318530718;
+                    p.vel += vec2f(cos(ta), sin(ta)) * params.temp;
+                }
                 p.pos = p.pos + p.vel;
 
                 if (edgeMode == 0u) {
@@ -2639,7 +2656,8 @@ export class ParticleSimulation {
             struct Particle   { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
             struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
             struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
-                                friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+                                friction: f32, maxRate: f32, _p2: f32, _p3: f32,
+                                temp: f32, _p5: f32, _p6: f32, _p7: f32 }
             struct FieldParams { f: array<vec4f, ${MAX_FIELDS}> }  // .x range, .y strength; f[0].z = numFields
 
             @group(0) @binding(0) var<storage, read_write> particles:       array<Particle>;
@@ -2684,7 +2702,7 @@ export class ParticleSimulation {
                 let packed   = u32(params.packed);
                 let edgeMode = (packed >> 8u) & 0xFFu;
                 let numFields = u32(fp.f[0].z);
-                let temp      = fp.f[0].w;           // thermal agitation
+                let temp      = params.temp;          // global thermal agitation
                 let frame     = u32(params._p3);
 
                 var p = particles[idx];
@@ -3272,9 +3290,12 @@ export class ParticleSimulation {
 
     setSimMode(mode: 0 | 1 | 2 | 3 | 4 | 5 | 6): void { this.simMode = mode; }
 
+    // Global temperature: thermal kick per tick, applied in every mode. Read from
+    // the per-frame params buffer, so no dirty flag is needed.
+    getTemperature(): number { return this.temperature; }
+    setTemperature(v: number): void { this.temperature = Math.max(0, v); }
+
     // ── Mode 6 (QFT) controls ───────────────────────────────────────────────────
-    getQftTemperature(): number { return this.qftTemperature; }
-    setQftTemperature(v: number): void { this.qftTemperature = Math.max(0, v); this.qftDirty = true; }
     getNumFields(): number { return this.numFields; }
     setNumFields(n: number): void {
         this.numFields = Math.max(1, Math.min(MAX_FIELDS, Math.round(n)));
@@ -3959,7 +3980,7 @@ export class ParticleSimulation {
             dnfTypes:         this.getDnfTypes(),
             dnfBonding:       this.dnfBonding,
             numFields:        this.numFields,
-            qftTemperature:   this.qftTemperature,
+            temperature:      this.temperature,
             fieldRange:       this.fieldRange.slice(0, this.numFields),
             fieldStrength:    this.fieldStrength.slice(0, this.numFields),
             charges:          this.getCharges(),
@@ -4075,7 +4096,9 @@ export class ParticleSimulation {
         if (state.dnfBonding != null) this.dnfBonding = Boolean(state.dnfBonding);
 
         if (state.numFields != null) this.numFields = Math.max(1, Math.min(MAX_FIELDS, Number(state.numFields)));
-        if (state.qftTemperature != null) this.qftTemperature = Math.max(0, Number(state.qftTemperature));
+        // `temperature` (global); accept legacy `qftTemperature` from older saves.
+        if (state.temperature != null) this.temperature = Math.max(0, Number(state.temperature));
+        else if (state.qftTemperature != null) this.temperature = Math.max(0, Number(state.qftTemperature));
         if (Array.isArray(state.fieldRange))    for (let f = 0; f < this.numFields; f++) if (state.fieldRange[f]    != null) this.fieldRange[f]    = Math.max(0, Number(state.fieldRange[f]));
         if (Array.isArray(state.fieldStrength)) for (let f = 0; f < this.numFields; f++) if (state.fieldStrength[f] != null) this.fieldStrength[f] = Number(state.fieldStrength[f]);
         if (Array.isArray(state.charges)) {

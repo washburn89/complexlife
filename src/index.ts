@@ -379,11 +379,12 @@ class ParticleLifeApp {
             this.sim?.setNumFields(v);
             this.refreshQftPanel();
         });
-        const qftTempSlider = document.getElementById('qftTempSlider') as HTMLInputElement;
-        qftTempSlider.addEventListener('input', () => {
-            const v = Number(qftTempSlider.value);
-            document.getElementById('qftTempValue')!.textContent = v.toFixed(2);
-            this.sim?.setQftTemperature(v);
+        // Global temperature (applies to every mode), lives in the World/Physics panel.
+        const tempSlider = document.getElementById('tempSlider') as HTMLInputElement;
+        tempSlider.addEventListener('input', () => {
+            const v = Number(tempSlider.value);
+            document.getElementById('tempValue')!.textContent = v.toFixed(2);
+            this.sim?.setTemperature(v);
         });
         document.getElementById('randomizeQftTransformBtn')!.addEventListener('click', () => {
             this.sim?.randomizeQftTransforms();
@@ -1950,9 +1951,6 @@ class ParticleLifeApp {
     private refreshQftPanel(): void {
         if (!this.sim) return;
         (document.getElementById('qftFieldCount') as HTMLInputElement).value = String(this.sim.getNumFields());
-        const temp = this.sim.getQftTemperature();
-        (document.getElementById('qftTempSlider') as HTMLInputElement).value = String(temp);
-        document.getElementById('qftTempValue')!.textContent = temp.toFixed(2);
         this.updateTransformRateUI(this.oddsFromRate(this.sim.getMaxTransformRate()), undefined, false);
         this.buildQftFieldTable();
         this.buildQftMatrix('qft-charge-table', this.sim.getCharges(), (t, f, v) => this.sim?.setCharge(t, f, v));
@@ -2654,6 +2652,10 @@ class ParticleLifeApp {
         const drag = 1 - this.sim.getFriction();
         (document.getElementById('frictionSlider') as HTMLInputElement).value = String(drag);
         document.getElementById('frictionValue')!.textContent = drag.toFixed(2);
+
+        const temp = this.sim.getTemperature();
+        (document.getElementById('tempSlider') as HTMLInputElement).value = String(temp);
+        document.getElementById('tempValue')!.textContent = temp.toFixed(2);
 
         this.updateTransformRateUI(this.oddsFromRate(this.sim.getMaxTransformRate()), undefined, false);
 
