@@ -633,8 +633,16 @@
                     </div>
                     <p class="matrix-label">Per field: range · strength</p>
                     <table class="mass-table" id="qft-field-table"></table>
-                    <p class="matrix-label" style="margin-top:12px">Charge · row = type, col = field</p>
+                    <p class="matrix-label" style="margin-top:12px">Charge (sources field) · row = type, col = field</p>
                     <div class="matrix-wrap"><table class="matrix" id="qft-charge-table"></table></div>
+                    <p class="matrix-label" style="margin-top:12px">Susceptibility (responds to field) · row = type, col = field</p>
+                    <div class="matrix-wrap"><table class="matrix" id="qft-susc-table"></table></div>
+                    <p class="tr-hint" style="margin-top:4px;">
+                        Force a particle feels = field strength × <strong>its susceptibility</strong> ×
+                        <strong>the other's charge</strong>. When these differ between two types the force is
+                        non-reciprocal (A chases B while B flees A) — that asymmetry is what makes motion and
+                        chasing behaviours emerge. Set susceptibility to 0 for "ignores this field".
+                    </p>
                 </div>
 
                 <div id="mode2-panel">

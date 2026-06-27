@@ -1901,7 +1901,8 @@ class ParticleLifeApp {
         (document.getElementById('qftTempSlider') as HTMLInputElement).value = String(temp);
         document.getElementById('qftTempValue')!.textContent = temp.toFixed(2);
         this.buildQftFieldTable();
-        this.buildQftChargeMatrix();
+        this.buildQftMatrix('qft-charge-table', this.sim.getCharges(), (t, f, v) => this.sim?.setCharge(t, f, v));
+        this.buildQftMatrix('qft-susc-table',   this.sim.getSusc(),    (t, f, v) => this.sim?.setSusc(t, f, v));
     }
 
     private buildQftFieldTable(): void {
@@ -1932,13 +1933,12 @@ class ParticleLifeApp {
         });
     }
 
-    private buildQftChargeMatrix(): void {
-        const table = document.getElementById('qft-charge-table') as HTMLTableElement;
+    private buildQftMatrix(tableId: string, data: number[][], onset: (t: number, f: number, v: number) => void): void {
+        const table = document.getElementById(tableId) as HTMLTableElement;
         if (!table || !this.sim) return;
         table.innerHTML = '';
         const n = this.sim.getNumTypes();
         const fields = this.sim.getFields();
-        const charges = this.sim.getCharges();
 
         const hdr = document.createElement('tr');
         hdr.innerHTML = '<th></th>' + fields.map(fd => `<th>${fd.name}</th>`).join('');
@@ -1954,9 +1954,9 @@ class ParticleLifeApp {
                 const td = document.createElement('td');
                 const inp = document.createElement('input');
                 inp.type = 'number'; inp.step = '0.1';
-                inp.value = String(Math.round((charges[t]?.[f] ?? 0) * 100) / 100);
+                inp.value = String(Math.round((data[t]?.[f] ?? 0) * 100) / 100);
                 inp.style.cssText = 'width:42px;font-size:9px;background:#1a1a1a;color:#ddd;border:1px solid #333;border-radius:3px;';
-                inp.addEventListener('change', () => this.sim?.setCharge(t, f, Number(inp.value) || 0));
+                inp.addEventListener('change', () => onset(t, f, Number(inp.value) || 0));
                 td.appendChild(inp);
                 row.appendChild(td);
             }

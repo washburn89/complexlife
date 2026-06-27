@@ -401,8 +401,10 @@ export class ParticleSimulation {
     private fieldRange:    number[] = [];   // intrinsic max range per field
     private fieldStrength: number[] = [];   // force multiplier per field
     private fieldNames:    string[] = [];
-    private charges: number[] = [];         // [type*MAX_FIELDS + field], signed
+    private charges: number[] = [];         // [type*MAX_FIELDS + field] — how a type SOURCES a field
+    private susc:    number[] = [];         // [type*MAX_FIELDS + field] — how a type RESPONDS to a field
     private chargesBuffer:     GPUBuffer | null = null;
+    private suscBuffer:        GPUBuffer | null = null;
     private fieldParamsBuffer: GPUBuffer | null = null;
     private mode6BGL:       GPUBindGroupLayout | null = null;
     private mode6Pipeline:  GPUComputePipeline | null = null;
@@ -498,8 +500,12 @@ export class ParticleSimulation {
         this.fieldRange[0]    = 26;
         this.fieldStrength[0] = 6;
         this.charges = Array(MAX_TYPES * MAX_FIELDS).fill(0);
-        for (let t = 0; t < MAX_TYPES; t++) this.charges[t * MAX_FIELDS + 0] = 1;  // exc = 1 for all
-        this.randomizeCharges();   // seed interaction fields (1..) with random charges
+        this.susc    = Array(MAX_TYPES * MAX_FIELDS).fill(0);
+        for (let t = 0; t < MAX_TYPES; t++) {
+            this.charges[t * MAX_FIELDS + 0] = 1;  // exc: every type sources...
+            this.susc[t * MAX_FIELDS + 0]    = 1;  // ...and responds to the exclusion field
+        }
+        this.randomizeCharges();   // seed interaction fields (1..) with random charge + susceptibility
         this.qftDirty = true;
     }
 
@@ -507,6 +513,12 @@ export class ParticleSimulation {
     private generateChargesData(): Float32Array<ArrayBuffer> {
         const data = new Float32Array(MAX_TYPES * MAX_FIELDS);
         for (let i = 0; i < MAX_TYPES * MAX_FIELDS; i++) data[i] = this.charges[i] ?? 0;
+        return data as Float32Array<ArrayBuffer>;
+    }
+
+    private generateSuscData(): Float32Array<ArrayBuffer> {
+        const data = new Float32Array(MAX_TYPES * MAX_FIELDS);
+        for (let i = 0; i < MAX_TYPES * MAX_FIELDS; i++) data[i] = this.susc[i] ?? 0;
         return data as Float32Array<ArrayBuffer>;
     }
 
@@ -808,6 +820,8 @@ export class ParticleSimulation {
         // Mode 6 (QFT) buffers.
         this.chargesBuffer = this.device!.createBuffer({ label: 'charges', size: MAX_TYPES * MAX_FIELDS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
         this.queue!.writeBuffer(this.chargesBuffer, 0, this.generateChargesData());
+        this.suscBuffer = this.device!.createBuffer({ label: 'susc', size: MAX_TYPES * MAX_FIELDS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        this.queue!.writeBuffer(this.suscBuffer, 0, this.generateSuscData());
         this.fieldParamsBuffer = this.device!.createBuffer({ label: 'fieldParams', size: MAX_FIELDS * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.queue!.writeBuffer(this.fieldParamsBuffer, 0, this.generateFieldParamsData());
     }
@@ -994,8 +1008,9 @@ export class ParticleSimulation {
             { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellCount
             { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellStart
             { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // params
-            { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // charges
+            { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // charges (source)
             { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // fieldParams
+            { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // susceptibility (response)
         ]});
         this.mode6Pipeline = this.device.createComputePipeline({
             layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.mode6BGL] }),
@@ -1166,7 +1181,7 @@ export class ParticleSimulation {
             });
         }
 
-        if (this.mode6BGL && this.chargesBuffer && this.fieldParamsBuffer) {
+        if (this.mode6BGL && this.chargesBuffer && this.fieldParamsBuffer && this.suscBuffer) {
             this.mode6BindGroup = this.device.createBindGroup({
                 layout: this.mode6BGL,
                 entries: [
@@ -1178,6 +1193,7 @@ export class ParticleSimulation {
                     { binding: 5, resource: { buffer: this.paramsBuffer          } },
                     { binding: 6, resource: { buffer: this.chargesBuffer         } },
                     { binding: 7, resource: { buffer: this.fieldParamsBuffer     } },
+                    { binding: 8, resource: { buffer: this.suscBuffer            } },
                 ],
             });
         }
@@ -1190,12 +1206,12 @@ export class ParticleSimulation {
         if (this.simMode === 6) {
             // QFT: cells must cover the largest field range = fieldRange * maxCharge².
             for (let f = 0; f < this.numFields; f++) {
-                let mc = 0;
+                let mq = 0, ms = 0;
                 for (let t = 0; t < this.numTypes; t++) {
-                    const c = Math.abs(this.charges[t * MAX_FIELDS + f] ?? 0);
-                    if (c > mc) mc = c;
+                    const q = Math.abs(this.charges[t * MAX_FIELDS + f] ?? 0); if (q > mq) mq = q;
+                    const s = Math.abs(this.susc[t * MAX_FIELDS + f]    ?? 0); if (s > ms) ms = s;
                 }
-                const r = (this.fieldRange[f] ?? 0) * mc * mc;
+                const r = (this.fieldRange[f] ?? 0) * mq * ms;  // range = R * |susc * charge|
                 if (r > maxRadius) maxRadius = r;
             }
         } else {
@@ -2550,6 +2566,7 @@ export class ParticleSimulation {
             @group(0) @binding(5) var<uniform>             params:          SimParams;
             @group(0) @binding(6) var<storage, read>       charges:         array<f32>;
             @group(0) @binding(7) var<uniform>             fp:              FieldParams;
+            @group(0) @binding(8) var<storage, read>       susc:            array<f32>;
 
             fn uhash(v: u32) -> u32 { var x = v ^ (v >> 16u); x *= 0x45d9f3bu; x ^= x >> 16u; return x; }
             fn rand01(seed: u32) -> f32 { return f32(uhash(seed)) / 4294967295.0; }
@@ -2610,14 +2627,15 @@ export class ParticleSimulation {
                             if (dist < 0.1) { continue; }
                             let dir = vec2f(dx, dy) / dist;
 
-                            // Sum the force over every field this pair shares a charge in.
+                            // Force I feel in each field: my susceptibility × the other's
+                            // charge (non-reciprocal — i feeling j differs from j feeling i).
                             for (var fi: u32 = 0u; fi < numFields; fi++) {
-                                let qq = charges[myBase + fi] * charges[otherBase + fi];
-                                if (qq == 0.0) { continue; }
-                                let range = fp.f[fi].x * abs(qq);
+                                let cpl = susc[myBase + fi] * charges[otherBase + fi];
+                                if (cpl == 0.0) { continue; }
+                                let range = fp.f[fi].x * abs(cpl);
                                 if (range <= 0.0 || dist >= range) { continue; }
                                 let prof = 1.0 - dist / range;                 // 1 near → 0 at range
-                                let mag  = fp.f[fi].y * qq * prof * 0.1;       // qq>0 = repel
+                                let mag  = fp.f[fi].y * cpl * prof * 0.1;      // cpl>0 = repel
                                 accel -= dir * mag;                            // repel pushes away
                             }
                         }
@@ -2685,6 +2703,7 @@ export class ParticleSimulation {
         }
         if (this.qftDirty) {
             this.queue.writeBuffer(this.chargesBuffer!,     0, this.generateChargesData());
+            this.queue.writeBuffer(this.suscBuffer!,        0, this.generateSuscData());
             this.queue.writeBuffer(this.fieldParamsBuffer!, 0, this.generateFieldParamsData());
             this.qftDirty = false;
         }
@@ -3133,15 +3152,27 @@ export class ParticleSimulation {
         this.charges[type * MAX_FIELDS + field] = value;
         this.qftDirty = true;
     }
-    // Randomize interaction-field charges (fields 1+); the exclusion field stays 1.
+    getSusc(): number[][] {
+        return Array.from({ length: this.numTypes }, (_, t) =>
+            Array.from({ length: this.numFields }, (_, f) => this.susc[t * MAX_FIELDS + f] ?? 0));
+    }
+    setSusc(type: number, field: number, value: number): void {
+        if (type < 0 || type >= MAX_TYPES || field < 0 || field >= MAX_FIELDS) return;
+        this.susc[type * MAX_FIELDS + field] = value;
+        this.qftDirty = true;
+    }
+
+    // Randomize interaction-field charge + susceptibility (fields 1+) independently
+    // — independent values make the forces non-reciprocal, which drives motion. The
+    // exclusion field stays at 1/1 (universal symmetric repulsion).
     randomizeCharges(): void {
+        const rv = () => Math.random() < 0.4 ? 0 : Math.round((Math.random() * 2 - 1) * 100) / 100;
         for (let t = 0; t < MAX_TYPES; t++) {
             this.charges[t * MAX_FIELDS + 0] = 1;   // exclusion always on
+            this.susc[t * MAX_FIELDS + 0]    = 1;
             for (let f = 1; f < MAX_FIELDS; f++) {
-                // ~40% uncharged in a field; otherwise a small signed charge.
-                const v = Math.random() < 0.4 ? 0
-                        : Math.round((Math.random() * 2 - 1) * 100) / 100;
-                this.charges[t * MAX_FIELDS + f] = v;
+                this.charges[t * MAX_FIELDS + f] = rv();
+                this.susc[t * MAX_FIELDS + f]    = rv();
             }
         }
         this.qftDirty = true;
@@ -3710,6 +3741,7 @@ export class ParticleSimulation {
             fieldRange:       this.fieldRange.slice(0, this.numFields),
             fieldStrength:    this.fieldStrength.slice(0, this.numFields),
             charges:          this.getCharges(),
+            susc:             this.getSusc(),
         };
     }
 
@@ -3828,6 +3860,15 @@ export class ParticleSimulation {
                 if (Array.isArray(row)) for (let f = 0; f < this.numFields; f++) if (row[f] != null) this.charges[t * MAX_FIELDS + f] = Number(row[f]);
             }
         }
+        if (Array.isArray(state.susc)) {
+            for (let t = 0; t < n; t++) {
+                const row = state.susc[t];
+                if (Array.isArray(row)) for (let f = 0; f < this.numFields; f++) if (row[f] != null) this.susc[t * MAX_FIELDS + f] = Number(row[f]);
+            }
+        } else if (Array.isArray(state.charges)) {
+            // Pre-susceptibility export: default response = charge (reciprocal, as it was).
+            for (let i = 0; i < MAX_TYPES * MAX_FIELDS; i++) this.susc[i] = this.charges[i];
+        }
         this.qftDirty = true;
 
         if (!this.isInitialized || !this.queue) return;
@@ -3838,6 +3879,7 @@ export class ParticleSimulation {
         this.queue.writeBuffer(this.paramsBuffer!,    0, this.paramsArray());
         if (this.typeMassBuffer) this.queue.writeBuffer(this.typeMassBuffer, 0, this.generateTypeMassData());
         if (this.chargesBuffer)     this.queue.writeBuffer(this.chargesBuffer,     0, this.generateChargesData());
+        if (this.suscBuffer)        this.queue.writeBuffer(this.suscBuffer,        0, this.generateSuscData());
         if (this.fieldParamsBuffer) this.queue.writeBuffer(this.fieldParamsBuffer, 0, this.generateFieldParamsData());
         this.simulationTime = 0;
     }
