@@ -1398,10 +1398,10 @@ export class ParticleSimulation {
                 p.pos = p.pos + p.vel;
 
                 if (edgeMode == 0u) {
-                    if (p.pos.x < 0.0)   { p.pos.x += width;  }
-                    if (p.pos.x > width)  { p.pos.x -= width;  }
-                    if (p.pos.y < 0.0)   { p.pos.y += height; }
-                    if (p.pos.y > height) { p.pos.y -= height; }
+                    // Modulo wrap (not single subtract): a fast particle can cross
+                    // more than a full world in one step, so wrap any distance.
+                    p.pos.x = p.pos.x - floor(p.pos.x / width)  * width;
+                    p.pos.y = p.pos.y - floor(p.pos.y / height) * height;
                 } else {
                     if (p.pos.x < 0.0)   { p.pos.x = 0.0;    p.vel.x =  abs(p.vel.x) * 0.5; }
                     if (p.pos.x > width)  { p.pos.x = width;  p.vel.x = -abs(p.vel.x) * 0.5; }
@@ -1512,18 +1512,34 @@ export class ParticleSimulation {
                 let worldW = params.worldW;
                 let worldH = params.worldH;
                 let zoom   = view.zoom;
-                let nx = (p.pos.x - view.cx) * 2.0 * zoom / worldW;
-                let ny = -(p.pos.y - view.cy) * 2.0 * zoom / worldH;
+                // Isotropic "contain" camera: at zoom 1 the whole world fits the
+                // viewport (filling its smaller axis, with background margins on the
+                // larger one so it spans edge-to-edge — no letterbox). spanX/spanY are
+                // the half-extents of world visible across the viewport.
+                let aspect      = view.canvasW / view.canvasH;
+                let worldAspect = worldW / worldH;
+                var spanX: f32;
+                var spanY: f32;
+                if (aspect > worldAspect) {
+                    spanY = (worldH * 0.5) / zoom;
+                    spanX = spanY * aspect;
+                } else {
+                    spanX = (worldW * 0.5) / zoom;
+                    spanY = spanX / aspect;
+                }
+                let nx = (p.pos.x - view.cx) / spanX;
+                let ny = -(p.pos.y - view.cy) / spanY;
                 // World-space constant size: 20 world-units radius, scales with zoom so
-                // zooming in reveals larger particles. aspectX keeps quads square in pixels.
+                // zooming in reveals larger particles (isotropic, so quads stay round).
                 // Instability whitening: _pad stores smoothed max transform probability [0, 0.5].
                 // Particle tints toward white in its own hue; at max prob → 75% toward white.
                 let normProb  = clamp(p._pad * 2.0, 0.0, 1.0);  // 0→0, 0.5→1
                 let whiteness = normProb * 0.75;
-                let quadScale = 20.0 * 2.0 * zoom / worldH * (1.0 + view.glow * 3.5);
-                let aspectX   = view.canvasH / view.canvasW;
+                let rWorld = 20.0 * (1.0 + view.glow * 3.5);
+                let qx = rWorld / spanX;
+                let qy = rWorld / spanY;
                 var o: VOut;
-                o.pos    = vec4f(nx + quad.x * quadScale * aspectX, ny + quad.y * quadScale, 0.0, 1.0);
+                o.pos    = vec4f(nx + quad.x * qx, ny + quad.y * qy, 0.0, 1.0);
                 o.uv     = quad;
                 let ownColor = COLORS[min(u32(p.typeId), 19u)];
                 o.color  = mix(ownColor, vec4f(1.0, 1.0, 1.0, 1.0), whiteness);
@@ -2254,10 +2270,10 @@ export class ParticleSimulation {
                 p.pos = p.pos + p.vel;
 
                 if (edgeMode == 0u) {
-                    if (p.pos.x < 0.0)    { p.pos.x += width;  }
-                    if (p.pos.x > width)  { p.pos.x -= width;  }
-                    if (p.pos.y < 0.0)    { p.pos.y += height; }
-                    if (p.pos.y > height) { p.pos.y -= height; }
+                    // Modulo wrap (not single subtract): a fast particle can cross
+                    // more than a full world in one step, so wrap any distance.
+                    p.pos.x = p.pos.x - floor(p.pos.x / width)  * width;
+                    p.pos.y = p.pos.y - floor(p.pos.y / height) * height;
                 } else {
                     if (p.pos.x < 0.0)    { p.pos.x = 0.0;    p.vel.x =  abs(p.vel.x) * 0.5; }
                     if (p.pos.x > width)  { p.pos.x = width;  p.vel.x = -abs(p.vel.x) * 0.5; }

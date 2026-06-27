@@ -168,12 +168,16 @@ class ParticleLifeApp {
 
     // ── Canvas sizing ─────────────────────────────────────────────────────────
 
+    // The canvas (viewport) fills the window; the simulation world is a separate
+    // size projected into it (centred, with background margins) by the renderer —
+    // so there are no letterbox bars and the world needn't be screen-shaped.
     private fitCanvas(): void {
-        const w = this.canvas.width, h = this.canvas.height;
-        if (!w || !h) return;
-        const scale = Math.min(window.innerWidth / w, window.innerHeight / h);
-        this.canvas.style.width  = `${w * scale}px`;
-        this.canvas.style.height = `${h * scale}px`;
+        const w = Math.max(1, window.innerWidth);
+        const h = Math.max(1, window.innerHeight);
+        this.canvas.width  = w;
+        this.canvas.height = h;
+        this.canvas.style.width  = `${w}px`;
+        this.canvas.style.height = `${h}px`;
     }
 
     private setCanvasSize(w: number, h: number): void {
@@ -611,14 +615,44 @@ class ParticleLifeApp {
 
     // ── Entity tracking helpers ───────────────────────────────────────────────
 
+    // Half-extents (world units) visible from the view centre to each viewport edge.
+    // Mirrors the isotropic "contain" projection in the render vertex shader.
+    private viewSpans(): { spanX: number; spanY: number } {
+        const p = this.sim!.getParams();
+        const v = this.sim!.getView();
+        const aspect = this.canvas.width / this.canvas.height;
+        const worldAspect = p.worldWidth / p.worldHeight;
+        if (aspect > worldAspect) {
+            const spanY = (p.worldHeight * 0.5) / v.zoom;
+            return { spanX: spanY * aspect, spanY };
+        }
+        const spanX = (p.worldWidth * 0.5) / v.zoom;
+        return { spanX, spanY: spanX / aspect };
+    }
+
     private screenToWorld(sx: number, sy: number): { wx: number; wy: number } {
         if (!this.sim) return { wx: 0, wy: 0 };
-        const rect   = this.canvas.getBoundingClientRect();
-        const params = this.sim.getParams();
-        const view   = this.sim.getView();
+        const rect = this.canvas.getBoundingClientRect();
+        const view = this.sim.getView();
+        const { spanX, spanY } = this.viewSpans();
+        const fx = (sx - rect.left - rect.width  / 2) / (rect.width  / 2);  // -1..1
+        const fy = (sy - rect.top  - rect.height / 2) / (rect.height / 2);  // -1..1 (down +)
+        return { wx: view.cx + fx * spanX, wy: view.cy + fy * spanY };
+    }
+
+    // Screen (client) pixels per world unit — isotropic under the contain camera.
+    private pxPerWorld(): number {
+        const rect = this.canvas.getBoundingClientRect();
+        return (rect.width / 2) / this.viewSpans().spanX;
+    }
+
+    private worldToScreen(wx: number, wy: number): { sx: number; sy: number } {
+        const rect = this.canvas.getBoundingClientRect();
+        const v = this.sim!.getView();
+        const s = this.pxPerWorld();
         return {
-            wx: view.cx + (sx - rect.left - rect.width  / 2) * params.worldWidth  / (rect.width  * view.zoom),
-            wy: view.cy + (sy - rect.top  - rect.height / 2) * params.worldHeight / (rect.height * view.zoom),
+            sx: rect.left + rect.width  / 2 + (wx - v.cx) * s,
+            sy: rect.top  + rect.height / 2 + (wy - v.cy) * s,
         };
     }
 
@@ -666,10 +700,7 @@ class ParticleLifeApp {
         // Brush circle for cursor tools (suppressed during inspect/track override)
         if (this.activeCursorTool !== 'none' && !this.inspectMode && this.trackMode === 'idle'
                 && this.cursorMouseX > -9000 && this.sim) {
-            const rect   = this.canvas.getBoundingClientRect();
-            const params = this.sim.getParams();
-            const view   = this.sim.getView();
-            const sr = this.brushWorldRadius * view.zoom * rect.width / params.worldWidth;
+            const sr = this.brushWorldRadius * this.pxPerWorld();
             const pressing = this.cursorMouseButtons !== 0;
             const tool = this.activeCursorTool;
             const idleColor  = tool === 'paint' ? 'rgba(0,255,100,0.4)'  : tool === 'erase' ? 'rgba(255,80,80,0.4)'  : 'rgba(255,255,255,0.4)';
@@ -705,12 +736,8 @@ class ParticleLifeApp {
         if (this.trackMode === 'tracking' && this.sim) {
             const info = this.sim.getTrackingInfo();
             if (!info) { this.trackMode = 'idle'; this.syncTrackButton(); return; }
-            const rect   = this.canvas.getBoundingClientRect();
-            const params = this.sim.getParams();
-            const view   = this.sim.getView();
-            const sx = rect.left + rect.width  / 2 + (info.comX - view.cx) * view.zoom * rect.width  / params.worldWidth;
-            const sy = rect.top  + rect.height / 2 + (info.comY - view.cy) * view.zoom * rect.height / params.worldHeight;
-            const sr = info.radius * view.zoom * rect.width / params.worldWidth;
+            const { sx, sy } = this.worldToScreen(info.comX, info.comY);
+            const sr = info.radius * this.pxPerWorld();
 
             const drift = (performance.now() * 0.02) % 20;
             ctx.save();
@@ -735,13 +762,8 @@ class ParticleLifeApp {
         // Selected particle: highlight ring + velocity arrow
         const diagData = this.sim?.diagData;
         if (diagData && this.sim) {
-            const rect   = this.canvas.getBoundingClientRect();
-            const params = this.sim.getParams();
-            const view   = this.sim.getView();
-            const scaleX = view.zoom * rect.width  / params.worldWidth;
-            const scaleY = view.zoom * rect.height / params.worldHeight;
-            const sx = rect.left + rect.width  / 2 + (diagData.pos[0] - view.cx) * scaleX;
-            const sy = rect.top  + rect.height / 2 + (diagData.pos[1] - view.cy) * scaleY;
+            const { sx, sy } = this.worldToScreen(diagData.pos[0], diagData.pos[1]);
+            const scaleY = this.pxPerWorld();
 
             // Highlight ring around selected particle
             ctx.save();
@@ -949,12 +971,11 @@ class ParticleLifeApp {
         window.addEventListener('mousemove', (e) => {
             if (panning && this.sim) {
                 const dx = e.clientX - lastX, dy = e.clientY - lastY;
-                const rect   = this.canvas.getBoundingClientRect();
-                const params = this.sim.getParams();
-                const view   = this.sim.getView();
+                const view = this.sim.getView();
+                const wpp  = 1 / this.pxPerWorld();   // world units per screen pixel
                 this.sim.setView(
-                    view.cx - dx * params.worldWidth  / (rect.width  * view.zoom),
-                    view.cy - dy * params.worldHeight / (rect.height * view.zoom),
+                    view.cx - dx * wpp,
+                    view.cy - dy * wpp,
                     view.zoom
                 );
                 lastX = e.clientX; lastY = e.clientY;
@@ -1018,15 +1039,16 @@ class ParticleLifeApp {
             e.preventDefault();
             if (!this.sim) return;
             const rect   = this.canvas.getBoundingClientRect();
-            const params = this.sim.getParams();
             const view   = this.sim.getView();
             const oldZ   = view.zoom;
             const newZ   = Math.max(0.05, Math.min(200, oldZ * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
-            const sx     = (e.clientX - rect.left)  - rect.width  / 2;
-            const sy     = (e.clientY - rect.top)   - rect.height / 2;
+            // Keep the world point under the cursor fixed (spans scale as 1/zoom).
+            const fx = (e.clientX - rect.left - rect.width  / 2) / (rect.width  / 2);
+            const fy = (e.clientY - rect.top  - rect.height / 2) / (rect.height / 2);
+            const s  = this.viewSpans();   // spans at oldZ
             this.sim.setView(
-                view.cx + sx * params.worldWidth  / rect.width  * (1 / oldZ - 1 / newZ),
-                view.cy + sy * params.worldHeight / rect.height * (1 / oldZ - 1 / newZ),
+                view.cx + fx * s.spanX * (1 - oldZ / newZ),
+                view.cy + fy * s.spanY * (1 - oldZ / newZ),
                 newZ
             );
             this.updateZoomDisplay();
@@ -2328,10 +2350,10 @@ class ParticleLifeApp {
         this.closeForceEditor();
         this.closeTransformEditor();
 
-        // Apply world size to canvas before handing off to sim
+        // The world size is applied to the sim (below); the canvas just fills the window.
         const w = Number(state.worldWidth)  || 1600;
         const h = Number(state.worldHeight) || 900;
-        this.setCanvasSize(w, h);
+        this.fitCanvas();
 
         this.sim.importState(state);
 
@@ -2462,11 +2484,12 @@ class ParticleLifeApp {
     async initialize(): Promise<void> {
         const worldW = parseInt((document.getElementById('worldW') as HTMLInputElement).value) || 4800;
         const worldH = parseInt((document.getElementById('worldH') as HTMLInputElement).value) || 2700;
-        this.setCanvasSize(worldW, worldH);
+        this.fitCanvas();   // canvas (viewport) fills the window
 
         this.sim = new ParticleSimulation(this.canvas);
         try {
             await this.sim.initialize();
+            this.sim.setWorldSize(worldW, worldH);   // world is independent of the viewport
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             document.body.innerHTML = `<div style="color:#f44;padding:40px;font-family:monospace;font-size:14px;">
