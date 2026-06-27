@@ -159,6 +159,9 @@ const DNF_TYPE_STRIDE_U32 = 4 + MAX_DNF_CONDITIONS * 4 + MAX_DNF_RULES * (4 + DN
 // compensate, keeping the long-run transform rate roughly unchanged.
 const TFORM_STRIDE = 3;
 
+// Mode 6 (QFT): max number of charge fields, including the exclusion field.
+export const MAX_FIELDS = 12;
+
 const OPEN_MULT            = 8;
 const MAX_GRID_DIM         = 64;
 const MAX_CELLS            = MAX_GRID_DIM * MAX_GRID_DIM;  // 4096
@@ -387,6 +390,23 @@ export class ParticleSimulation {
     // type force-based conditions and boolean transform rules (see DnfType above).
     private dnfTypes: DnfType[] = Array.from({ length: MAX_TYPES }, () => ({ conditions: [], rules: [] }));
     private dnfRulesBuffer: GPUBuffer | null = null;
+
+    // ── Mode 6 (QFT: shared charge fields) ──────────────────────────────────────
+    // Particles carry a signed "charge" per field (charges[type*MAX_FIELDS+field]).
+    // For a pair in a field the force is proportional to qi*qj (like → repel,
+    // opposite → attract) and acts within range = fieldRange * |qi*qj|. Field 0 is
+    // the universal exclusion field ("exc") — all types charge 1 by default.
+    private numFields = 3;
+    private fieldRange:    number[] = [];   // intrinsic max range per field
+    private fieldStrength: number[] = [];   // force multiplier per field
+    private fieldNames:    string[] = [];
+    private charges: number[] = [];         // [type*MAX_FIELDS + field], signed
+    private chargesBuffer:     GPUBuffer | null = null;
+    private fieldParamsBuffer: GPUBuffer | null = null;
+    private mode6BGL:       GPUBindGroupLayout | null = null;
+    private mode6Pipeline:  GPUComputePipeline | null = null;
+    private mode6BindGroup: GPUBindGroup       | null = null;
+    private qftDirty = true;
     // Mode 5 directional bonding: off by default — Mode 5 is DNF transforms on a
     // plain isotropic-force substrate. Toggle on to bring patchy bonds back. Passed
     // to the kernel via params._p2 so it gates all patch passes (and patch render).
@@ -422,6 +442,7 @@ export class ParticleSimulation {
         this.initializeForceMatrix();
         this.initializeTransformRules();
         this.initializePoleConfigs();
+        this.initializeQFT();
     }
 
     // ── Init helpers ──────────────────────────────────────────────────────────
@@ -465,6 +486,39 @@ export class ParticleSimulation {
 
     private initializePoleConfigs(): void {
         this.poleConfigs.fill(0);  // all monopoles by default
+    }
+
+    // ── Mode 6 (QFT) init / data ────────────────────────────────────────────────
+    private initializeQFT(): void {
+        this.fieldRange    = Array(MAX_FIELDS).fill(120);
+        this.fieldStrength = Array(MAX_FIELDS).fill(1);
+        this.fieldNames    = Array.from({ length: MAX_FIELDS }, (_, i) => i === 0 ? 'exc' : `f${i}`);
+        // Exclusion field: short range, strong, universal — keeps particles apart.
+        this.fieldRange[0]    = 26;
+        this.fieldStrength[0] = 6;
+        this.charges = Array(MAX_TYPES * MAX_FIELDS).fill(0);
+        for (let t = 0; t < MAX_TYPES; t++) this.charges[t * MAX_FIELDS + 0] = 1;  // exc = 1 for all
+        this.randomizeCharges();   // seed interaction fields (1..) with random charges
+        this.qftDirty = true;
+    }
+
+    // charges[type*MAX_FIELDS + field] as a flat storage buffer.
+    private generateChargesData(): Float32Array<ArrayBuffer> {
+        const data = new Float32Array(MAX_TYPES * MAX_FIELDS);
+        for (let i = 0; i < MAX_TYPES * MAX_FIELDS; i++) data[i] = this.charges[i] ?? 0;
+        return data as Float32Array<ArrayBuffer>;
+    }
+
+    // Per-field uniform: vec4(range, strength, _, _). field0's .z carries numFields
+    // (carried here rather than in the f32-packed params, which loses precision >2^24).
+    private generateFieldParamsData(): Float32Array<ArrayBuffer> {
+        const data = new Float32Array(MAX_FIELDS * 4);
+        for (let f = 0; f < MAX_FIELDS; f++) {
+            data[f * 4 + 0] = this.fieldRange[f]    ?? 0;
+            data[f * 4 + 1] = this.fieldStrength[f] ?? 0;
+        }
+        data[2] = this.numFields;   // f[0].z
+        return data as Float32Array<ArrayBuffer>;
     }
 
     private generatePoleData(): Float32Array<ArrayBuffer> {
@@ -749,6 +803,11 @@ export class ParticleSimulation {
         // Mode 5 DNF rules (uniform). MAX_TYPES * 68 u32 = 5440 bytes.
         this.dnfRulesBuffer = this.device!.createBuffer({ label: 'dnfRules', size: MAX_TYPES * DNF_TYPE_STRIDE_U32 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.queue!.writeBuffer(this.dnfRulesBuffer, 0, this.generateDnfData());
+        // Mode 6 (QFT) buffers.
+        this.chargesBuffer = this.device!.createBuffer({ label: 'charges', size: MAX_TYPES * MAX_FIELDS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        this.queue!.writeBuffer(this.chargesBuffer, 0, this.generateChargesData());
+        this.fieldParamsBuffer = this.device!.createBuffer({ label: 'fieldParams', size: MAX_FIELDS * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.queue!.writeBuffer(this.fieldParamsBuffer, 0, this.generateFieldParamsData());
     }
 
     private async createPipelines(): Promise<void> {
@@ -925,6 +984,22 @@ export class ParticleSimulation {
             compute: { module: this.device.createShaderModule({ code: this.getMode3ShaderCode() }), entryPoint: 'main' },
         });
 
+        // Mode 6 (QFT) physics pipeline — its own layout (charges + field params).
+        this.mode6BGL = this.device.createBindGroupLayout({ entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage'           } }, // particles (rw)
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // sortedParticles
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // gridParams
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellCount
+            { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // cellStart
+            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // params
+            { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // charges
+            { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform'           } }, // fieldParams
+        ]});
+        this.mode6Pipeline = this.device.createComputePipeline({
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.mode6BGL] }),
+            compute: { module: this.device.createShaderModule({ code: this.getMode6ShaderCode() }), entryPoint: 'main' },
+        });
+
         this.rebuildBindGroups();
     }
 
@@ -1088,17 +1163,46 @@ export class ParticleSimulation {
                 ],
             });
         }
+
+        if (this.mode6BGL && this.chargesBuffer && this.fieldParamsBuffer) {
+            this.mode6BindGroup = this.device.createBindGroup({
+                layout: this.mode6BGL,
+                entries: [
+                    { binding: 0, resource: { buffer: this.particleBuffer        } },
+                    { binding: 1, resource: { buffer: this.particlesSortedBuffer } },
+                    { binding: 2, resource: { buffer: this.gridParamsBuffer      } },
+                    { binding: 3, resource: { buffer: this.gridCellCountBuffer   } },
+                    { binding: 4, resource: { buffer: this.gridCellStartBuffer   } },
+                    { binding: 5, resource: { buffer: this.paramsBuffer          } },
+                    { binding: 6, resource: { buffer: this.chargesBuffer         } },
+                    { binding: 7, resource: { buffer: this.fieldParamsBuffer     } },
+                ],
+            });
+        }
     }
 
     // ── Grid helpers ──────────────────────────────────────────────────────────
 
     private computeGridParams(): { gridW: number; gridH: number; cellSize: number; numCells: number } {
         let maxRadius = 1;
-        for (let from = 0; from < MAX_TYPES; from++)
-            for (let to = 0; to < MAX_TYPES; to++) {
-                const r = this.params.forceMatrix[from]?.[to]?.radius ?? 100;
+        if (this.simMode === 6) {
+            // QFT: cells must cover the largest field range = fieldRange * maxCharge².
+            for (let f = 0; f < this.numFields; f++) {
+                let mc = 0;
+                for (let t = 0; t < this.numTypes; t++) {
+                    const c = Math.abs(this.charges[t * MAX_FIELDS + f] ?? 0);
+                    if (c > mc) mc = c;
+                }
+                const r = (this.fieldRange[f] ?? 0) * mc * mc;
                 if (r > maxRadius) maxRadius = r;
             }
+        } else {
+            for (let from = 0; from < MAX_TYPES; from++)
+                for (let to = 0; to < MAX_TYPES; to++) {
+                    const r = this.params.forceMatrix[from]?.[to]?.radius ?? 100;
+                    if (r > maxRadius) maxRadius = r;
+                }
+        }
         const cellSize = Math.max(maxRadius,
             this.params.worldWidth  / MAX_GRID_DIM,
             this.params.worldHeight / MAX_GRID_DIM);
@@ -2424,6 +2528,114 @@ export class ParticleSimulation {
         `;
     }
 
+    // Mode 6 (QFT): each pair sums a force over all charge fields. Per field the
+    // force ∝ qi*qj (like → repel, opposite → attract), acting within
+    // range = fieldRange * |qi*qj|; charge 0 = no interaction in that field. The
+    // exclusion field (0) gives every particle a strong short-range repulsion.
+    private getMode6ShaderCode(): string {
+        return /* wgsl */`
+            struct Particle   { pos: vec2f, vel: vec2f, typeId: f32, _pad: f32 }
+            struct GridParams { gridW: u32, gridH: u32, numCells: u32, cellSize: f32 }
+            struct SimParams  { speed: f32, worldW: f32, worldH: f32, packed: f32,
+                                friction: f32, maxRate: f32, _p2: f32, _p3: f32 }
+            struct FieldParams { f: array<vec4f, ${MAX_FIELDS}> }  // .x range, .y strength; f[0].z = numFields
+
+            @group(0) @binding(0) var<storage, read_write> particles:       array<Particle>;
+            @group(0) @binding(1) var<storage, read>       sortedParticles: array<Particle>;
+            @group(0) @binding(2) var<uniform>             gridParams:      GridParams;
+            @group(0) @binding(3) var<storage, read>       cellCount:       array<u32>;
+            @group(0) @binding(4) var<storage, read>       cellStart:       array<u32>;
+            @group(0) @binding(5) var<uniform>             params:          SimParams;
+            @group(0) @binding(6) var<storage, read>       charges:         array<f32>;
+            @group(0) @binding(7) var<uniform>             fp:              FieldParams;
+
+            @compute @workgroup_size(256)
+            fn main(@builtin(global_invocation_id) id: vec3u) {
+                let idx = id.x;
+                if (idx >= arrayLength(&particles)) { return; }
+
+                let speed    = params.speed;
+                let width    = params.worldW;
+                let height   = params.worldH;
+                let packed   = u32(params.packed);
+                let edgeMode = (packed >> 8u) & 0xFFu;
+                let numFields = u32(fp.f[0].z);
+
+                var p = particles[idx];
+                if (p.typeId < 0.0) { return; }
+                let myType = u32(p.typeId);
+                let myBase = myType * ${MAX_FIELDS}u;
+                var accel  = vec2f(0.0);
+
+                let gw = i32(gridParams.gridW);
+                let gh = i32(gridParams.gridH);
+                let cs = gridParams.cellSize;
+                let myGx = clamp(i32(p.pos.x / cs), 0, gw - 1);
+                let myGy = clamp(i32(p.pos.y / cs), 0, gh - 1);
+
+                for (var goy = -1; goy <= 1; goy++) {
+                    for (var gox = -1; gox <= 1; gox++) {
+                        var ngx = myGx + gox;
+                        var ngy = myGy + goy;
+                        if (edgeMode == 0u) {
+                            ngx = ((ngx % gw) + gw) % gw;
+                            ngy = ((ngy % gh) + gh) % gh;
+                        } else {
+                            if (ngx < 0 || ngx >= gw || ngy < 0 || ngy >= gh) { continue; }
+                        }
+                        let cell  = u32(ngy) * gridParams.gridW + u32(ngx);
+                        let start = cellStart[cell];
+                        let end   = start + cellCount[cell];
+                        for (var k = start; k < end; k++) {
+                            let other = sortedParticles[k];
+                            if (other.typeId < 0.0) { continue; }
+                            let otherBase = u32(other.typeId) * ${MAX_FIELDS}u;
+
+                            var dx = other.pos.x - p.pos.x;
+                            var dy = other.pos.y - p.pos.y;
+                            if (edgeMode == 0u) {
+                                if (dx >  width  * 0.5) { dx -= width;  }
+                                if (dx < -width  * 0.5) { dx += width;  }
+                                if (dy >  height * 0.5) { dy -= height; }
+                                if (dy < -height * 0.5) { dy += height; }
+                            }
+                            let dist = sqrt(dx * dx + dy * dy);
+                            if (dist < 0.1) { continue; }
+                            let dir = vec2f(dx, dy) / dist;
+
+                            // Sum the force over every field this pair shares a charge in.
+                            for (var fi: u32 = 0u; fi < numFields; fi++) {
+                                let qq = charges[myBase + fi] * charges[otherBase + fi];
+                                if (qq == 0.0) { continue; }
+                                let range = fp.f[fi].x * abs(qq);
+                                if (range <= 0.0 || dist >= range) { continue; }
+                                let prof = 1.0 - dist / range;                 // 1 near → 0 at range
+                                let mag  = fp.f[fi].y * qq * prof * 0.1;       // qq>0 = repel
+                                accel -= dir * mag;                            // repel pushes away
+                            }
+                        }
+                    }
+                }
+
+                let fric = pow(params.friction, speed);
+                p.vel = p.vel * fric + accel * speed;
+                p.pos = p.pos + p.vel;
+
+                if (edgeMode == 0u) {
+                    p.pos.x = p.pos.x - floor(p.pos.x / width)  * width;
+                    p.pos.y = p.pos.y - floor(p.pos.y / height) * height;
+                } else {
+                    if (p.pos.x < 0.0)    { p.pos.x = 0.0;    p.vel.x =  abs(p.vel.x) * 0.5; }
+                    if (p.pos.x > width)  { p.pos.x = width;  p.vel.x = -abs(p.vel.x) * 0.5; }
+                    if (p.pos.y < 0.0)    { p.pos.y = 0.0;    p.vel.y =  abs(p.vel.y) * 0.5; }
+                    if (p.pos.y > height) { p.pos.y = height; p.vel.y = -abs(p.vel.y) * 0.5; }
+                }
+                p._pad = 0.0;
+                particles[idx] = p;
+            }
+        `;
+    }
+
     // ── Public API ────────────────────────────────────────────────────────────
 
     update(): void {
@@ -2457,6 +2669,11 @@ export class ParticleSimulation {
         if (this.dnfDirty) {
             this.queue.writeBuffer(this.dnfRulesBuffer!, 0, this.generateDnfData());
             this.dnfDirty = false;
+        }
+        if (this.qftDirty) {
+            this.queue.writeBuffer(this.chargesBuffer!,     0, this.generateChargesData());
+            this.queue.writeBuffer(this.fieldParamsBuffer!, 0, this.generateFieldParamsData());
+            this.qftDirty = false;
         }
 
         if (!this.isPaused) {
@@ -2503,7 +2720,11 @@ export class ParticleSimulation {
             reorderCp.end();
 
             const forceCp = enc.beginComputePass();
-            if ((this.simMode === 3 || this.simMode === 4 || this.simMode === 5) && this.mode3Pipeline && this.mode3BindGroup) {
+            if (this.simMode === 6 && this.mode6Pipeline && this.mode6BindGroup) {
+                // Mode 6 (QFT): charge-field physics, its own kernel + bind group.
+                forceCp.setPipeline(this.mode6Pipeline);
+                forceCp.setBindGroup(0, this.mode6BindGroup);
+            } else if ((this.simMode === 3 || this.simMode === 4 || this.simMode === 5) && this.mode3Pipeline && this.mode3BindGroup) {
                 // Mode 3/4: patchy physics replaces the classic force pass. It reads the
                 // same cell-sorted neighbours plus their orientation and writes back
                 // position, velocity and orientation in one kernel (Mode 4 also transforms).
@@ -2865,7 +3086,51 @@ export class ParticleSimulation {
         this.simulationTime = 0;
     }
 
-    setSimMode(mode: 0 | 1 | 2 | 3 | 4 | 5): void { this.simMode = mode; }
+    setSimMode(mode: 0 | 1 | 2 | 3 | 4 | 5 | 6): void { this.simMode = mode; }
+
+    // ── Mode 6 (QFT) controls ───────────────────────────────────────────────────
+    getNumFields(): number { return this.numFields; }
+    setNumFields(n: number): void {
+        this.numFields = Math.max(1, Math.min(MAX_FIELDS, Math.round(n)));
+        this.qftDirty = true;
+    }
+    // Per-field [range, strength, name] for the active fields.
+    getFields(): Array<{ range: number; strength: number; name: string }> {
+        return Array.from({ length: this.numFields }, (_, f) => ({
+            range: this.fieldRange[f] ?? 0,
+            strength: this.fieldStrength[f] ?? 0,
+            name: this.fieldNames[f] ?? `f${f}`,
+        }));
+    }
+    setFieldParam(field: number, range?: number, strength?: number): void {
+        if (field < 0 || field >= MAX_FIELDS) return;
+        if (range    != null) this.fieldRange[field]    = Math.max(0, range);
+        if (strength != null) this.fieldStrength[field] = strength;
+        this.qftDirty = true;
+    }
+    // charges[type][field], active types × active fields.
+    getCharges(): number[][] {
+        return Array.from({ length: this.numTypes }, (_, t) =>
+            Array.from({ length: this.numFields }, (_, f) => this.charges[t * MAX_FIELDS + f] ?? 0));
+    }
+    setCharge(type: number, field: number, value: number): void {
+        if (type < 0 || type >= MAX_TYPES || field < 0 || field >= MAX_FIELDS) return;
+        this.charges[type * MAX_FIELDS + field] = value;
+        this.qftDirty = true;
+    }
+    // Randomize interaction-field charges (fields 1+); the exclusion field stays 1.
+    randomizeCharges(): void {
+        for (let t = 0; t < MAX_TYPES; t++) {
+            this.charges[t * MAX_FIELDS + 0] = 1;   // exclusion always on
+            for (let f = 1; f < MAX_FIELDS; f++) {
+                // ~40% uncharged in a field; otherwise a small signed charge.
+                const v = Math.random() < 0.4 ? 0
+                        : Math.round((Math.random() * 2 - 1) * 100) / 100;
+                this.charges[t * MAX_FIELDS + f] = v;
+            }
+        }
+        this.qftDirty = true;
+    }
     getEdgeMode():    number    { return this.edgeMode; }
     getSimMode():     number    { return this.simMode; }
 
@@ -3425,6 +3690,10 @@ export class ParticleSimulation {
                                   Array.from({ length: n }, (_, to) => this.patchAffinity[from * MAX_TYPES + to])),
             dnfTypes:         this.getDnfTypes(),
             dnfBonding:       this.dnfBonding,
+            numFields:        this.numFields,
+            fieldRange:       this.fieldRange.slice(0, this.numFields),
+            fieldStrength:    this.fieldStrength.slice(0, this.numFields),
+            charges:          this.getCharges(),
         };
     }
 
@@ -3533,6 +3802,17 @@ export class ParticleSimulation {
         this.dnfDirty = true;
         if (state.dnfBonding != null) this.dnfBonding = Boolean(state.dnfBonding);
 
+        if (state.numFields != null) this.numFields = Math.max(1, Math.min(MAX_FIELDS, Number(state.numFields)));
+        if (Array.isArray(state.fieldRange))    for (let f = 0; f < this.numFields; f++) if (state.fieldRange[f]    != null) this.fieldRange[f]    = Math.max(0, Number(state.fieldRange[f]));
+        if (Array.isArray(state.fieldStrength)) for (let f = 0; f < this.numFields; f++) if (state.fieldStrength[f] != null) this.fieldStrength[f] = Number(state.fieldStrength[f]);
+        if (Array.isArray(state.charges)) {
+            for (let t = 0; t < n; t++) {
+                const row = state.charges[t];
+                if (Array.isArray(row)) for (let f = 0; f < this.numFields; f++) if (row[f] != null) this.charges[t * MAX_FIELDS + f] = Number(row[f]);
+            }
+        }
+        this.qftDirty = true;
+
         if (!this.isInitialized || !this.queue) return;
         this.queue.writeBuffer(this.particleBuffer!,  0, this.generateParticleData());
         this.queue.writeBuffer(this.forcesBuffer!,    0, this.generateForcesData());
@@ -3540,6 +3820,8 @@ export class ParticleSimulation {
         this.queue.writeBuffer(this.poleBuffer!,      0, this.generatePoleData());
         this.queue.writeBuffer(this.paramsBuffer!,    0, this.paramsArray());
         if (this.typeMassBuffer) this.queue.writeBuffer(this.typeMassBuffer, 0, this.generateTypeMassData());
+        if (this.chargesBuffer)     this.queue.writeBuffer(this.chargesBuffer,     0, this.generateChargesData());
+        if (this.fieldParamsBuffer) this.queue.writeBuffer(this.fieldParamsBuffer, 0, this.generateFieldParamsData());
         this.simulationTime = 0;
     }
 }

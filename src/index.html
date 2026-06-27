@@ -193,8 +193,8 @@
         .mode-toggle-row { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
         .mode-btn { flex: 1 1 auto; min-width: 54px; padding: 7px 4px; font-size: 11px; }
 
-        #transform-panel, #mode2-panel, #mode3-panel, #dnf-panel { display: none; }
-        #transform-panel.visible, #mode2-panel.visible, #mode3-panel.visible, #dnf-panel.visible { display: block; }
+        #transform-panel, #mode2-panel, #mode3-panel, #dnf-panel, #qft-panel { display: none; }
+        #transform-panel.visible, #mode2-panel.visible, #mode3-panel.visible, #dnf-panel.visible, #qft-panel.visible { display: block; }
         #dnf-list { display: flex; flex-direction: column; gap: 4px; }
         .dnf-row { display: flex; align-items: flex-start; gap: 6px; padding: 5px 6px; border-radius: 4px;
                    background: rgba(255,255,255,0.03); cursor: pointer; font-size: 11px; line-height: 1.5; }
@@ -510,6 +510,7 @@
                     <button class="mode-btn"          id="mode3-btn">Patchy</button>
                     <button class="mode-btn"          id="mode4-btn">Patchy+T</button>
                     <button class="mode-btn"          id="mode5-btn">Patchy+DNF</button>
+                    <button class="mode-btn"          id="mode6-btn">QFT</button>
                 </div>
 
                 <div id="mode3-panel">
@@ -602,6 +603,28 @@
                     </div>
                     <p class="matrix-label">Rules per source type (click a row to edit)</p>
                     <div id="dnf-list"></div>
+                </div>
+
+                <div id="qft-panel">
+                    <p class="tr-hint">
+                        <strong>QFT.</strong> Instead of per-type force rules, particles carry a signed
+                        <em>charge</em> in each <em>field</em>. For a pair, each field contributes a force ∝
+                        charge×charge — <strong>like charges repel, opposite attract</strong> — acting within
+                        <code>range = field range × |charge×charge|</code>. Charge 0 = no interaction in that
+                        field. Field <strong>exc</strong> is a universal short-range repulsion (Pauli-style)
+                        that keeps particles from piling — all types carry it by default.
+                    </p>
+                    <div class="settings-row">
+                        <label>Fields</label>
+                        <input type="number" id="qftFieldCount" min="1" max="12" value="3" step="1">
+                    </div>
+                    <div class="btn-row" style="margin:8px 0;">
+                        <button id="randomizeChargesBtn">Randomize charges</button>
+                    </div>
+                    <p class="matrix-label">Per field: range · strength</p>
+                    <table class="mass-table" id="qft-field-table"></table>
+                    <p class="matrix-label" style="margin-top:12px">Charge · row = type, col = field</p>
+                    <div class="matrix-wrap"><table class="matrix" id="qft-charge-table"></table></div>
                 </div>
 
                 <div id="mode2-panel">

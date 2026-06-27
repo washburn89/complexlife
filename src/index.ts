@@ -106,7 +106,7 @@ class ParticleLifeApp {
     // shown (forces); otherwise only when the current sim mode is in the list.
     private readonly randomizeCats: {
         key: string; label: string; modes: number[] | null;
-        run: () => void; refresh: 'forces' | 'transform' | 'poles' | 'masses' | 'valences' | 'bonding' | 'dnf';
+        run: () => void; refresh: 'forces' | 'transform' | 'poles' | 'masses' | 'valences' | 'bonding' | 'dnf' | 'charges';
     }[] = [
         { key: 'strength',  label: 'Force strength', modes: null,      run: () => this.sim!.randomizeStrengths(),     refresh: 'forces' },
         { key: 'maxRadius', label: 'Max radius',     modes: null,      run: () => this.sim!.randomizeMaxRadii(),      refresh: 'forces' },
@@ -117,6 +117,7 @@ class ParticleLifeApp {
         { key: 'valences',  label: 'Valences',       modes: [3, 4, 5], run: () => this.sim!.randomizePatches(),       refresh: 'valences' },
         { key: 'bonding',   label: 'Bonding',        modes: [3, 4, 5], run: () => this.sim!.randomizePatchParams(),   refresh: 'bonding' },
         { key: 'dnf',       label: 'DNF rules',      modes: [5],       run: () => this.sim!.randomizeDnfRules(),      refresh: 'dnf' },
+        { key: 'charges',   label: 'Charges',        modes: [6],       run: () => this.sim!.randomizeCharges(),       refresh: 'charges' },
     ];
     // Default selection — minRadius and poles off, as those are rarely wanted.
     private randomizeSel: Record<string, boolean> = {
@@ -269,6 +270,7 @@ class ParticleLifeApp {
         document.getElementById('mode3-btn')!.addEventListener('click', () => this.setSimMode(3));
         document.getElementById('mode4-btn')!.addEventListener('click', () => this.setSimMode(4));
         document.getElementById('mode5-btn')!.addEventListener('click', () => this.setSimMode(5));
+        document.getElementById('mode6-btn')!.addEventListener('click', () => this.setSimMode(6));
 
         // Per-matrix randomize buttons
         document.getElementById('randomizeStrengthBtn')!.addEventListener('click', () => {
@@ -360,6 +362,19 @@ class ParticleLifeApp {
         });
         document.getElementById('dnfBondOffBtn')!.addEventListener('click', () => this.setDnfBonding(false));
         document.getElementById('dnfBondOnBtn')!.addEventListener('click', () => this.setDnfBonding(true));
+
+        // QFT (mode 6) controls
+        document.getElementById('randomizeChargesBtn')!.addEventListener('click', () => {
+            this.sim?.randomizeCharges();
+            this.refreshQftPanel();
+        });
+        const qftFieldCount = document.getElementById('qftFieldCount') as HTMLInputElement;
+        qftFieldCount.addEventListener('change', () => {
+            const v = Math.max(1, Math.min(12, Math.round(Number(qftFieldCount.value) || 3)));
+            qftFieldCount.value = String(v);
+            this.sim?.setNumFields(v);
+            this.refreshQftPanel();
+        });
         const dnfMaxSlider = document.getElementById('dnfMaxSlider') as HTMLInputElement;
         dnfMaxSlider.addEventListener('input', () => {
             const v = parseFloat(dnfMaxSlider.value);
@@ -543,15 +558,19 @@ class ParticleLifeApp {
         btn.classList.toggle('active', paused);
     }
 
-    private setSimMode(mode: 0 | 1 | 2 | 3 | 4 | 5): void {
+    private setSimMode(mode: 0 | 1 | 2 | 3 | 4 | 5 | 6): void {
         this.sim?.setSimMode(mode);
-        for (let m = 0; m <= 5; m++) {
+        for (let m = 0; m <= 6; m++) {
             document.getElementById(`mode${m}-btn`)!.classList.toggle('selected', mode === m);
         }
         // Transform rules apply in modes 1 (Transform), 2 (Mass) and 4 (Patchy+T).
         const hasTransform = mode === 1 || mode === 2 || mode === 4;
         // DNF rules apply only in mode 5.
         const hasDnf = mode === 5;
+        // QFT charge fields apply only in mode 6.
+        const hasQft = mode === 6;
+        document.getElementById('qft-panel')!.classList.toggle('visible', hasQft);
+        if (hasQft) this.refreshQftPanel();
         const dnfBond = this.sim?.getDnfBonding() ?? false;
         // Patch controls: always in modes 3/4; in mode 5 only when bonding is on.
         const showPatch = mode === 3 || mode === 4 || (mode === 5 && dnfBond);
@@ -1213,6 +1232,7 @@ class ParticleLifeApp {
         if (refreshes.has('valences'))  this.refreshPatchTable();
         if (refreshes.has('bonding'))   this.refreshPatchUI();
         if (refreshes.has('dnf'))       this.refreshDnfPanel();
+        if (refreshes.has('charges'))   this.refreshQftPanel();
     }
 
     private refreshPaintTypePicker(): void {
@@ -1867,6 +1887,74 @@ class ParticleLifeApp {
         }
     }
 
+    // ── QFT panel (mode 6) ──────────────────────────────────────────────────────
+    private refreshQftPanel(): void {
+        if (!this.sim) return;
+        (document.getElementById('qftFieldCount') as HTMLInputElement).value = String(this.sim.getNumFields());
+        this.buildQftFieldTable();
+        this.buildQftChargeMatrix();
+    }
+
+    private buildQftFieldTable(): void {
+        const tbl = document.getElementById('qft-field-table') as HTMLTableElement;
+        if (!tbl || !this.sim) return;
+        tbl.innerHTML = '';
+        const fields = this.sim.getFields();
+        const hdr = tbl.insertRow();
+        ['field', 'range', 'strength'].forEach(h => {
+            const th = document.createElement('th');
+            th.textContent = h;
+            th.style.cssText = 'font-size:9px;color:#666;text-align:left;font-weight:normal;padding:0 4px 2px';
+            hdr.appendChild(th);
+        });
+        const numInput = (val: number, step: number, onset: (v: number) => void) => {
+            const inp = document.createElement('input');
+            inp.type = 'number'; inp.step = String(step); inp.value = String(val);
+            inp.addEventListener('change', () => onset(Number(inp.value) || 0));
+            return inp;
+        };
+        fields.forEach((fd, f) => {
+            const row = tbl.insertRow();
+            const nameCell = row.insertCell();
+            nameCell.textContent = fd.name;
+            nameCell.style.cssText = f === 0 ? 'color:#e88;font-weight:bold' : 'color:#9bd';
+            row.insertCell().appendChild(numInput(Math.round(fd.range), 1, v => this.sim?.setFieldParam(f, Math.max(0, v), undefined)));
+            row.insertCell().appendChild(numInput(Math.round(fd.strength * 100) / 100, 0.1, v => this.sim?.setFieldParam(f, undefined, v)));
+        });
+    }
+
+    private buildQftChargeMatrix(): void {
+        const table = document.getElementById('qft-charge-table') as HTMLTableElement;
+        if (!table || !this.sim) return;
+        table.innerHTML = '';
+        const n = this.sim.getNumTypes();
+        const fields = this.sim.getFields();
+        const charges = this.sim.getCharges();
+
+        const hdr = document.createElement('tr');
+        hdr.innerHTML = '<th></th>' + fields.map(fd => `<th>${fd.name}</th>`).join('');
+        table.appendChild(hdr);
+
+        for (let t = 0; t < n; t++) {
+            const row = document.createElement('tr');
+            const th = document.createElement('th');
+            th.className = 'row-header';
+            th.innerHTML = `<span class="type-pip" style="background:${TYPE_HEX[t]}"></span>${TYPE_LABELS[t]}`;
+            row.appendChild(th);
+            for (let f = 0; f < fields.length; f++) {
+                const td = document.createElement('td');
+                const inp = document.createElement('input');
+                inp.type = 'number'; inp.step = '0.1';
+                inp.value = String(Math.round((charges[t]?.[f] ?? 0) * 100) / 100);
+                inp.style.cssText = 'width:42px;font-size:9px;background:#1a1a1a;color:#ddd;border:1px solid #333;border-radius:3px;';
+                inp.addEventListener('change', () => this.sim?.setCharge(t, f, Number(inp.value) || 0));
+                td.appendChild(inp);
+                row.appendChild(td);
+            }
+            table.appendChild(row);
+        }
+    }
+
     // ── DNF rules panel (mode 5 / Transform #2) ─────────────────────────────────
     private refreshDnfPanel(): void {
         if (!this.sim) return;
@@ -2377,7 +2465,7 @@ class ParticleLifeApp {
         document.getElementById('speedValue')!.textContent = `${this.sim.getParams().simulationSpeed.toFixed(1)}×`;
         document.getElementById('particleCountDisplay')!.textContent = String(this.sim.getParams().particleCount);
 
-        const simMode  = this.sim.getSimMode()  as 0 | 1 | 2 | 3 | 4 | 5;
+        const simMode  = this.sim.getSimMode()  as 0 | 1 | 2 | 3 | 4 | 5 | 6;
         const edgeMode = this.sim.getEdgeMode() as 0 | 1;
         this.setSimMode(simMode);
         document.getElementById('edgeLoopBtn')!.classList.toggle('selected', edgeMode === 0);
@@ -2417,6 +2505,7 @@ class ParticleLifeApp {
 
         this.refreshPatchUI();
         this.refreshDnfPanel();
+        this.refreshQftPanel();
 
         this.refreshForceMatrices();
         this.refreshTransformMatrix();  // also calls buildPolePanel()
