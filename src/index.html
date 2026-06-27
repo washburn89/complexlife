@@ -145,7 +145,7 @@
            panel. max-width pins the wrap to the panel so the table can't push the
            layout wider with no way to reach the right-hand columns; padding-bottom
            leaves room for the horizontal scrollbar so it's always visible. */
-        .matrix-wrap { overflow-x: auto; overflow-y: hidden; max-width: 100%; padding-bottom: 4px; }
+        .matrix-wrap { overflow: auto; max-width: 100%; max-height: 58vh; padding-bottom: 4px; }
         .matrix-label { font-size: 10px; color: var(--text-faint); margin-bottom: 6px; }
         table.matrix { border-collapse: collapse; font-size: 9px; width: max-content; }
         table.matrix th {
@@ -462,7 +462,7 @@
             </div>
             <div class="ctrl-row">
                 <label>Types</label>
-                <input type="number" id="typeCount" min="1" max="20" value="10" step="1">
+                <input type="number" id="typeCount" min="1" max="50" value="10" step="1">
             </div>
             <div class="ctrl-row">
                 <label>Speed</label>

@@ -3,9 +3,13 @@ import { ParticleSimulation, TransformRule, DnfCondition, DnfRule, MAX_TYPES, MA
 // src/vendor/webm-muxer.LICENSE.txt.
 import { Muxer, ArrayBufferTarget } from './vendor/webm-muxer';
 
+// Short 3-letter type names, decoupled from colours (we have up to 50 types).
 const TYPE_LABELS = [
-    'R', 'G', 'B', 'Y', 'M', 'C', 'O', 'P', 'K', 'S',
-    'W', 'A', 'L', 'T', 'I', 'N', 'Q', 'H', 'F', 'Z',
+    'Axo', 'Bex', 'Cyl', 'Dax', 'Eon', 'Fyn', 'Gad', 'Hex', 'Ivo', 'Jax',
+    'Kor', 'Lum', 'Mox', 'Nyx', 'Orb', 'Pyx', 'Qua', 'Rho', 'Syl', 'Tau',
+    'Uxo', 'Vex', 'Wyn', 'Xan', 'Yvo', 'Zed', 'Arc', 'Bly', 'Cri', 'Dro',
+    'Elu', 'Fro', 'Gly', 'Hru', 'Ixi', 'Jek', 'Kip', 'Lof', 'Mun', 'Nim',
+    'Oss', 'Pel', 'Qib', 'Rax', 'Sol', 'Tiv', 'Umo', 'Vit', 'Wox', 'Zor',
 ];
 const TYPE_HEX = TYPE_COLORS_HEX;
 // DNF condition operators, indexed by op code (0:> 1:>= 2:< 3:<=).
@@ -1955,7 +1959,7 @@ class ParticleLifeApp {
             line.appendChild(opSel);
 
             const thr = document.createElement('input');
-            thr.type = 'number'; thr.step = '0.05'; thr.min = '-10'; thr.max = '10'; thr.value = String(cd.threshold);
+            thr.type = 'number'; thr.step = '0.05'; thr.min = '-50'; thr.max = '50'; thr.value = String(cd.threshold);
             thr.addEventListener('change', () => { cd.threshold = Number(thr.value) || 0; thr.value = String(cd.threshold); commit(); });
             line.appendChild(thr);
 
